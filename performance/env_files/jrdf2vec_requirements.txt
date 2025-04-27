@@ -1,0 +1,39 @@
+annotated-types @ file:///home/conda/feedstock_root/build_artifacts/annotated-types_1733247046149/work
+appdirs @ file:///home/conda/feedstock_root/build_artifacts/appdirs_1733753955715/work
+blinker @ file:///croot/blinker_1737448726027/work
+Brotli @ file:///croot/brotli-split_1736182456865/work
+certifi @ file:///home/conda/feedstock_root/build_artifacts/certifi_1739515848642/work/certifi
+charset-normalizer @ file:///croot/charset-normalizer_1721748349566/work
+click @ file:///croot/click_1744271578095/work
+docker-pycreds==0.4.0
+eval_type_backport @ file:///home/conda/feedstock_root/build_artifacts/eval_type_backport_1734857727836/work
+Flask==2.2.0
+gensim @ file:///croot/gensim_1725057941774/work
+gitdb @ file:///home/conda/feedstock_root/build_artifacts/gitdb_1735887193964/work
+GitPython @ file:///home/conda/feedstock_root/build_artifacts/gitpython_1735929639977/work
+idna @ file:///croot/idna_1714398848350/work
+itsdangerous @ file:///croot/itsdangerous_1716533337253/work
+Jinja2 @ file:///croot/jinja2_1741710844255/work
+MarkupSafe @ file:///croot/markupsafe_1738584038848/work
+numpy @ file:///croot/numpy_and_numpy_base_1708638617955/work/dist/numpy-1.26.4-cp312-cp312-linux_x86_64.whl#sha256=b8e59fcb10ab071cbeded47aed247ddfa1c902d595848c27f82021340e226134
+platformdirs @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_platformdirs_1742485085/work
+protobuf @ file:///home/conda/feedstock_root/build_artifacts/protobuf_1741124577516/work/bazel-bin/python/dist/protobuf-5.29.3-cp312-abi3-linux_x86_64.whl#sha256=8da9cd7b78bd51db999f53f7fa8b6037ad96c9f27070630fea8a230597dd2c2b
+psutil @ file:///home/conda/feedstock_root/build_artifacts/psutil_1740663123172/work
+pydantic @ file:///home/conda/feedstock_root/build_artifacts/pydantic_1744192202330/work
+pydantic_core @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_pydantic-core_1743607634/work
+PySocks @ file:///work/perseverance-python-buildout/croot/pysocks_1698845478203/work
+PyYAML @ file:///home/conda/feedstock_root/build_artifacts/pyyaml_1737454647378/work
+requests @ file:///croot/requests_1730999120400/work
+scipy @ file:///croot/scipy_1733756309941/work/dist/scipy-1.13.1-cp312-cp312-linux_x86_64.whl#sha256=d95fe1fdd78365a6397b5fe623933c40d900c343f2ccb5d5a8838c961a4c6bd8
+sentry-sdk @ file:///home/conda/feedstock_root/build_artifacts/sentry-sdk_1745496648046/work
+setproctitle @ file:///home/conda/feedstock_root/build_artifacts/setproctitle_1740396875159/work
+setuptools==75.8.0
+six @ file:///home/conda/feedstock_root/build_artifacts/six_1733380938961/work
+smart-open @ file:///work/perseverance-python-buildout/croot/smart_open_1698863627550/work
+smmap @ file:///home/conda/feedstock_root/build_artifacts/smmap_1739781697784/work
+typing-inspection @ file:///home/conda/feedstock_root/build_artifacts/typing-inspection_1741438046699/work
+typing_extensions @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_typing_extensions_1744302253/work
+urllib3 @ file:///croot/urllib3_1737133630106/work
+wandb @ file:///home/conda/feedstock_root/build_artifacts/wandb_1745429923146/work
+Werkzeug==2.2.0
+wheel==0.45.1

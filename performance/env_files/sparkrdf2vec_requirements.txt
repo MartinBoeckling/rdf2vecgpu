@@ -1,0 +1,36 @@
+certifi==2025.4.26
+charset-normalizer==3.4.1
+deckar01-ratelimit==3.0.2
+fuzzywuzzy==0.18.0
+graphframes @ file:///home/conda/feedstock_root/build_artifacts/graphframes_1626355161728/work
+graphframes-py==0.0.0
+idna==3.10
+info-gain==1.0.1
+joblib==1.4.2
+kgextension==0.1.1
+lxml==5.4.0
+networkx==3.4.2
+nose==1.3.7
+numpy==2.2.5
+pandas @ file:///home/conda/feedstock_root/build_artifacts/pandas_1744430449469/work
+py4j @ file:///home/conda/feedstock_root/build_artifacts/py4j_1660381574436/work
+pyarrow==19.0.1
+pyparsing==3.2.3
+pyspark @ file:///home/conda/feedstock_root/build_artifacts/pyspark_1740719055705/work
+pyspotlight==0.7.2
+python-dateutil @ file:///home/conda/feedstock_root/build_artifacts/python-dateutil_1733215673016/work
+pytz @ file:///home/conda/feedstock_root/build_artifacts/pytz_1742920838005/work
+rdflib==7.1.4
+requests==2.32.3
+scikit-learn==1.6.1
+scipy==1.15.2
+six @ file:///home/conda/feedstock_root/build_artifacts/six_1733380938961/work
+sparkkgml==0.2.2
+sparql-dataframe==0.4
+SPARQLWrapper==2.0.0
+strsimpy==0.2.1
+threadpoolctl==3.6.0
+tqdm==4.67.1
+tzdata @ file:///home/conda/feedstock_root/build_artifacts/python-tzdata_1742745135198/work
+urllib3==2.4.0
+validators==0.34.0
