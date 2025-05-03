@@ -1,0 +1,12 @@
+WALK_NUMBER = [100, 500, 1000]
+MAX_DEPTH = [4, 8, 12]
+EVALUATION_RUNS = 10
+WALK_STRATEGY = ["BFS", "random"]
+TIMEOUT = 14400 # Timeout in seconds (4 hours)
+
+# Word2vec
+EPOCHS = [5, 10]
+RANDOM_STATE = 42
+WINDOW_SIZE = 5
+MIN_COUNT = 1
+VECTOR_SIZE = 100
