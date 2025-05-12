@@ -1,8 +1,7 @@
 ## gpuRDF2Vec
 A scalable GPU based implementation of RDF2Vec embeddings for large and dense Knowledge Graphs.
 
-
-[![License: MIT](#)](LICENSE) ![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=for-the-badge&logo=PyTorch&logoColor=white)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 ![RDF2VecGPU_Image](img/github_repo_header.png)
 
