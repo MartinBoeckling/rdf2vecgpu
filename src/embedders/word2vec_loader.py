@@ -60,3 +60,66 @@ class SkipGramDataModule(L.LightningDataModule):
             num_workers=0,          # CUDA tensors + index dataset → no workers
             pin_memory=False,
         )
+    
+class CBOWDataModule(L.LightningDataModule):
+    """Dataloading optimised for a GPU-resident CBOW table.
+
+    Parameters
+    ----------
+    context_tensor : torch.Tensor
+        2-D CUDA tensor of shape (n_samples, ctx_size), where each row
+        is the flattened context words for one target.
+    center_tensor : torch.Tensor
+        1-D CUDA tensor of length n_samples, the target (centre) word indices.
+    batch_size : int
+        Number of (context_vec, center) samples per optimisation step.
+    """
+
+    def __init__(
+        self,
+        context_tensor: torch.Tensor,
+        center_tensor: torch.Tensor,
+        *,
+        batch_size: int
+    ):
+        super().__init__()
+        # both tensors must be on CUDA
+        assert context_tensor.device.type == "cuda", "context_tensor must be on GPU"
+        assert center_tensor.device.type  == "cuda", "center_tensor must be on GPU"
+        # must have same first dimension
+        assert context_tensor.dim() == 2, "context_tensor must be 2-D"
+        assert center_tensor.dim()  == 1, "center_tensor must be 1-D"
+        assert context_tensor.shape[0] == center_tensor.shape[0]
+
+        # store contiguous views
+        self.context    = context_tensor.contiguous()
+        self.center     = center_tensor.contiguous()
+        self.batch_size = batch_size
+
+        # simple index dataset
+        self._dataset = _IndexDataset(len(self.center))
+
+    def setup(self, stage: str | None = None):
+        # nothing extra to do here
+        pass
+
+    def train_dataloader(self):
+        sampler       = RandomSampler(self._dataset, replacement=False)
+        batch_sampler = BatchSampler(
+            sampler,
+            batch_size=self.batch_size,
+            drop_last=False
+        )
+
+        def _collate(indices: list[int]):
+            idx = torch.tensor(indices, device=self.center.device, dtype=torch.long)
+            # contexts: [B, ctx_size], centers: [B]
+            return self.context[idx], self.center[idx]
+
+        return DataLoader(
+            self._dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=_collate,
+            num_workers=0,     # GPU tensors + index sampler → no subprocesses
+            pin_memory=False,
+        )

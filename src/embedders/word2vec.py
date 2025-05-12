@@ -12,7 +12,7 @@ class SkipGram(L.LightningModule):
     Args:
         L (_type_): _description_
     """
-    def __init__(self, vocab_size, embedding_dim, neg_samples, learning_rate=0.003, use_sparse=False):
+    def __init__(self, vocab_size, embedding_dim, neg_samples, learning_rate=0.003, use_sparse=True):
         super().__init__()
         self.vocab_size = vocab_size
         self.learning_rate = learning_rate
@@ -65,12 +65,11 @@ class CBOW(L.LightningModule):
     Args:
         L (_type_): _description_
     """
-    def __init__(self, vocab_size, embedding_dim, learning_rate, use_sparse=True, window_size=5):
+    def __init__(self, vocab_size, embedding_dim, learning_rate, use_sparse=True):
         super().__init__()
         self.save_hyperparameters()
         self.vocab_size = vocab_size
         self.learning_rate = learning_rate
-        self.window_size = window_size
         self.use_sparse = use_sparse
 
         self.in_embeddings = nn.Embedding(vocab_size, embedding_dim)

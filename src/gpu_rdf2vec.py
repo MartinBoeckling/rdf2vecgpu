@@ -10,7 +10,7 @@ from torch.utils.dlpack import to_dlpack
 from lightning.pytorch.tuner import Tuner
 from .helper.functions import get_gpu_cluster, determine_optimal_chunksize, _generate_vocab
 from .embedders.word2vec import SkipGram, CBOW
-from .embedders.word2vec_loader import SkipGramDataModule
+from .embedders.word2vec_loader import SkipGramDataModule, CBOWDataModule
 from .reader.kg_reader import read_kg_file
 from .corpus.walk_corpus import single_gpu_walk_corpus, multi_gpu_walk_corpus
 import cudf
@@ -146,7 +146,6 @@ class GPU_RDF2Vec:
         self.word2vec_model = None
         self.word2idx = None
         self.cpu_count = cpu_count
-        torch.set_float32_matmul_precision('high')
 
     def load_data(self, path: str) -> cudf.DataFrame:
         """
@@ -334,14 +333,6 @@ class GPU_RDF2Vec:
                 embedding_dim=self.vector_size,
                 neg_samples=self.negative_samples,
                 learning_rate=self.learning_rate
-                # walk_corpus=walk_corpus,
-                # epochs=self.epochs,
-                # batch_size=self.batch_size,
-                # vector_size=self.vector_size,
-                # window_size=self.window_size,
-                # min_count=self.min_count,
-                # random_state=self.random_state,
-                # reproducible=self.reproducible
             )
             center_tensor = torch.utils.dlpack.from_dlpack(walk_corpus['center'].to_dlpack()).contiguous()
             context_tensor = torch.utils.dlpack.from_dlpack(walk_corpus['context'].to_dlpack()).contiguous()
@@ -351,12 +342,16 @@ class GPU_RDF2Vec:
             word2vec_model = CBOW(
                 vocab_size = self.word2idx.shape[0],
                 embedding_dim=self.vector_size,
-                learning_rate=self.learning_rate
+                learning_rate=self.learning_rate,
+                window_size=self.window_size,
             )
             center_tensor = torch.utils.dlpack.from_dlpack(walk_corpus['center'].to_dlpack()).contiguous()
             context_tensor = torch.utils.dlpack.from_dlpack(walk_corpus['context'].to_dlpack()).contiguous()
         
         # word2vec_model = torch.compile(word2vec_model) -> Stabalize model compilation for speedup
+        if self.reproducible:
+            logger.info("Setting up reproducible training, might increase training time.")
+            L.seed_everything(self.random_state, workers=True)
         trainer = L.Trainer(max_epochs=self.epochs, log_every_n_steps=1, accelerator="gpu", precision=16, devices=1)
         tune_batch_size = True
         if tune_batch_size:

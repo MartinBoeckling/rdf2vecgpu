@@ -91,7 +91,50 @@ class single_gpu_walk_corpus:
     
 
     def _cbow_pairs(self, tokens: cudf.DataFrame, window: int):
-        raise NotImplementedError("CBOW is not implemented yet")
+        """
+        For each position in each walk, collect all context tokens within the given window
+        into a list, paired with the centre token.
+
+        Returns a DataFrame with columns:
+        - 'context' : list of context tokens
+        - 'center'  : the centre token
+        """
+        pairs = []
+
+        # for each offset, shift tokens to become a 'context' column
+        for d in range(-window, window + 1):
+            if d == 0:
+                continue
+
+            # rename token → context, and shift its pos so it lines up with the centre at pos+d
+            ctx = (
+                tokens
+                .rename(columns={'token': 'context'})
+                .assign(pos=tokens.pos - d)
+            )
+
+            # join centre and this slice of context
+            centre = tokens.rename(columns={'token': 'center'})
+            merged = centre.merge(
+                ctx,
+                on=['walk_id', 'pos'],
+                how='inner'
+            )[['walk_id', 'pos', 'center', 'context']]
+
+            pairs.append(merged)
+
+        # stack all (centre, single-context) rows
+        all_pairs = cudf.concat(pairs, ignore_index=True)
+
+        # aggregate each centre into a list of contexts
+        cbow = (
+            all_pairs
+            .groupby(['walk_id', 'pos', 'center'])
+            .agg_list('context')  # now each row has a 'context' list
+            .reset_index()
+        )
+        # return just the two columns we need for training
+        return cbow[['context', 'center']]
 
     def bfs_walk(self, edge_df: cudf.DataFrame, walk_vertices: cudf.Series, walk_depth: int, random_state: int, word2vec_model: str, min_count: int) -> cudf.DataFrame:
         out = []
