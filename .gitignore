@@ -171,5 +171,17 @@ cython_debug/
 .pypirc
 
 data/
-
 wandb/
+job/
+vector/
+walks/
+python-server/
+dask_spill/
+lightning_logs/
+.vscode/
+spark_local/
+wikidata_parquet/
+.scale*
+test.py
+*.xlsx
+wikidata*

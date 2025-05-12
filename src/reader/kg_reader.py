@@ -61,4 +61,4 @@ def triple_to_ttl(file_path: str, destination_path: str):
     print(f"Serialized RDF graph to {file_path} in ttl format.")
 
 if __name__ == "__main__":
-    triple_to_ttl(file_path="data/generated_graphs/erdos_renyi_graph_50000.parquet", destination_path="data/generated_graphs/erdos_renyi_graph_50000.ttl")
+    triple_to_ttl(file_path="data/wikidata5m/wikidata5m_kg.parquet", destination_path="data/wikidata5m/wikidata5m_kg.ttl")

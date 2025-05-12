@@ -1,15 +1,7 @@
-# from cugraph.dask.centrality.betweenness_centrality import betweenness_centrality
 from cugraph.centrality import betweenness_centrality, degree_centrality
 from cugraph import Graph
 import cudf
 from pathlib import Path
-import dask_cudf
-from dask.distributed import Client
-from dask_cuda import LocalCUDACluster
-import cugraph.dask.comms.comms as Comms
-
-import cugraph
-import cugraph.dask as dask_cugraph
 
 def calculate_graph_statistics(path: str) -> None:
     gdf = cudf.read_parquet(path)
@@ -33,10 +25,12 @@ def calculate_graph_statistics(path: str) -> None:
     print(f"Mean Betweenness Centrality: {mean_betweenness}")
 
 if __name__ == "__main__":
-    calculate_graph_statistics(path="data/wikidata5m/wikidata5m_kg.parquet")
-    calculate_graph_statistics(path="data/generated_graphs/barabasi_graph_100.parquet")
-    calculate_graph_statistics(path="data/generated_graphs/barabasi_graph_1000.parquet")
-    calculate_graph_statistics(path="data/generated_graphs/barabasi_graph_10000.parquet")
+    # calculate_graph_statistics(path="data/wikidata5m/wikidata5m_kg.parquet")
+    # calculate_graph_statistics(path="data/fb15k-237/fb15k_kg.parquet")
+
+    # calculate_graph_statistics(path="data/generated_graphs/barabasi_graph_100.parquet")
+    # calculate_graph_statistics(path="data/generated_graphs/barabasi_graph_1000.parquet")
+    # calculate_graph_statistics(path="data/generated_graphs/barabasi_graph_10000.parquet")
     
     calculate_graph_statistics(path="data/generated_graphs/erdos_renyi_graph_100.parquet")
     calculate_graph_statistics(path="data/generated_graphs/erdos_renyi_graph_1000.parquet")

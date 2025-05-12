@@ -4,6 +4,8 @@ from torch.optim import Adam
 import lightning as L
 import numpy as np
 
+torch.cuda.set_per_process_memory_fraction(0.9)
+
 class SkipGram(L.LightningModule):
     """_summary_
 
@@ -63,7 +65,7 @@ class CBOW(L.LightningModule):
     Args:
         L (_type_): _description_
     """
-    def __init__(self, vocab_size, embedding_dim, learning_rate, use_sparse=True):
+    def __init__(self, vocab_size, embedding_dim, learning_rate, use_sparse=True, window_size=5):
         super().__init__()
         self.save_hyperparameters()
         self.vocab_size = vocab_size
