@@ -170,7 +170,8 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
-data/
+data/*
+!data/.gitkeep
 wandb/
 job/
 vector/
