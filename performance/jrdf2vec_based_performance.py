@@ -49,18 +49,18 @@ def run_jrdf2vec(path: str, epochs: int, walk_number: int, max_depth: int) -> No
             str(epochs),
             "-numberOfWalks",
             str(walk_number),
-            "-maxDepth",
+            "-depth",
             str(max_depth),
             "-threads",
             str(cpu_number),
             "-walkGenerationMode",
-            "RANDOM_WALKS"
+            "RANDOM_WALKS",
             "-embedText",
             "-minCount",
             str(MIN_COUNT),
             "-window",
             str(WINDOW_SIZE),
-            "-vectorSize",
+            "-dimension",
             str(VECTOR_SIZE),
             "-noVectorTextFileGeneration"
         ]
@@ -98,19 +98,19 @@ if __name__ == "__main__":
     product_params = product(EPOCHS, WALK_NUMBER, MAX_DEPTH)
     product_params = list(product_params)
     for parameters in product_params:
-        if parameters == (10, 500, 8):
-            epoch, walk_numbers, max_depths = parameters
-            for i in range(EVALUATION_RUNS):
-                run_jrdf2vec(path="data/fb15k-237/Release/fb15k_kg.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+        epoch, walk_numbers, max_depths = parameters
+          for i in range(EVALUATION_RUNS):
+              run_jrdf2vec("/ceph/mboeckli/rdf2vecgpu/data/wikidata5m/wikidata5m_kg.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+              run_jrdf2vec(path="data/fb15k-237/Release/fb15k_kg.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
 
-                # run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/barabasi_graph_100.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-                # run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/barabasi_graph_1000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-                # run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/barabasi_graph_10000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-                
-                # run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/erdos_renyi_graph_100.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-                # run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/erdos_renyi_graph_1000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-                # run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/erdos_renyi_graph_10000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-                
-                # run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/random_graph_100.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-                # run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/random_graph_1000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-                # run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/random_graph_10000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+              run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/barabasi_graph_100.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+              run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/barabasi_graph_1000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+              run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/barabasi_graph_10000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+
+              run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/erdos_renyi_graph_100.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+              run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/erdos_renyi_graph_1000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+              run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/erdos_renyi_graph_10000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+
+              run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/random_graph_100.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+              run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/random_graph_1000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+              run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/random_graph_10000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
