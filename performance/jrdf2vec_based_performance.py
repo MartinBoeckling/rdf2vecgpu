@@ -99,19 +99,18 @@ if __name__ == "__main__":
     product_params = list(product_params)
     for parameters in product_params:
         epoch, walk_numbers, max_depths = parameters
-        if parameters == (10, 100, 8):
-            for i in range(EVALUATION_RUNS):
-                run_jrdf2vec("/ceph/mboeckli/rdf2vecgpu/data/wikidata5m/wikidata5m_kg.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-            # run_jrdf2vec(path="data/fb15k-237/Release/fb15k_kg.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+          for i in range(EVALUATION_RUNS):
+              run_jrdf2vec("/ceph/mboeckli/rdf2vecgpu/data/wikidata5m/wikidata5m_kg.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+              run_jrdf2vec(path="data/fb15k-237/Release/fb15k_kg.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
 
-            # run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/barabasi_graph_100.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-            # run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/barabasi_graph_1000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-            # run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/barabasi_graph_10000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-            
-            # run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/erdos_renyi_graph_100.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-            # run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/erdos_renyi_graph_1000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-            # run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/erdos_renyi_graph_10000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-            
-            # run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/random_graph_100.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-            # run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/random_graph_1000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-            # run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/random_graph_10000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+              run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/barabasi_graph_100.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+              run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/barabasi_graph_1000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+              run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/barabasi_graph_10000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+
+              run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/erdos_renyi_graph_100.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+              run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/erdos_renyi_graph_1000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+              run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/erdos_renyi_graph_10000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+
+              run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/random_graph_100.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+              run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/random_graph_1000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+              run_jrdf2vec(path="/ceph/mboeckli/rdf2vecgpu/data/generated_graphs/random_graph_10000.ttl", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
