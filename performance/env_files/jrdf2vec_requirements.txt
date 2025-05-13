@@ -7,7 +7,7 @@ charset-normalizer @ file:///croot/charset-normalizer_1721748349566/work
 click @ file:///croot/click_1744271578095/work
 docker-pycreds==0.4.0
 eval_type_backport @ file:///home/conda/feedstock_root/build_artifacts/eval_type_backport_1734857727836/work
-Flask==2.2.0
+Flask==2.2.5
 gensim @ file:///croot/gensim_1725057941774/work
 gitdb @ file:///home/conda/feedstock_root/build_artifacts/gitdb_1735887193964/work
 GitPython @ file:///home/conda/feedstock_root/build_artifacts/gitpython_1735929639977/work
@@ -35,5 +35,5 @@ typing-inspection @ file:///home/conda/feedstock_root/build_artifacts/typing-ins
 typing_extensions @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_typing_extensions_1744302253/work
 urllib3 @ file:///croot/urllib3_1737133630106/work
 wandb @ file:///home/conda/feedstock_root/build_artifacts/wandb_1745429923146/work
-Werkzeug==2.2.0
+Werkzeug==3.0.6
 wheel==0.45.1
