@@ -58,17 +58,18 @@ if __name__ == "__main__":
     product_params = list(product_params)
     for parameters in product_params:
         epoch, walk_numbers, max_depths = parameters
-        for i in range(1):
-            # perform_rdf2vec_gpu_run(path="data/fb15k-237/Release/fb15k_kg.parquet", epoch=epoch, walk_number=walk_numbers, max_depth=max_depths)
+        for i in range(EVALUATION_RUNS):
+            perform_rdf2vec_gpu_run(path="data/wikidata5m/wikidata5m_kg.parquet", epoch=epoch, walk_number=walk_numbers, max_depth=max_depths)
+            perform_rdf2vec_gpu_run(path="data/fb15k-237/Release/fb15k_kg.parquet", epoch=epoch, walk_number=walk_numbers, max_depth=max_depths)
 
-            # # perform_rdf2vec_gpu_run(path="data/generated_graphs/barabasi_graph_100.parquet", epoch=epoch, walk_number=walk_numbers, max_depth=max_depths)
-            # perform_rdf2vec_gpu_run(path="data/generated_graphs/barabasi_graph_1000.parquet", epoch=epoch, walk_number=walk_numbers, max_depth=max_depths)
-            # perform_rdf2vec_gpu_run(path="data/generated_graphs/barabasi_graph_10000.parquet", epoch=epoch, walk_number=walk_numbers, max_depth=max_depths)
+            perform_rdf2vec_gpu_run(path="data/generated_graphs/barabasi_graph_100.parquet", epoch=epoch, walk_number=walk_numbers, max_depth=max_depths)
+            perform_rdf2vec_gpu_run(path="data/generated_graphs/barabasi_graph_1000.parquet", epoch=epoch, walk_number=walk_numbers, max_depth=max_depths)
+            perform_rdf2vec_gpu_run(path="data/generated_graphs/barabasi_graph_10000.parquet", epoch=epoch, walk_number=walk_numbers, max_depth=max_depths)
             
-            # perform_rdf2vec_gpu_run(path="data/generated_graphs/erdos_renyi_graph_100.parquet", epoch=epoch, walk_number=walk_numbers, max_depth=max_depths)
+            perform_rdf2vec_gpu_run(path="data/generated_graphs/erdos_renyi_graph_100.parquet", epoch=epoch, walk_number=walk_numbers, max_depth=max_depths)
             perform_rdf2vec_gpu_run(path="data/generated_graphs/erdos_renyi_graph_1000.parquet", epoch=epoch, walk_number=walk_numbers, max_depth=max_depths)
-            # perform_rdf2vec_gpu_run(path="data/generated_graphs/erdos_renyi_graph_10000.parquet", epoch=epoch, walk_number=walk_numbers, max_depth=max_depths)
+            perform_rdf2vec_gpu_run(path="data/generated_graphs/erdos_renyi_graph_10000.parquet", epoch=epoch, walk_number=walk_numbers, max_depth=max_depths)
             
-            # perform_rdf2vec_gpu_run(path="data/generated_graphs/random_graph_100.parquet", epoch=epoch, walk_number=walk_numbers, max_depth=max_depths)
-            # perform_rdf2vec_gpu_run(path="data/generated_graphs/random_graph_1000.parquet", epoch=epoch, walk_number=walk_numbers, max_depth=max_depths)
-            # perform_rdf2vec_gpu_run(path="data/generated_graphs/random_graph_10000.parquet", epoch=epoch, walk_number=walk_numbers, max_depth=max_depths)
+            perform_rdf2vec_gpu_run(path="data/generated_graphs/random_graph_100.parquet", epoch=epoch, walk_number=walk_numbers, max_depth=max_depths)
+            perform_rdf2vec_gpu_run(path="data/generated_graphs/random_graph_1000.parquet", epoch=epoch, walk_number=walk_numbers, max_depth=max_depths)
+            perform_rdf2vec_gpu_run(path="data/generated_graphs/random_graph_10000.parquet", epoch=epoch, walk_number=walk_numbers, max_depth=max_depths)

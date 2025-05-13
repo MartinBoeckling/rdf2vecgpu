@@ -146,19 +146,19 @@ if __name__ == "__main__":
     product_params = list(product_params)
 
     for parameters in product_params:
-        if parameters == (10, 500, 8):
-            epoch, walk_numbers, max_depths = parameters
-            for i in range(EVALUATION_RUNS):
-                monitor_run_pyrdf2vec(path="data/fb15k-237/Release/fb15k_kg.parquet", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+        epoch, walk_numbers, max_depths = parameters
+        for i in range(EVALUATION_RUNS):
+            monitor_run_pyrdf2vec(path="data/wikidata5m/wikidata5m_kg.parquet", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+            monitor_run_pyrdf2vec(path="data/fb15k-237/Release/fb15k_kg.parquet", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
 
-                monitor_run_pyrdf2vec(path="data/generated_graphs/barabasi_graph_100.parquet", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-                monitor_run_pyrdf2vec(path="data/generated_graphs/barabasi_graph_1000.parquet", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-                monitor_run_pyrdf2vec(path="data/generated_graphs/barabasi_graph_10000.parquet", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-                
-                monitor_run_pyrdf2vec(path="data/generated_graphs/erdos_renyi_graph_100.parquet", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-                monitor_run_pyrdf2vec(path="data/generated_graphs/erdos_renyi_graph_1000.parquet", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-                monitor_run_pyrdf2vec(path="data/generated_graphs/erdos_renyi_graph_10000.parquet", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-                
-                monitor_run_pyrdf2vec(path="data/generated_graphs/random_graph_100.parquet", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-                monitor_run_pyrdf2vec(path="data/generated_graphs/random_graph_1000.parquet", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
-                monitor_run_pyrdf2vec(path="data/generated_graphs/random_graph_10000.parquet", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+            monitor_run_pyrdf2vec(path="data/generated_graphs/barabasi_graph_100.parquet", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+            monitor_run_pyrdf2vec(path="data/generated_graphs/barabasi_graph_1000.parquet", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+            monitor_run_pyrdf2vec(path="data/generated_graphs/barabasi_graph_10000.parquet", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+            
+            monitor_run_pyrdf2vec(path="data/generated_graphs/erdos_renyi_graph_100.parquet", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+            monitor_run_pyrdf2vec(path="data/generated_graphs/erdos_renyi_graph_1000.parquet", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+            monitor_run_pyrdf2vec(path="data/generated_graphs/erdos_renyi_graph_10000.parquet", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+            
+            monitor_run_pyrdf2vec(path="data/generated_graphs/random_graph_100.parquet", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+            monitor_run_pyrdf2vec(path="data/generated_graphs/random_graph_1000.parquet", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
+            monitor_run_pyrdf2vec(path="data/generated_graphs/random_graph_10000.parquet", epochs=epoch, walk_number=walk_numbers, max_depth=max_depths)
