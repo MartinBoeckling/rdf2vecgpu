@@ -5,6 +5,9 @@ A scalable GPU based implementation of RDF2Vec embeddings for large and dense Kn
 
 ![RDF2VecGPU_Image](img/github_repo_header.png)
 
+> [!IMPORTANT]
+> This package is under active development in the beta phase. The overall class/ method design will most probably change and introduce breaking changes between releases
+
 ## Table of contents
 The content of this repository readme can be found here:
 - [gpuRDF2Vec](#gpurdf2vec)
