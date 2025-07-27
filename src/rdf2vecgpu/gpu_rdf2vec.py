@@ -1,5 +1,4 @@
 from cugraph import Graph
-# from cugraph.dask import 
 from pathlib import Path
 import multiprocessing as mp
 from rdflib.util import guess_format
@@ -78,10 +77,10 @@ class GPU_RDF2Vec:
         knowledge_graph : cugraph.Graph
             Directed graph that stores the integer‑encoded triples.
         word2vec_model : torch.nn.Module or None
-            Trained model after :pymeth:`fit`; ``None`` before.
+            Trained model after `fit`; ``None`` before.
         word2idx : cudf.DataFrame or None
             Two‑column mapping *token* → *word*; available after
-            :pymeth:`load_data`.
+            `load_data`.
         generate_artifact : bool
             Copied from the constructor.
         cpu_count : int
@@ -92,8 +91,8 @@ class GPU_RDF2Vec:
         NotImplementedError
             If a not‑yet‑supported walk strategy, embedding model is specified.
         ValueError
-            If an unsupported file format is passed to :pymeth:`load_data` or if
-            :pymeth:`transform` is called prior to :pymeth:`fit`.
+            If an unsupported file format is passed to `load_data` or if
+            `transform` is called prior to `fit`.
 
         Examples
         --------
@@ -119,6 +118,7 @@ class GPU_RDF2Vec:
         >>> rdf2vec.fit(edges)
         >>> emb_df = rdf2vec.transform()
         >>> emb_df.head()
+        
         """
         # Initialize class variables
         # Walk strategy parameters
@@ -155,10 +155,10 @@ class GPU_RDF2Vec:
         The method chooses the most efficient cuDF reader based on the file
         extension (`.parquet`, `.csv`, `.txt`, `.nt`).  If the extension is not
         one of these, it attempts to infer any other RDF serialisation via
-        :pyfunc:`rdflib.util.guess_format` and falls back to a generic
+        `rdflib.util.guess_format` and falls back to a generic
         ``rdflib`` reader.  After reading, the triples are integer‑encoded, a
         ``word2idx`` mapping is created (and optionally persisted), and the
-        resulting edge list is loaded into :pyattr:`self.knowledge_graph`.
+        resulting edge list is loaded into `self.knowledge_graph`.
 
         Parameters
         ----------
@@ -170,14 +170,14 @@ class GPU_RDF2Vec:
             * ``.txt`` – whitespace‑separated triples without header  
             * ``.nt`` – N‑Triples (parsed with cuDF CSV reader and cleaned)  
             * any other RDF serialisation recognised by
-                :pyfunc:`rdflib.util.guess_format`
+                `rdflib.util.guess_format`
 
         Returns
         -------
         cudf.DataFrame
             Three‑column cuDF DataFrame whose ``subject``, ``predicate``, and
             ``object`` are *int32* tokens.  The DataFrame is also stored as a
-            directed edge list in :pyattr:`self.knowledge_graph`.
+            directed edge list in `self.knowledge_graph`.
 
         Raises
         ------
@@ -187,12 +187,14 @@ class GPU_RDF2Vec:
 
         Notes
         -----
-        * Builds a vocabulary with :pyfunc:`_generate_vocab` and stores it in
-            :pyattr:`self.word2idx`.
+        * Builds a vocabulary with `_generate_vocab` and stores it in
+            `self.word2idx`.
         * Persists ``word2idx`` as Parquet under *./vector/* when
             ``self.generate_artifact`` is ``True``.
         * Returns the int‑encoded edge list for downstream use (e.g.,
-            :py:meth:`fit`)."""
+            a`fit`).
+        
+        """
         
         file_path = Path(path)
         file_ending = file_path.suffix
@@ -253,47 +255,43 @@ class GPU_RDF2Vec:
 
     def fit(self, edge_df: cudf.DataFrame, walk_vertices: cudf.Series = None) -> None:
         """
-        Train a Word2Vec model on random‑walk sequences generated from the
+        Train a Word2Vec model on random-walk sequences generated from the
         knowledge graph.
 
-        The method performs three high‑level steps:
+        The method performs three high-level steps:
 
         1. **Generate walks** – Uses the configured ``walk_strategy``
-        to obtain `(center, context)` pairs that mimic natural‑language contexts.
+        to obtain (center, context) pairs that mimic natural-language contexts.
         2. **Build the training data set** – Converts the pairs to PyTorch
-           tensors and wraps them in a performant `TensorDataset`/`DataLoader`.
-        3. **Optimise the embedding model** – Instantiates the requested
-           Word2Vec variant, then fits it with a
-           PyTorch Lightning `Trainer`.
+        tensors and wraps them in a performant `TensorDataset`/`DataLoader`.
+        3. **Optimize the embedding model** – Instantiates the requested
+        Word2Vec variant, then fits it with a
+        PyTorch Lightning `Trainer`.
 
         Parameters
         ----------
         edge_df : cudf.DataFrame
-            Int‑encoded edge list with columns ``subject``, ``predicate``,
-            ``object``—typically the output of :py:meth:`load_data`.
-        walk_vertices : cudf.Series or None, default ``None``
+            Int-encoded edge list with columns ``subject``, ``predicate``,
+            ``object``—typically the output of `load_data`.
+        walk_vertices : cudf.Series or None, default None
             Optional subset of starting vertices from which to launch random
-            walks.  If *None*, all vertices in :pyattr:`self.knowledge_graph`
-            are used.
+            walks. If None, all vertices in ``self.knowledge_graph`` are used.
 
         Raises
         ------
         ValueError
             If an invalid ``walk_strategy`` is supplied.
 
-        Notes
-        -----
-        * Walks are repeated ``self.walk_number`` times and have maximum depth
-          ``self.walk_depth``.
-        * Skip‑gram training uses negative sampling with
-          ``self.negative_samples`` negatives per positive pair.
-        * The trained model is stored in :pyattr:`self.word2vec_model` and can
-          subsequently be exported via :py:meth:`transform`.
-
+       Notes
+       -----
+       - Walks are repeated ``self.walk_number`` times and have maximum depth ``self.walk_depth``.
+       - Skip-gram training uses negative sampling with ``self.negative_samples`` negatives per positive pair.
+       - The trained model is stored in ``self.word2vec_model`` and can subsequently be exported via ``transform``.
+       
         Examples
         --------
         >>> edges = rdf2vec.load_data("example.parquet")
-        >>> rdf2vec.fit(edges)                    # doctest: +SKIP
+        >>> rdf2vec.fit(edges)
         """
 
         if self.multi_gpu:
@@ -343,7 +341,6 @@ class GPU_RDF2Vec:
                 vocab_size = self.word2idx.shape[0],
                 embedding_dim=self.vector_size,
                 learning_rate=self.learning_rate,
-                window_size=self.window_size,
             )
             center_tensor = torch.utils.dlpack.from_dlpack(walk_corpus['center'].to_dlpack()).contiguous()
             context_tensor = torch.utils.dlpack.from_dlpack(walk_corpus['context'].to_dlpack()).contiguous()
@@ -387,8 +384,8 @@ class GPU_RDF2Vec:
         Raises
         ------
         ValueError
-            If called before :pymeth:`fit` (no trained model) **or**
-            :pymeth:`load_data` (no ``word2idx`` vocabulary).
+            If called before `fit` (no trained model) **or**
+            `load_data` (no ``word2idx`` vocabulary).
 
         Notes
         -----
@@ -417,31 +414,32 @@ class GPU_RDF2Vec:
         Train the Word2Vec model **and** immediately return the resulting
         embeddings.
 
-        This convenience wrapper simply calls :py:meth:`fit` followed by
-        :py:meth:`transform`.  Use it when you do **not** need to inspect the
+        This convenience wrapper simply calls `fit` followed by
+        `transform`.  Use it when you do **not** need to inspect the
         model object itself and only care about the final entity vectors.
 
         Parameters
         ----------
         edge_df : cudf.DataFrame
             Int‑encoded triples that define the knowledge graph (typically the
-            output of :py:meth:`load_data`).
+            output of `load_data`).
         walk_vertices : cudf.Series or None, default ``None``
             Optional subset of start vertices for walk generation; see
-            :py:meth:`fit` for semantics.
+            a`fit` for semantics.
 
         Returns
         -------
         cudf.DataFrame
             The concatenated ``word2idx``–embedding table produced by
-            :py:meth:`transform`.
+            a`transform`.
 
         Notes
         -----
-        * All exceptions raised by :py:meth:`fit` or :py:meth:`transform`
+        - All exceptions raised by a`fit` or a`transform`
           propagate unchanged.
-        * The trained model is still stored in
-          :pyattr:`self.word2vec_model` for later re‑use.
+        - The trained model is still stored in
+          `self.word2vec_model` for later re‑use.
+
         """
         self.fit(edge_df, walk_vertices)
         embedding_df = self.transform()

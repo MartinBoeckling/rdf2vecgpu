@@ -1,0 +1,30 @@
+[project]
+name = "rdf2vecgpu"
+version = "0.1.0"
+description = "GPU-Accelerated RDF2Vec – A high-performance GPU implementation of RDF2Vec that uses CUDA and RAPIDS to generate scalable, embeddings for large dense knowledge graphs."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "cudf-cu12>=25.6.0",
+    "cugraph-cu12==25.6.*",
+    "cupy-cuda12x>=13.5.1",
+    "dask-cudf-cu12>=25.6.0",
+    "dask[complete]>=2025.5.0",
+    "lightning>=2.5.2",
+    "loguru>=0.7.3",
+    "numpy>=2.2.6",
+    "rdflib>=7.1.4",
+    "torch>=2.7.1",
+    "tqdm>=4.67.1",
+]
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+sources = ["src"]
+
+[project.urls]
+"Homepage" = "https://github.com/MartinBoeckling/rdf2vecgpu"
+"Issues" = "https://github.com/MartinBoeckling/rdf2vecgpu/issues"

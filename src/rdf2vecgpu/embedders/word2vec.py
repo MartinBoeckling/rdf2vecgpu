@@ -7,11 +7,6 @@ import numpy as np
 torch.cuda.set_per_process_memory_fraction(0.9)
 
 class SkipGram(L.LightningModule):
-    """_summary_
-
-    Args:
-        L (_type_): _description_
-    """
     def __init__(self, vocab_size, embedding_dim, neg_samples, learning_rate=0.003, use_sparse=True):
         super().__init__()
         self.vocab_size = vocab_size
@@ -60,11 +55,6 @@ class SkipGram(L.LightningModule):
     
 
 class CBOW(L.LightningModule):
-    """_summary_
-
-    Args:
-        L (_type_): _description_
-    """
     def __init__(self, vocab_size, embedding_dim, learning_rate, use_sparse=True):
         super().__init__()
         self.save_hyperparameters()
@@ -109,3 +99,8 @@ class CBOW(L.LightningModule):
         opt_function = torch.optim.SparseAdam if self.use_sparse else torch.optim.Adam
         return opt_function(self.parameters(), lr=self.learning_rate)
     
+
+class OrderAwareSkipgram:
+    def __init__(self):
+        super().__init__()
+        pass
