@@ -20,17 +20,16 @@ def calculate_graph_statistics(path: str) -> None:
     density = number_edges / (number_nodes * (number_nodes - 1))
     print(f"Density: {density}")
     betweenness_df = betweenness_centrality(G, normalized=False)
-    # betweenness_df.compute()
     mean_betweenness = betweenness_df["betweenness_centrality"].mean()
     print(f"Mean Betweenness Centrality: {mean_betweenness}")
 
 if __name__ == "__main__":
-    # calculate_graph_statistics(path="data/wikidata5m/wikidata5m_kg.parquet")
-    # calculate_graph_statistics(path="data/fb15k-237/fb15k_kg.parquet")
+    calculate_graph_statistics(path="data/wikidata5m/wikidata5m_kg.parquet")
+    calculate_graph_statistics(path="data/fb15k-237/fb15k_kg.parquet")
 
-    # calculate_graph_statistics(path="data/generated_graphs/barabasi_graph_100.parquet")
-    # calculate_graph_statistics(path="data/generated_graphs/barabasi_graph_1000.parquet")
-    # calculate_graph_statistics(path="data/generated_graphs/barabasi_graph_10000.parquet")
+    calculate_graph_statistics(path="data/generated_graphs/barabasi_graph_100.parquet")
+    calculate_graph_statistics(path="data/generated_graphs/barabasi_graph_1000.parquet")
+    calculate_graph_statistics(path="data/generated_graphs/barabasi_graph_10000.parquet")
     
     calculate_graph_statistics(path="data/generated_graphs/erdos_renyi_graph_100.parquet")
     calculate_graph_statistics(path="data/generated_graphs/erdos_renyi_graph_1000.parquet")

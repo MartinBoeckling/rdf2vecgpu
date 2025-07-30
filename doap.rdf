@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+         xmlns:doap="http://usefulinc.com/ns/doap#"
+         xmlns:foaf="http://xmlns.com/foaf/0.1/">
+
+  <doap:Project>
+    <doap:name>rdf2vecgpu</doap:name>
+    <doap:shortdesc>A GPU-accelerated RDF2Vec implementation using RAPIDS and CUDA.</doap:shortdesc>
+    <doap:description>
+      GPU-Accelerated RDF2Vec – A high-performance GPU implementation of RDF2Vec that uses CUDA and RAPIDS to generate scalable, embeddings for large dense knowledge graphs.
+    </doap:description>
+    <doap:homepage rdf:resource="https://github.com/MartinBoeckling/rdf2vecgpu"/>
+    <doap:created>2025-07-29</doap:created>
+    <doap:programming-language>Python</doap:programming-language>
+    <doap:license rdf:resource="https://opensource.org/licenses/MIT"/>
+    <doap:bug-database rdf:resource="https://github.com/MartinBoeckling/rdf2vecgpu/issues"/>
+    
+    <doap:repository>
+      <doap:GitRepository>
+        <doap:location rdf:resource="https://github.com/MartinBoeckling/rdf2vecgpu.git"/>
+        <doap:browse rdf:resource="https://github.com/MartinBoeckling/rdf2vecgpu"/>
+      </doap:GitRepository>
+    </doap:repository>
+
+    <doap:release>
+      <doap:Version>
+        <doap:revision>0.1.0</doap:revision>
+        <doap:created>2025-07-29</doap:created>
+        <doap:download-page rdf:resource="https://pypi.org/project/rdf2vecgpu/"/>
+      </doap:Version>
+    </doap:release>
+
+    <doap:maintainer>
+      <foaf:Person>
+        <foaf:name>Martin Böckling</foaf:name>
+      </foaf:Person>
+    </doap:maintainer>
+
+    <doap:category rdf:resource="http://dbpedia.org/resource/Artificial_intelligence"/>
+  </doap:Project>
+
+</rdf:RDF>
