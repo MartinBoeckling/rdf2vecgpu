@@ -16,7 +16,6 @@ The content of this repository readme can be found here:
 - [gpuRDF2Vec overview](#gpurdf2vec-overview)
   - [Repository Structure](#repository-structure)
   - [Capability overview](#capability-overview)
-  - [Runtime comparison to other RDF2Vec packages](#runtime-comparison-to-other-rdf2vec-packages)
 - [Quick start](#quick-start)
 - [Implementation Details](#implementation-details)
 - [License](#license)
@@ -107,8 +106,6 @@ RDF2Vec is a powerful technique to generate vector embeddings of entities in RDF
 - Pluggable rdf loaders and parquet, csv, txt integration
 - Performance comparison can be found in the following [folder](performance/)
 
-### Runtime comparison to other RDF2Vec packages
-A detailed report for the 
 ## Quick start
 ```python
 from src.gpu_rdf2vec import GPU_RDF2Vec
@@ -184,7 +181,7 @@ We achieve order-of-magnitude for large and dense graphs over CPU-bound RDF2Vec 
    - We use PyTorch Distributed + NCCL: each GPU holds the same graph shard but a unique walk corpus.  
    - Gradients are synchronized via `all_reduce` at regular intervals (~500 ms), amortizing PCIe/NVLink costs and ensuring linear scaling across nodes.
 ## License
-
+The overview of the used MIT license can be found [here](LICENSE)
 ## Roadmap
 - [ ] Order aware Word2Vec following the details of [Ling, Wang, et al. "Two/too simple adaptations of word2vec for syntax problems.](https://aclanthology.org/N15-1142.pdf). [Issue item](https://github.com/MartinBoeckling/rdf2vecgpu/issues/2)
 - [ ] Provide spilling to single GPU training to work around potential OOM issues faced during rdf2vec training [Issue Item](https://github.com/MartinBoeckling/rdf2vecgpu/issues/3)
