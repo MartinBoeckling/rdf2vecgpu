@@ -186,4 +186,5 @@ wikidata_parquet/
 test.py
 *.xlsx
 wikidata*
+uv.lock
 .uv.lock
