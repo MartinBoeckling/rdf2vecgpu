@@ -12,6 +12,7 @@ A scalable GPU based implementation of RDF2Vec embeddings for large and dense Kn
 The content of this repository readme can be found here:
 - [gpuRDF2Vec](#gpurdf2vec)
 - [Table of contents](#table-of-contents)
+- [Package installation](#package-installation)
 - [Repository setup](#repository-setup)
 - [gpuRDF2Vec overview](#gpurdf2vec-overview)
   - [Repository Structure](#repository-structure)
@@ -22,6 +23,14 @@ The content of this repository readme can be found here:
 - [Roadmap](#roadmap)
 - [Report issues and bugs](#report-issues-and-bugs)
 
+## Package installation
+Install the package rdf2vecgpu by running the following command:
+
+```
+pip install rdf2vecgpu
+```
+> [!IMPORTANT]
+> Make sure to install the accompanying cuda version as outlined in the [following section](#repository-setup)
 
 ## Repository setup
 The repository setup builds on top of two major libraries. Both Pytorch lightning as well as the RAPIDS libraries cuDF and cuGraph. We provide the exeplanatory installation details for Cuda 12.6:
