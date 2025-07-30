@@ -117,7 +117,7 @@ RDF2Vec is a powerful technique to generate vector embeddings of entities in RDF
 
 ## Quick start
 ```python
-from src.gpu_rdf2vec import GPU_RDF2Vec
+from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
 # Instantiate the gpu RDF2Vec library settings
 gpu_rdf2vec_model = GPU_RDF2Vec(
     walk_strategy="random",
