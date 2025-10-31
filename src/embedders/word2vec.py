@@ -3,11 +3,12 @@ import torch.nn as nn
 from torch.optim import Adam
 import lightning as L
 import numpy as np
+from torch.nn import functional as F
 
 torch.cuda.set_per_process_memory_fraction(0.9)
 
 class SkipGram(L.LightningModule):
-    def __init__(self, vocab_size, embedding_dim, neg_samples, learning_rate=0.003, use_sparse=True):
+    def __init__(self, vocab_size, embedding_dim, neg_samples, learning_rate=0.003, use_sparse=False):
         super().__init__()
         self.vocab_size = vocab_size
         self.learning_rate = learning_rate
@@ -55,53 +56,50 @@ class SkipGram(L.LightningModule):
     
 
 class CBOW(L.LightningModule):
-    def __init__(self, vocab_size, embedding_dim, learning_rate, use_sparse=True):
+    def __init__(self, vocab_size, embedding_dim, learning_rate=0.003, use_sparse=False):
         super().__init__()
         self.save_hyperparameters()
         self.vocab_size = vocab_size
         self.learning_rate = learning_rate
         self.use_sparse = use_sparse
 
-        self.in_embeddings = nn.Embedding(vocab_size, embedding_dim)
-        self.output_embeddings = nn.Embedding(vocab_size, embedding_dim)
-
+        self.in_embeddings = nn.Embedding(vocab_size, embedding_dim, sparse=use_sparse)
+        self.output_embeddings = nn.Linear(embedding_dim, vocab_size)
+        
         bound = 1.0 / embedding_dim
         nn.init.uniform_(self.in_embeddings.weight, -bound, bound)
         nn.init.uniform_(self.output_embeddings.weight, -bound, bound)
-        self.loss_fn = nn.BCEWithLogitsLoss(reduction='none')
+        
+        self.loss_fn = nn.CrossEntropyLoss()
 
-    def forward(self, center, context, negative):
-        center_embed = self.in_embeddings(center)  # (batch, embed)
-        context_embed = self.output_embeddings(context)  # (batch, embed)
-        negative_embed = self.output_embeddings(negative)
+    def forward(self, context):
+        mask = (context != -1).float()
+        
+        context_embeds = self.in_embeddings(context.clamp(min=0))
+        
+        masked_embeds = context_embeds * mask.unsqueeze(-1)
+        sum_embeds = masked_embeds.sum(dim=1)
+        counts = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        context_mean = sum_embeds / counts
+        
+        logits = self.output_embeddings(context_mean)
 
-
-        pos_logits = torch.sum(torch.mul(center_embed, context_embed), dim=-1)
-        pos_targets = torch.ones_like(pos_logits)
-        pos_loss = self.loss_fn(pos_logits, pos_targets)
-
-        neg_logits = torch.bmm(center_embed, context_embed.unsqueeze(-1)).squeeze(-1)
-        neg_targets = torch.zeros_like(neg_logits)
-        neg_loss = self.loss_fn(neg_logits, neg_targets)
-
-        return torch.mean(pos_loss + neg_loss)
+        return logits
 
     def training_step(self, batch, batch_idx):
-        center, context = batch
-        batch_size, device =  center.size(0), center.device
-
-        negative = torch.randint(0, self.vocab_size, (batch_size, self.window_size), device=device)
-        loss = self(center, context, negative)
+        context, center = batch
+        center = center.long()
+        logits = self(context)
+        loss = self.loss_fn(logits, center)
         self.log("train_loss", loss, prog_bar=True)
         return loss
 
     def configure_optimizers(self):
-        opt_function = torch.optim.SparseAdam if self.use_sparse else torch.optim.Adam
-        return opt_function(self.parameters(), lr=self.learning_rate)
+        return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
     
 
 class OrderAwareSkipgram(L.LightningModule):
-    def __init__(self, vocab_size, embedding_dim, neg_samples, max_distance=5, learning_rate=0.003, use_sparse=True):
+    def __init__(self, vocab_size, embedding_dim, neg_samples, max_distance=5, learning_rate=0.003, use_sparse=False):
         super().__init__()
         self.save_hyperparameters()
         self.vocab_size = vocab_size
@@ -242,7 +240,7 @@ class OrderAwareSkipgram(L.LightningModule):
 
 
 class OrderAwareCBOW(L.LightningModule):
-    def __init__(self, vocab_size, embedding_dim, neg_samples, max_distance=5, learning_rate=0.003, use_sparse=True):
+    def __init__(self, vocab_size, embedding_dim, neg_samples, max_distance=5, learning_rate=0.003, use_sparse=False):
         super().__init__()
         self.save_hyperparameters()
         self.vocab_size = vocab_size
