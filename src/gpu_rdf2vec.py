@@ -340,11 +340,17 @@ class GPU_RDF2Vec:
             word2vec_model = CBOW(
                 vocab_size = self.word2idx.shape[0],
                 embedding_dim=self.vector_size,
-                learning_rate=self.learning_rate,
+                learning_rate=self.learning_rate
             )
             center_tensor = torch.utils.dlpack.from_dlpack(walk_corpus['center'].to_dlpack()).contiguous()
-            context_tensor = torch.utils.dlpack.from_dlpack(walk_corpus['context'].to_dlpack()).contiguous()
-        
+            context_series = walk_corpus['context']
+            exploded_df = context_series.to_frame("context").explode('context').reset_index()
+            exploded_df["pos"] = exploded_df.groupby("index").cumcount()
+            pivot_df = exploded_df.pivot(index="index", columns="pos", values="context")
+            reset_pivot_df = pivot_df.reset_index(drop=True)
+            reset_pivot_df = reset_pivot_df.fillna(-1).astype('int32')
+            context_tensor = torch.utils.dlpack.from_dlpack(reset_pivot_df.to_dlpack()).contiguous()
+            datamodule = CBOWDataModule(center_tensor=center_tensor, context_tensor=context_tensor, batch_size=self.batch_size if self.batch_size else round(len(context_tensor)/(self.cpu_count)))
         # word2vec_model = torch.compile(word2vec_model) -> Stabalize model compilation for speedup
         if self.reproducible:
             logger.info("Setting up reproducible training, might increase training time.")
