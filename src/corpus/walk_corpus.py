@@ -7,6 +7,7 @@ import cugraph
 from cugraph import Graph                     # single-GPU Graph
 from cugraph.dask import uniform_random_walks as dask_uniform_random_walks
 from cugraph.dask.traversal.bfs import bfs as dask_bfs
+import torch
 
 class single_gpu_walk_corpus:
     def __init__(self, graph: Graph):
@@ -129,11 +130,10 @@ class single_gpu_walk_corpus:
         # aggregate each centre into a list of contexts
         cbow = (
             all_pairs
-            .groupby(['walk_id', 'pos', 'center'])
-            .agg_list('context')  # now each row has a 'context' list
+            .groupby(['walk_id', 'pos', 'center'])["context"]
+            .agg(list)
             .reset_index()
         )
-        # return just the two columns we need for training
         return cbow[['context', 'center']]
 
     def bfs_walk(self, edge_df: cudf.DataFrame, walk_vertices: cudf.Series, walk_depth: int, random_state: int, word2vec_model: str, min_count: int) -> cudf.DataFrame:
@@ -171,6 +171,7 @@ class single_gpu_walk_corpus:
         bfs_all = cudf.concat(out, ignore_index=True)
         bfs_all["step"] = bfs_all.groupby("walk_id").cumcount()
         bfs_all = bfs_all.merge(edge_df, left_on=["subject", "object"], right_on=["subject", "object"], how="left")[["subject", "predicate", "object", "walk_id", "step"]]
+        bfs_all = bfs_all.rename(columns={"subject": "src", "object": "dst"})
         triple_to_token_df = self._triples_to_tokens(bfs_all, min_count)
         if word2vec_model == "skipgram":
             skipgram_df = self._skipgram_pairs(triple_to_token_df, window=5)
