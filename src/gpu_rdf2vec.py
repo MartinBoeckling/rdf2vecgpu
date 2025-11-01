@@ -4,23 +4,27 @@ import multiprocessing as mp
 from rdflib.util import guess_format
 import lightning as L
 import torch
+import dask
+from cugraph.dask.comms import comms as Comms
+from dask.distributed import Client
 from torch.utils.data import TensorDataset, DataLoader, Dataset
 from torch.utils.dlpack import to_dlpack
 from lightning.pytorch.tuner import Tuner
-from .helper.functions import get_gpu_cluster, determine_optimal_chunksize, _generate_vocab
+from .helper.functions import _generate_vocab
 from .embedders.word2vec import SkipGram, CBOW
 from .embedders.word2vec_loader import SkipGramDataModule, CBOWDataModule
 from .reader.kg_reader import read_kg_file
 from .corpus.walk_corpus import single_gpu_walk_corpus, multi_gpu_walk_corpus
 import cudf
-import dask_cudf
+import dask.dataframe as dd
 from loguru import logger
 
 class GPU_RDF2Vec:
     def __init__(self, walk_strategy: str, walk_depth: int, walk_number: int, embedding_model: str,
                  epochs: int, batch_size: int, vector_size: int, window_size: int, min_count: int,
                  negative_samples: int, learning_rate: int, random_state: int, reproducible: bool,
-                 multi_gpu: bool, generate_artifact: bool, cpu_count: int):
+                 multi_gpu: bool, generate_artifact: bool, cpu_count: int, 
+                 client=None):  # Add client parameter
         """GPU‑accelerated implementation of the RDF2Vec pipeline.
 
         This class wraps every step that is necessary to obtain dense vector
@@ -71,7 +75,10 @@ class GPU_RDF2Vec:
                 Persist word2idx and embedding matrices as Parquet artefacts under provided directory
             cpu_count (int): 
                 Number of cpu workers that feed the GPU via the DataLoader
-
+            client (dask.distributed.Client, optional): 
+                Dask distributed client for multi-GPU operations. Required if multi_gpu=True.
+                If None and multi_gpu=False, operates in single-GPU mode.
+        
         Attributes
         ----------
         knowledge_graph : cugraph.Graph
@@ -137,15 +144,33 @@ class GPU_RDF2Vec:
         self.reproducible = reproducible
         self.multi_gpu = multi_gpu
         self.learning_rate = learning_rate
-        # Initialize the GPU cluster if multi_gpu is True
+        
+        # Handle client
         if multi_gpu:
-            get_gpu_cluster()
+            if client is None:
+                raise ValueError(
+                    "multi_gpu=True requires a Dask client. Please create a "
+                    "LocalCUDACluster and Client, then pass the client to GPU_RDF2Vec.\n"
+                    "Example:\n"
+                    "  from dask_cuda import LocalCUDACluster\n"
+                    "  from dask.distributed import Client\n"
+                    "  cluster = LocalCUDACluster(...)\n"
+                    "  client = Client(cluster)\n"
+                    "  rdf2vec = GPU_RDF2Vec(..., client=client)"
+                )
+            self.client = client
+            logger.info(f"Using provided Dask client with {len(client.scheduler_info()['workers'])} workers")
+            dask.config.set({"dataframe.backend": "cudf"})
+        else:
+            self.client = None
+        
         # Initialize the cugraph graph
         self.knowledge_graph = Graph(directed=True)
         self.generate_artifact = generate_artifact
         self.word2vec_model = None
         self.word2idx = None
         self.cpu_count = cpu_count
+        self.comms_initialized = False  # Track Comms initialization
 
     def load_data(self, path: str) -> cudf.DataFrame:
         """
@@ -200,23 +225,23 @@ class GPU_RDF2Vec:
         file_ending = file_path.suffix
         if file_ending == ".parquet":
             if self.multi_gpu:
-                kg_data = dask_cudf.read_parquet(path, columns=["subject", "predicate", "object"])
+                kg_data = dd.read_parquet(path, columns=["subject", "predicate", "object"])
             else:
                 kg_data = cudf.read_parquet(path, columns=["subject", "predicate", "object"])
         elif file_ending == ".csv":
             if self.multi_gpu:
-                kg_data = dask_cudf.read_csv(path, names=["subject", "predicate", "object"], header=None)
+                kg_data = dd.read_csv(path, names=["subject", "predicate", "object"], header=None)
             else:
                 kg_data = cudf.read_csv(path, names=["subject", "predicate", "object"], header=None)
         elif file_ending == ".txt":
             if self.multi_gpu:
-                kg_data = dask_cudf.read_csv(path, sep=" ", names=["subject", "predicate", "object"], header=None)
+                kg_data = dd.read_csv(path, sep=" ", names=["subject", "predicate", "object"], header=None)
             else:
                 kg_data = cudf.read_text(path, names=["subject", "predicate", "object"])
         # In order to read the .nt file we will use the csv reader extension and clean up the data
         elif file_ending == ".nt":
             if self.multi_gpu:
-                kg_data = dask_cudf.read_csv(path, sep=" ", names=["subject", "predicate", "object", "dot"], header=None)
+                kg_data = dd.read_csv(path, sep=" ", names=["subject", "predicate", "object", "dot"], header=None)
             else:
                 kg_data = cudf.read_csv(path, sep=" ", names=["subject", "predicate", "object"], header=None)
             kg_data = kg_data.drop(["dot"], axis=1)
@@ -233,22 +258,59 @@ class GPU_RDF2Vec:
                 kg_data = cudf.DataFrame(kg_tuple, columns=["subject", "object", "predicate"])
             else:
                 raise ValueError(f"Unsupported file format: {file_ending}. Please consider either a valid RDF format or a .parquet, .csv, .txt file.")
-        tokenization, word = _generate_vocab(kg_data, self.multi_gpu)
         if self.multi_gpu:
-            word2idx = dask_cudf.concat([dask_cudf.Series(tokenization), dask_cudf.Series(word)], axis=1)
+            word2idx = _generate_vocab(kg_data, self.multi_gpu)
+            subjects = word2idx[word2idx['role'] == 'subject'][['row_id', 'token']]
+            subjects = subjects.rename(columns={'token': 'subject'})
+
+            # Filter for predicates
+            predicates = word2idx[word2idx['role'] == 'predicate'][['row_id', 'token']]
+            predicates = predicates.rename(columns={'token': 'predicate'})
+
+            # Filter for objects
+            objects = word2idx[word2idx['role'] == 'object'][['row_id', 'token']]
+            objects = objects.rename(columns={'token': 'object'})
+
+            # Merge them back together using the row_id
+            subjects = subjects.set_index('row_id')
+            predicates = predicates.set_index('row_id')
+            objects = objects.set_index('row_id')
+            kg_data = dd.concat([subjects, predicates, objects], axis=1).reset_index()
+            kg_data = kg_data.astype({
+                "subject": "int64",
+                "predicate": "int64",
+                "object": "int64"
+            })
+            word2idx = word2idx[['token', 'word']].drop_duplicates().reset_index(drop=True)
+
         else:
+            tokenization, word = _generate_vocab(kg_data, self.multi_gpu)
             word2idx = cudf.concat([cudf.Series(tokenization), cudf.Series(word)], axis=1)
+            kg_data["subject"] = kg_data.merge(word2idx, left_on="subject", right_on="word", how="left")["token"]
+            kg_data["predicate"] = kg_data.merge(word2idx, left_on="predicate", right_on="word", how="left")["token"]
+            kg_data["object"] = kg_data.merge(word2idx, left_on="object", right_on="word", how="left")["token"]
+            kg_data = kg_data.astype("int32")
         word2idx.columns = ["token", "word"]
         if self.generate_artifact:
             word2idx.to_parquet(f"vector/word2idx_{file_path.stem}.parquet", index=False)
         self.word2idx = word2idx
-        kg_data["subject"] = kg_data.merge(word2idx, left_on="subject", right_on="word", how="left")["token"]
-        kg_data["predicate"] = kg_data.merge(word2idx, left_on="predicate", right_on="word", how="left")["token"]
-        kg_data["object"] = kg_data.merge(word2idx, left_on="object", right_on="word", how="left")["token"]
-        kg_data = kg_data.astype("int32")
+
         # Load the edge list into the graph
         if self.multi_gpu:
+            # Initialize Comms only once, when we actually need it
+            if not self.comms_initialized:
+                from cugraph.dask.comms import comms as Comms
+                try:
+                    Comms.initialize(p2p=True)
+                    self.comms_initialized = True
+                    logger.info("cuGraph Comms initialized successfully")
+                except Exception as e:
+                    logger.error(f"Failed to initialize cuGraph Comms: {e}")
+                    raise
+            
+            kg_data = kg_data[["subject", "predicate", "object"]]
             self.knowledge_graph.from_dask_cudf_edgelist(kg_data, source='subject', destination='object', edge_attr='predicate', renumber=False)
+            print(self.knowledge_graph.is_directed())
         else:
             self.knowledge_graph.from_cudf_edgelist(kg_data, source='subject', destination='object', edge_attr='predicate', renumber=False)
         return kg_data
@@ -336,15 +398,25 @@ class GPU_RDF2Vec:
             context_tensor = torch.utils.dlpack.from_dlpack(walk_corpus['context'].to_dlpack()).contiguous()
             datamodule = SkipGramDataModule(center_tensor=center_tensor, context_tensor=context_tensor, batch_size=self.batch_size if self.batch_size else round(len(context_tensor)/(self.cpu_count)))
 
-        else:
+        elif self.embedding_model == "cbow":
             word2vec_model = CBOW(
                 vocab_size = self.word2idx.shape[0],
                 embedding_dim=self.vector_size,
-                learning_rate=self.learning_rate,
+                learning_rate=self.learning_rate
             )
             center_tensor = torch.utils.dlpack.from_dlpack(walk_corpus['center'].to_dlpack()).contiguous()
-            context_tensor = torch.utils.dlpack.from_dlpack(walk_corpus['context'].to_dlpack()).contiguous()
-        
+            context_series = walk_corpus['context']
+            exploded_df = context_series.to_frame("context").explode('context').reset_index()
+            exploded_df["pos"] = exploded_df.groupby("index").cumcount()
+            pivot_df = exploded_df.pivot(index="index", columns="pos", values="context")
+            reset_pivot_df = pivot_df.reset_index(drop=True)
+            reset_pivot_df = reset_pivot_df.fillna(-1).astype('int32')
+            context_tensor = torch.utils.dlpack.from_dlpack(reset_pivot_df.to_dlpack()).contiguous()
+            datamodule = CBOWDataModule(center_tensor=center_tensor, context_tensor=context_tensor, batch_size=self.batch_size if self.batch_size else round(len(context_tensor)/(self.cpu_count)))
+
+        else:
+            logger.error(f"Unsupported embedding model: {self.embedding_model}. Please choose either 'skipgram' or 'cbow'.")
+            raise ValueError(f"Unsupported embedding model: {self.embedding_model}. Please choose either 'skipgram' or 'cbow'.")
         # word2vec_model = torch.compile(word2vec_model) -> Stabalize model compilation for speedup
         if self.reproducible:
             logger.info("Setting up reproducible training, might increase training time.")
@@ -445,3 +517,15 @@ class GPU_RDF2Vec:
         embedding_df = self.transform()
         return embedding_df
     
+    def close(self):
+        """Close the Dask client, cuGraph Comms, and cluster if they exist."""
+        if self.comms_initialized:
+            try:
+                Comms.destroy()
+                logger.info("cuGraph Comms destroyed")
+            except Exception as e:
+                logger.warning(f"Error destroying Comms: {e}")
+        if self.client is not None:
+            self.client.close()
+        if self.cluster is not None:
+            self.cluster.close()
