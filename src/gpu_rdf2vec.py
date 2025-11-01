@@ -398,7 +398,7 @@ class GPU_RDF2Vec:
             context_tensor = torch.utils.dlpack.from_dlpack(walk_corpus['context'].to_dlpack()).contiguous()
             datamodule = SkipGramDataModule(center_tensor=center_tensor, context_tensor=context_tensor, batch_size=self.batch_size if self.batch_size else round(len(context_tensor)/(self.cpu_count)))
 
-        else:
+        elif self.embedding_model == "cbow":
             word2vec_model = CBOW(
                 vocab_size = self.word2idx.shape[0],
                 embedding_dim=self.vector_size,
@@ -413,6 +413,10 @@ class GPU_RDF2Vec:
             reset_pivot_df = reset_pivot_df.fillna(-1).astype('int32')
             context_tensor = torch.utils.dlpack.from_dlpack(reset_pivot_df.to_dlpack()).contiguous()
             datamodule = CBOWDataModule(center_tensor=center_tensor, context_tensor=context_tensor, batch_size=self.batch_size if self.batch_size else round(len(context_tensor)/(self.cpu_count)))
+
+        else:
+            logger.error(f"Unsupported embedding model: {self.embedding_model}. Please choose either 'skipgram' or 'cbow'.")
+            raise ValueError(f"Unsupported embedding model: {self.embedding_model}. Please choose either 'skipgram' or 'cbow'.")
         # word2vec_model = torch.compile(word2vec_model) -> Stabalize model compilation for speedup
         if self.reproducible:
             logger.info("Setting up reproducible training, might increase training time.")
