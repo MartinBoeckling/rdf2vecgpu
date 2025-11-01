@@ -375,10 +375,6 @@ class multi_gpu_walk_corpus:
 
         return pairs   # still a dask_cudf.DataFrame – call .compute() when needed
 
-    # -------------------------- BFS corpus ----------------------------- #
-    # (Algorithmically unchanged – wrapped for Dask simplicity)          #
-    # ------------------------------------------------------------------ #
-
     def bfs_walk(
         self,
         edge_df: cudf.DataFrame | dcudf.DataFrame,
