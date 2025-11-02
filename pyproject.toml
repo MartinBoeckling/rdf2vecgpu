@@ -1,6 +1,6 @@
 [project]
 name = "rdf2vecgpu"
-version = "0.2.0"
+version = "0.2.1"
 description = "GPU-Accelerated RDF2Vec – A high-performance GPU implementation of RDF2Vec that uses CUDA and RAPIDS to generate scalable, embeddings for large dense knowledge graphs."
 readme = "README.md"
 requires-python = ">=3.12"
