@@ -28,3 +28,8 @@ sources = ["src"]
 [project.urls]
 "Homepage" = "https://github.com/MartinBoeckling/rdf2vecgpu"
 "Issues" = "https://github.com/MartinBoeckling/rdf2vecgpu/issues"
+
+[project.optional-dependencies]
+mlflow = [
+    "mlflow>=3.5.1",
+]

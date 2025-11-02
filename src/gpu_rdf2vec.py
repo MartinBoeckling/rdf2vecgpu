@@ -15,6 +15,7 @@ from .embedders.word2vec import SkipGram, CBOW, OrderAwareSkipgram, OrderAwareCB
 from .embedders.word2vec_loader import SkipGramDataModule, CBOWDataModule, OrderAwareSkipGramDataModule, OrderAwareCBOWDataModule
 from .reader.kg_reader import read_kg_file
 from .corpus.walk_corpus import single_gpu_walk_corpus, multi_gpu_walk_corpus
+from .logger.mlflow_logger import make_tracker
 import cudf
 import dask.dataframe as dd
 from loguru import logger
@@ -355,7 +356,8 @@ class GPU_RDF2Vec:
         >>> edges = rdf2vec.load_data("example.parquet")
         >>> rdf2vec.fit(edges)
         """
-
+        if self.tracker:
+            self.tracker.start_pipeline(self.tracker_run_name, self.tracker_tags)
         if self.multi_gpu:
             walk_instance = multi_gpu_walk_corpus(self.knowledge_graph)
         else:
