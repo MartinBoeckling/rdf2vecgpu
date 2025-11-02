@@ -11,8 +11,8 @@ from torch.utils.data import TensorDataset, DataLoader, Dataset
 from torch.utils.dlpack import to_dlpack
 from lightning.pytorch.tuner import Tuner
 from .helper.functions import _generate_vocab
-from .embedders.word2vec import SkipGram, CBOW
-from .embedders.word2vec_loader import SkipGramDataModule, CBOWDataModule
+from .embedders.word2vec import SkipGram, CBOW, OrderAwareSkipgram, OrderAwareCBOW
+from .embedders.word2vec_loader import SkipGramDataModule, CBOWDataModule, OrderAwareSkipGramDataModule, OrderAwareCBOWDataModule
 from .reader.kg_reader import read_kg_file
 from .corpus.walk_corpus import single_gpu_walk_corpus, multi_gpu_walk_corpus
 from .logger.mlflow_logger import make_tracker
@@ -145,9 +145,6 @@ class GPU_RDF2Vec:
         self.reproducible = reproducible
         self.multi_gpu = multi_gpu
         self.learning_rate = learning_rate
-        self.tracker = None
-        self.tracker_tags = None
-        self.tracker_run_name = None
         
         # Handle client
         if multi_gpu:
@@ -175,11 +172,6 @@ class GPU_RDF2Vec:
         self.word2idx = None
         self.cpu_count = cpu_count
         self.comms_initialized = False  # Track Comms initialization
-
-    def enable_mlflow_autologging(self, experiment_name: str, tracking_uri: str, registry_uri: str = None, run_name: str = None, tags: dict = None):
-        self.tracker = make_tracker(experiment=experiment_name, tracking_uri=tracking_uri, registry_uri=registry_uri)
-        self.run_name = run_name
-        self.tracker_tags = tags
 
     def load_data(self, path: str) -> cudf.DataFrame:
         """
@@ -295,11 +287,11 @@ class GPU_RDF2Vec:
         else:
             tokenization, word = _generate_vocab(kg_data, self.multi_gpu)
             word2idx = cudf.concat([cudf.Series(tokenization), cudf.Series(word)], axis=1)
+            word2idx.columns = ["token", "word"]
             kg_data["subject"] = kg_data.merge(word2idx, left_on="subject", right_on="word", how="left")["token"]
             kg_data["predicate"] = kg_data.merge(word2idx, left_on="predicate", right_on="word", how="left")["token"]
             kg_data["object"] = kg_data.merge(word2idx, left_on="object", right_on="word", how="left")["token"]
             kg_data = kg_data.astype("int32")
-        word2idx.columns = ["token", "word"]
         if self.generate_artifact:
             word2idx.to_parquet(f"vector/word2idx_{file_path.stem}.parquet", index=False)
         self.word2idx = word2idx
@@ -408,7 +400,7 @@ class GPU_RDF2Vec:
             context_tensor = torch.utils.dlpack.from_dlpack(walk_corpus['context'].to_dlpack()).contiguous()
             datamodule = SkipGramDataModule(center_tensor=center_tensor, context_tensor=context_tensor, batch_size=self.batch_size if self.batch_size else round(len(context_tensor)/(self.cpu_count)))
 
-        else:
+        elif self.embedding_model == "cbow":
             word2vec_model = CBOW(
                 vocab_size = self.word2idx.shape[0],
                 embedding_dim=self.vector_size,
@@ -423,6 +415,10 @@ class GPU_RDF2Vec:
             reset_pivot_df = reset_pivot_df.fillna(-1).astype('int32')
             context_tensor = torch.utils.dlpack.from_dlpack(reset_pivot_df.to_dlpack()).contiguous()
             datamodule = CBOWDataModule(center_tensor=center_tensor, context_tensor=context_tensor, batch_size=self.batch_size if self.batch_size else round(len(context_tensor)/(self.cpu_count)))
+
+        else:
+            logger.error(f"Unsupported embedding model: {self.embedding_model}. Please choose either 'skipgram' or 'cbow'.")
+            raise ValueError(f"Unsupported embedding model: {self.embedding_model}. Please choose either 'skipgram' or 'cbow'.")
         # word2vec_model = torch.compile(word2vec_model) -> Stabalize model compilation for speedup
         if self.reproducible:
             logger.info("Setting up reproducible training, might increase training time.")
