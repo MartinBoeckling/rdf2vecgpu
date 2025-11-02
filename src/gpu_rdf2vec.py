@@ -11,8 +11,8 @@ from torch.utils.data import TensorDataset, DataLoader, Dataset
 from torch.utils.dlpack import to_dlpack
 from lightning.pytorch.tuner import Tuner
 from .helper.functions import _generate_vocab
-from .embedders.word2vec import SkipGram, CBOW
-from .embedders.word2vec_loader import SkipGramDataModule, CBOWDataModule
+from .embedders.word2vec import SkipGram, CBOW, OrderAwareSkipgram, OrderAwareCBOW
+from .embedders.word2vec_loader import SkipGramDataModule, CBOWDataModule, OrderAwareSkipGramDataModule, OrderAwareCBOWDataModule
 from .reader.kg_reader import read_kg_file
 from .corpus.walk_corpus import single_gpu_walk_corpus, multi_gpu_walk_corpus
 import cudf
@@ -286,11 +286,11 @@ class GPU_RDF2Vec:
         else:
             tokenization, word = _generate_vocab(kg_data, self.multi_gpu)
             word2idx = cudf.concat([cudf.Series(tokenization), cudf.Series(word)], axis=1)
+            word2idx.columns = ["token", "word"]
             kg_data["subject"] = kg_data.merge(word2idx, left_on="subject", right_on="word", how="left")["token"]
             kg_data["predicate"] = kg_data.merge(word2idx, left_on="predicate", right_on="word", how="left")["token"]
             kg_data["object"] = kg_data.merge(word2idx, left_on="object", right_on="word", how="left")["token"]
             kg_data = kg_data.astype("int32")
-        word2idx.columns = ["token", "word"]
         if self.generate_artifact:
             word2idx.to_parquet(f"vector/word2idx_{file_path.stem}.parquet", index=False)
         self.word2idx = word2idx
