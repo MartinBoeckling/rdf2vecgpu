@@ -6,15 +6,19 @@ The training process of RDF2vec embeddings using the `gpuRDF2vec` package involv
 happen internally which use the GPU acceleration capabilities of the package. 
 The overall training of the embedding model happens by calling the `fit` method of the `GPU_RDF2Vec` class.
 Below, we outline the main steps that are performed during the training process:
+
 1. **Walk Extraction**: Based on the selected walk strategy (random or BFS), the package generates 
 walks from the knowledge graph. This step is performed entirely on the GPU using cuGraph for 
 efficient graph traversal and walk generation.
+
 2. **Data Preparation**: The generated walks are then prepared for training the Word2Vec model. This involves converting the walks into a format 
 suitable for the embedding model, which is also done on the GPU using cuDF dataframes which transforms
 the data into PyTorch tensors via DLPack to avoid CPU bottlenecks.
+
 3. **Embedding Training**: The Word2Vec model is trained using the prepared walks. 
 The package uses an optimized implementation of Word2Vec that leverages GPU acceleration for 
 faster training times and allows scaling accross different nodes and GPUs.
+
 4. **Model Saving**: After training, the learned embeddings can be saved to disk for later use.
 Here is an example code snippet demonstrating how to train RDF2vec embeddings using the `gpuRDF2vec` package:
 

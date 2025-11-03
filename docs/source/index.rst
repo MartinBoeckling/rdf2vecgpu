@@ -64,7 +64,7 @@ This project is licensed under the MIT License.
    gettingstarted
    dataload
    training
-   vectorRetrieval
+   vectorretrieval
 
 
 Indices and tables

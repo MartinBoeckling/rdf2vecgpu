@@ -8,6 +8,7 @@ of dlpack to extract the vectors directly from GPU memory. This allows in genera
 to handle large-scale knowledge graphs efficiently.
 
 The following example demonstrates how to perform this retrieval process:
+
 .. code-block:: python
 
     from gpuRDF2vec import GPU_RDF2vec
