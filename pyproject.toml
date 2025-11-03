@@ -23,7 +23,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build]
-sources = ["src"]
+sources = ["src/rdf2vecgpu"]
 
 [project.urls]
 "Homepage" = "https://github.com/MartinBoeckling/rdf2vecgpu"
