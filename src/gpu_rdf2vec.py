@@ -671,3 +671,156 @@ class GPU_RDF2Vec:
                 logger.warning(f"Error destroying Comms: {e}")
         if self.client is not None:
             self.client.close()
+
+    def _validate_config(self):
+        """Validates the configuration parameters for the GPU_RDF2Vec class.
+
+        This method checks the validity of various configuration parameters, ensuring
+        they meet the expected types, ranges, and constraints. If any parameter is invalid,
+        an appropriate exception is raised.
+
+            ValueError: If `walk_strategy` is not "random" or "bfs".
+
+            ValueError: If `embedding_model` is not "skipgram" or "cbow".
+
+            TypeError: If any of the following parameters is not an integer:
+            `walk_depth`, `walk_number`, `epochs`, `vector_size`, `window_size`,
+            `min_count`, `negative_samples`, `random_state`, `cpu_count`, `number_nodes`.
+
+            TypeError: If `learning_rate` is not a float.
+
+            TypeError: If any of the following parameters is not a boolean:
+            `reproducible`, `multi_gpu`, `generate_artifact`, `tune_batch_size`.
+
+            ValueError: If any of the following parameters is not a positive integer:
+            `walk_depth`, `walk_number`, `epochs`, `vector_size`, `window_size`,
+            `cpu_count`, `number_nodes`.
+
+            ValueError: If `min_count` or `negative_samples` is negative.
+
+            ValueError: If `learning_rate` is not a positive float.
+
+            TypeError: If `batch_size` is provided and is not an integer.
+
+            ValueError: If `batch_size` is provided and is not greater than 0.
+
+            ValueError: If `window_size` is greater than `walk_depth`.
+
+            EnvironmentError: If CUDA is not available on the system.
+
+            ValueError: If `multi_gpu` is True but no Dask client is provided.
+
+            Warning: If `multi_gpu` is True but fewer than 1 GPU is detected.
+
+            Warning: If `tune_batch_size` is True while `reproducible` is also True.
+
+        Notes:
+            - If `window_size` is greater than `walk_depth`, a warning is logged as it may lead to unexpected behavior.
+            - If `tune_batch_size` is enabled while `reproducible` is True, a warning is logged as it may reduce reproducibility.
+            - If `multi_gpu` is enabled, a Dask client must be provided, and at least one GPU must be visible to the process.
+        """
+
+        if self.walk_strategy not in ["random", "bfs"]:
+            raise ValueError(
+                f"Unsupported walk strategy: {self.walk_strategy}. Please choose either 'random' or 'bfs'."
+            )
+        if self.embedding_model not in ["skipgram", "cbow"]:
+            raise ValueError(
+                f"Unsupported embedding model: {self.embedding_model}. Please choose either 'skipgram' or 'cbow'."
+            )
+
+        for name, val in {
+            "walk_depth": self.walk_depth,
+            "walk_number": self.walk_number,
+            "epochs": self.epochs,
+            "vector_size": self.vector_size,
+            "window_size": self.window_size,
+            "min_count": self.min_count,
+            "negative_samples": self.negative_samples,
+            "random_state": self.random_state,
+            "cpu_count": self.cpu_count,
+            "number_nodes": self.num_nodes,
+        }.items():
+            if not isinstance(val, int):
+                raise TypeError(f"{name} must be int, got {type(val)}")
+
+        # Boolean checks
+        if not isinstance(self.learning_rate, float):
+            raise TypeError(
+                f"learning_rate must be a float value, got {type(self.learning_rate)}"
+            )
+        if not isinstance(self.reproducible, bool):
+            raise TypeError(
+                f"reproducible must be a bool value, got {type(self.reproducible)}"
+            )
+        if not isinstance(self.multi_gpu, bool):
+            raise TypeError(
+                f"multi_gpu must be a bool value, got {type(self.multi_gpu)}"
+            )
+        if not isinstance(self.generate_artifact, bool):
+            raise TypeError(
+                f"generate_artifact must be a bool value, got {type(self.generate_artifact)}"
+            )
+        if not isinstance(self.tune_batch_size, bool):
+            raise TypeError(
+                f"tune_batch_size must be a bool value, got {type(self.tune_batch_size)}"
+            )
+
+        # Numeric value checks
+        if self.walk_depth <= 0:
+            raise ValueError("walk_depth must be a positive integer")
+        if self.walk_number <= 0:
+            raise ValueError("walk_number must be a positive integer")
+        if self.epochs <= 0:
+            raise ValueError("epochs must be a positive integer")
+        if self.vector_size <= 0:
+            raise ValueError("vector_size must be a positive integer")
+        if self.window_size <= 0:
+            raise ValueError("window_size must be a positive integer")
+        if self.min_count < 0:
+            raise ValueError("min_count must be a non-negative integer")
+        if self.negative_samples < 0:
+            raise ValueError("negative_samples must be a non-negative integer")
+        if self.learning_rate <= 0:
+            raise ValueError("learning_rate must be a positive float value")
+        if self.cpu_count <= 0:
+            raise ValueError("cpu_count must be a positive integer")
+        if self.num_nodes <= 0:
+            raise ValueError("number_nodes must be a positive integer")
+
+        if hasattr(self, "batch_size") and self.batch_size is not None:
+            if not isinstance(self.batch_size, int):
+                raise TypeError(
+                    f"batch_size must be int when provided, got {type(self.batch_size).__name__}"
+                )
+            if self.batch_size <= 0:
+                raise ValueError("batch_size must be > 0 when provided")
+
+        if self.window_size > self.walk_depth:
+            logger.warning(
+                "window_size is greater than walk_depth; this may lead to unexpected behavior."
+            )
+        if self.reproducible and self.tune_batch_size:
+            logger.warning(
+                "tune_batch_size=True may reduce reproducibility; consider disabling when reproducible=True."
+            )
+
+        if not torch.cuda.is_available():
+            raise EnvironmentError(
+                "CUDA is not available. A GPU is required to run this code."
+            )
+        if self.multi_gpu and self.client is None:
+            raise ValueError(
+                "multi_gpu=True requires a Dask client. Please create a "
+                "LocalCUDACluster and Client, then pass the client to GPU_RDF2Vec.\n"
+                "Example:\n"
+                "  from dask_cuda import LocalCUDACluster\n"
+                "  from dask.distributed import Client\n"
+                "  cluster = LocalCUDACluster(...)\n"
+                "  client = Client(cluster)\n"
+                "  rdf2vec = GPU_RDF2Vec(..., client=client)"
+            )
+        if self.multi_gpu and torch.cuda.device_count() < 1:
+            logger.warning(
+                "multi_gpu=True but torch reports <1 visible GPU on this process."
+            )
