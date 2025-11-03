@@ -10,8 +10,11 @@ except ImportError as e:
     logger.exception("mlflow is not installed. Please install it to use MLflowLogger.")
     raise
 
+
 class MlflowTracker(BaseTracker):
-    def __init__(self, experiment: str, tracking_uri: str, registry_uri: Optional[str] = None):
+    def __init__(
+        self, experiment: str, tracking_uri: str, registry_uri: Optional[str] = None
+    ):
         mlflow.set_tracking_uri(tracking_uri)
         if registry_uri:
             mlflow.set_registry_uri(registry_uri)
@@ -20,9 +23,12 @@ class MlflowTracker(BaseTracker):
         self._parent_run = None
         self._active_stage_runs = []
 
-    def enabled(self) -> bool: return True
+    def enabled(self) -> bool:
+        return True
 
-    def start_pipeline(self, run_name: Optional[str] = None, tags: Optional[Dict[str, str]] = None) -> "MlflowTracker":
+    def start_pipeline(
+        self, run_name: Optional[str] = None, tags: Optional[Dict[str, str]] = None
+    ) -> "MlflowTracker":
         if run_name is not None:
             self._parent_run = mlflow.start_run(run_name)
         else:
@@ -30,7 +36,7 @@ class MlflowTracker(BaseTracker):
         if tags:
             mlflow.set_tags(tags)
         return self
-    
+
     def stage(self, name: str):
         run = mlflow.start_run(run_name=name, nested=True)
         self._active_stage_runs.append(run)
@@ -39,6 +45,7 @@ class MlflowTracker(BaseTracker):
         finally:
             mlflow.end_run()
             self._active_stage_runs.pop()
+
     def log_params(self, params: Dict[str, Any]):
         mlflow.log_params(params)
 
@@ -47,11 +54,11 @@ class MlflowTracker(BaseTracker):
             mlflow.log_metrics(metrics, step=step)
         else:
             mlflow.log_metrics(metrics)
-    
+
     def set_tags(self, tags: Dict[str, str]):
         mlflow.set_tags(tags)
 
-    def log_artifact(self, path, artifact_path = None):
+    def log_artifact(self, path, artifact_path=None):
         mlflow.log_artifact(path, artifact_path=artifact_path)
 
     def log_figure(self, fig, artifact_file, artifact_path):
@@ -72,6 +79,9 @@ class MlflowTracker(BaseTracker):
             self._parent_run = None
 
 
-def make_tracker(experiment: str, tracking_uri: str, registry_uri: Optional[str] = None) -> Union[MlflowTracker, None]:
-    return MlflowTracker(experiment=experiment, tracking_uri=tracking_uri, registry_uri=registry_uri)
-
+def make_tracker(
+    experiment: str, tracking_uri: str, registry_uri: Optional[str] = None
+) -> Union[MlflowTracker, None]:
+    return MlflowTracker(
+        experiment=experiment, tracking_uri=tracking_uri, registry_uri=registry_uri
+    )
