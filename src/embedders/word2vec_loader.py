@@ -2,6 +2,7 @@ import lightning as L
 from torch.utils.data import DataLoader, Dataset, RandomSampler, BatchSampler
 import torch
 
+
 class _IndexDataset(Dataset):
     """Lightweight wrapper that just returns its own index.
 
@@ -9,6 +10,7 @@ class _IndexDataset(Dataset):
     integer indices that we slice in a custom collate_fn.  Returning only the
     index keeps __getitem__ O(1) and avoids creating per‑sample tensors.
     """
+
     def __init__(self, length: int):
         self._len = length
 
@@ -30,12 +32,18 @@ class SkipGramDataModule(L.LightningDataModule):
         Number of (centre, context) pairs per optimisation step.
     """
 
-    def __init__(self, center_tensor: torch.Tensor, context_tensor: torch.Tensor, *, batch_size: int):
+    def __init__(
+        self,
+        center_tensor: torch.Tensor,
+        context_tensor: torch.Tensor,
+        *,
+        batch_size: int,
+    ):
         super().__init__()
         assert center_tensor.device.type == "cuda", "tensors must be on GPU"
         assert center_tensor.shape == context_tensor.shape
 
-        self.center  = center_tensor.contiguous()
+        self.center = center_tensor.contiguous()
         self.context = context_tensor.contiguous()
         self.batch_size = batch_size
 
@@ -47,7 +55,9 @@ class SkipGramDataModule(L.LightningDataModule):
 
     def train_dataloader(self):
         sampler = RandomSampler(self._dataset, replacement=False)
-        batch_sampler = BatchSampler(sampler, batch_size=self.batch_size, drop_last=False)
+        batch_sampler = BatchSampler(
+            sampler, batch_size=self.batch_size, drop_last=False
+        )
 
         def _collate(indices: list[int]):  # indices comes from BatchSampler
             idx = torch.tensor(indices, device=self.center.device)
@@ -57,10 +67,11 @@ class SkipGramDataModule(L.LightningDataModule):
             self._dataset,
             batch_sampler=batch_sampler,
             collate_fn=_collate,
-            num_workers=0,          # CUDA tensors + index dataset → no workers
+            num_workers=0,  # CUDA tensors + index dataset → no workers
             pin_memory=False,
         )
-    
+
+
 class CBOWDataModule(L.LightningDataModule):
     """Dataloading optimised for a GPU-resident CBOW table.
 
@@ -80,20 +91,20 @@ class CBOWDataModule(L.LightningDataModule):
         context_tensor: torch.Tensor,
         center_tensor: torch.Tensor,
         *,
-        batch_size: int
+        batch_size: int,
     ):
         super().__init__()
         # both tensors must be on CUDA
         assert context_tensor.device.type == "cuda", "context_tensor must be on GPU"
-        assert center_tensor.device.type  == "cuda", "center_tensor must be on GPU"
+        assert center_tensor.device.type == "cuda", "center_tensor must be on GPU"
         # must have same first dimension
         assert context_tensor.dim() == 2, "context_tensor must be 2-D"
-        assert center_tensor.dim()  == 1, "center_tensor must be 1-D"
+        assert center_tensor.dim() == 1, "center_tensor must be 1-D"
         assert context_tensor.shape[0] == center_tensor.shape[0]
 
         # store contiguous views
-        self.context    = context_tensor.contiguous()
-        self.center     = center_tensor.contiguous()
+        self.context = context_tensor.contiguous()
+        self.center = center_tensor.contiguous()
         self.batch_size = batch_size
 
         # simple index dataset
@@ -104,11 +115,9 @@ class CBOWDataModule(L.LightningDataModule):
         pass
 
     def train_dataloader(self):
-        sampler       = RandomSampler(self._dataset, replacement=False)
+        sampler = RandomSampler(self._dataset, replacement=False)
         batch_sampler = BatchSampler(
-            sampler,
-            batch_size=self.batch_size,
-            drop_last=False
+            sampler, batch_size=self.batch_size, drop_last=False
         )
 
         def _collate(indices: list[int]):
@@ -120,9 +129,10 @@ class CBOWDataModule(L.LightningDataModule):
             self._dataset,
             batch_sampler=batch_sampler,
             collate_fn=_collate,
-            num_workers=0,     # GPU tensors + index sampler → no subprocesses
+            num_workers=0,  # GPU tensors + index sampler → no subprocesses
             pin_memory=False,
         )
+
 
 class OrderAwareSkipGramDataModule(L.LightningDataModule):
     """Dataloading optimised for a GPU‑resident order-aware skip‑gram table.
@@ -138,12 +148,12 @@ class OrderAwareSkipGramDataModule(L.LightningDataModule):
     """
 
     def __init__(
-        self, 
-        center_tensor: torch.Tensor, 
-        context_tensor: torch.Tensor, 
+        self,
+        center_tensor: torch.Tensor,
+        context_tensor: torch.Tensor,
         distance_tensor: torch.Tensor,
-        *, 
-        batch_size: int
+        *,
+        batch_size: int,
     ):
         super().__init__()
         assert center_tensor.device.type == "cuda", "tensors must be on GPU"
@@ -164,7 +174,9 @@ class OrderAwareSkipGramDataModule(L.LightningDataModule):
 
     def train_dataloader(self):
         sampler = RandomSampler(self._dataset, replacement=False)
-        batch_sampler = BatchSampler(sampler, batch_size=self.batch_size, drop_last=False)
+        batch_sampler = BatchSampler(
+            sampler, batch_size=self.batch_size, drop_last=False
+        )
 
         def _collate(indices: list[int]):  # indices comes from BatchSampler
             idx = torch.tensor(indices, device=self.center.device)
@@ -174,7 +186,7 @@ class OrderAwareSkipGramDataModule(L.LightningDataModule):
             self._dataset,
             batch_sampler=batch_sampler,
             collate_fn=_collate,
-            num_workers=0,          # CUDA tensors + index dataset → no workers
+            num_workers=0,  # CUDA tensors + index dataset → no workers
             pin_memory=False,
         )
 
@@ -202,22 +214,28 @@ class OrderAwareCBOWDataModule(L.LightningDataModule):
         context_distance_tensor: torch.Tensor,
         center_tensor: torch.Tensor,
         *,
-        batch_size: int
+        batch_size: int,
     ):
         super().__init__()
         # all tensors must be on CUDA
         assert context_tensor.device.type == "cuda", "context_tensor must be on GPU"
-        assert context_distance_tensor.device.type == "cuda", "context_distance_tensor must be on GPU"
+        assert (
+            context_distance_tensor.device.type == "cuda"
+        ), "context_distance_tensor must be on GPU"
         assert center_tensor.device.type == "cuda", "center_tensor must be on GPU"
-        
+
         # check dimensions
         assert context_tensor.dim() == 2, "context_tensor must be 2-D"
         assert context_distance_tensor.dim() == 2, "context_distance_tensor must be 2-D"
         assert center_tensor.dim() == 1, "center_tensor must be 1-D"
-        
+
         # check shape compatibility
-        assert context_tensor.shape == context_distance_tensor.shape, "context and distance tensors must have same shape"
-        assert context_tensor.shape[0] == center_tensor.shape[0], "first dimension must match between context and center tensors"
+        assert (
+            context_tensor.shape == context_distance_tensor.shape
+        ), "context and distance tensors must have same shape"
+        assert (
+            context_tensor.shape[0] == center_tensor.shape[0]
+        ), "first dimension must match between context and center tensors"
 
         # store contiguous views
         self.context = context_tensor.contiguous()
@@ -235,9 +253,7 @@ class OrderAwareCBOWDataModule(L.LightningDataModule):
     def train_dataloader(self):
         sampler = RandomSampler(self._dataset, replacement=False)
         batch_sampler = BatchSampler(
-            sampler,
-            batch_size=self.batch_size,
-            drop_last=False
+            sampler, batch_size=self.batch_size, drop_last=False
         )
 
         def _collate(indices: list[int]):
@@ -249,6 +265,6 @@ class OrderAwareCBOWDataModule(L.LightningDataModule):
             self._dataset,
             batch_sampler=batch_sampler,
             collate_fn=_collate,
-            num_workers=0,     # GPU tensors + index sampler → no subprocesses
+            num_workers=0,  # GPU tensors + index sampler → no subprocesses
             pin_memory=False,
         )
