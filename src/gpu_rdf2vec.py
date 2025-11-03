@@ -174,6 +174,7 @@ class GPU_RDF2Vec:
         self.tune_batch_size = tune_batch_size
         self.num_nodes = number_nodes
 
+        self._validate_config()
         # Handle client
         if multi_gpu:
             if client is None:
@@ -194,7 +195,6 @@ class GPU_RDF2Vec:
             dask.config.set({"dataframe.backend": "cudf"})
         else:
             self.client = None
-
         # Initialize the cugraph graph
         self.knowledge_graph = Graph(directed=True)
         self.generate_artifact = generate_artifact
