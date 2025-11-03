@@ -11,22 +11,40 @@ import torch
 
 
 class single_gpu_walk_corpus:
+    """Build word2vec training pairs from a cuGraph single-GPU Graph.
+
+    Generates Skip-gram or CBOW pairs from:
+    - Uniform random walks
+    - BFS paths from start vertices to leaves
+
+    Tokens are integers derived directly from vertex/predicate ids, and an
+    optional frequency threshold `min_count` filters rare tokens.
+    """
+
     def __init__(self, graph: Graph, window_size: int):
+        """Create a single-GPU corpus builder.
+
+        Args:
+            graph (Graph): cuGraph single-GPU Graph containing the data.
+            window_size (int): Context window radius used to form pairs.
+        """
         self.G = graph
         self.window_size = window_size
 
     def _replace_entities_with_tokens(
         self, tokeninzation: cudf.Series, word: cudf.Series, edge_df: cudf.DataFrame
     ) -> tuple[cudf.DataFrame, cudf.DataFrame]:
-        """_summary_
+        """Map string/entity identifiers in edges to integer token ids.
 
         Args:
-            tokeninzation (cudf.Series): _description_
-            word (cudf.Series): _description_
-            edge_df (cudf.DataFrame): _description_
+            tokeninzation (cudf.Series): Token ids aligned with `word`.
+            word (cudf.Series): Original entity strings/ids aligned with tokens.
+            edge_df (cudf.DataFrame): Edge list with columns ['subject','predicate','object'].
 
         Returns:
-            tuple[cudf.DataFrame, cudf.DataFrame]: _description_
+            tuple[cudf.DataFrame, cudf.DataFrame]:
+                - Updated edge_df with integer tokens (int32).
+                - word2idx DataFrame with columns ['token','word'].
         """
         word2idx = cudf.concat([cudf.Series(tokeninzation), cudf.Series(word)], axis=1)
         word2idx.columns = ["token", "word"]
@@ -43,13 +61,20 @@ class single_gpu_walk_corpus:
         return edge_df, word2idx
 
     def _triples_to_tokens(self, df: cudf.DataFrame, min_count) -> cudf.DataFrame:
-        """_summary_
+        """Linearize (src, predicate, dst) triples into token sequences per walk.
+
+        Expected input columns: ['src','predicate','dst','walk_id','step'].
+
+        For each walk:
+          pos=0 → src at step=0
+          pos=2*k+1 → predicate at step=k
+          pos=2*k+2 → dst at step=k
+
+        Tokens with total frequency < min_count are removed.
 
         Args:
-            df (cudf.DataFrame): _description_
-
-        Returns:
-            cudf.DataFrame: _description_
+            df (cudf.DataFrame): Triple rows with walk and step metadata.
+            min_count (int): Minimum token frequency to keep.
         """
         df = df.sort_values(["walk_id", "step"])
 

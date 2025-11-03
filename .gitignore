@@ -188,3 +188,4 @@ test.py
 wikidata*
 uv.lock
 .uv.lock
+.DS_Store
