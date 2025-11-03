@@ -1,7 +1,2 @@
-sphinx.ext.autodoc
-sphinx.ext.napoleon
-sphinx.ext.viewcode
-sphinx.ext.autosummary
-sphinx.ext.intersphinx
-sphinx.ext.autosectionlabel
+furo
 sphinxemoji.sphinxemoji
