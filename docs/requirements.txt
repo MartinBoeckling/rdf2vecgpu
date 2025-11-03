@@ -1,2 +1,2 @@
 furo
-sphinxemoji.sphinxemoji
+sphinxemoji
