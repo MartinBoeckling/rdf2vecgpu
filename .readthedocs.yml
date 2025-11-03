@@ -3,7 +3,7 @@ version: 2
 
 sphinx:
   # Path to your Sphinx configuration file.
-  configuration: docs/conf.py
+  configuration: docs/source/conf.py
 
 # Image to use
 build:
