@@ -65,7 +65,7 @@ six @ file:///home/conda/feedstock_root/build_artifacts/six_1733380938961/work
 smart_open @ file:///home/conda/feedstock_root/build_artifacts/smart_open_1734485076778/work/dist
 smmap @ file:///home/conda/feedstock_root/build_artifacts/smmap_1739781697784/work
 tomlkit==0.7.2
-torch==1.13.1
+torch==2.7.0
 tqdm==4.67.1
 typing-inspection @ file:///home/conda/feedstock_root/build_artifacts/typing-inspection_1741438046699/work
 typing_extensions @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_typing_extensions_1744302253/work
