@@ -45,10 +45,9 @@ Here is an example code snippet demonstrating how to train RDF2vec embeddings us
         generate_artifact=False,
         cpu_count=20
     )
-
-   # Fit the model to the knowledge graph data
-   gpu_rdf2vec_model.fit(
-       graph_path="path/to/knowledge_graph.nt",
-       graph_format="nt",
-       engine="cudf"
-   )
+    # Read data from knowledge graph
+    path = "data/wikidata5m/wikidata5m_kg.parquet"
+    # Load data and receive edge data
+    edge_data = gpu_rdf2vec_model.load_data(path)
+    # Fit the model to the knowledge graph data
+    gpu_rdf2vec_model.fit(edge_df=edge_data, walk_vertices=None)

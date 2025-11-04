@@ -11,16 +11,32 @@ The following example demonstrates how to perform this retrieval process:
 
 .. code-block:: python
 
-    from gpuRDF2vec import GPU_RDF2vec
-
-    # Initialize the GPU_RDF2vec object with the path to your knowledge graph
-    rdf2vec = GPU_RDF2vec(kg_path="path/to/your/knowledge_graph.ttl")
-
-    # Train the RDF2Vec embeddings
-    rdf2vec.train(embedding_size=128, epochs=10)
-
-    # Retrieve the embeddings for all entities
-    embeddings = rdf2vec.transform()
+    gpu_rdf2vec_model = GPU_RDF2Vec(
+        walk_strategy="random",
+        walk_depth=4,
+        walk_number=100,
+        embedding_model="skipgram",
+        epochs=5,
+        batch_size=None,
+        vector_size=100,
+        window_size=5,
+        min_count=1,
+        learning_rate=0.01,
+        negative_samples=5,
+        random_state=42,
+        reproducible=False,
+        multi_gpu=False,
+        generate_artifact=False,
+        cpu_count=20
+    )
+    # Read data from knowledge graph
+    path = "data/wikidata5m/wikidata5m_kg.parquet"
+    # Load data and receive edge data
+    edge_data = gpu_rdf2vec_model.load_data(path)
+    # Fit the model to the knowledge graph data
+    gpu_rdf2vec_model.fit(edge_df=edge_data, walk_vertices=None)
+    # Retrieve the learned embeddings
+    embeddings = gpu_rdf2vec_model.transform()
 
 The `transform` method returns a cudf dataframe where the keys are the entity URIs, together with 
 the internal integer based ID and the embedding vectors. In case you set the **generate_artifact** 

@@ -1,7 +1,7 @@
-src.corpus package
+rdf2vecgpu.corpus package
 ==================
 
-.. automodule:: src.corpus
+.. automodule:: rdf2vecgpu.corpus
    :members:
    :show-inheritance:
    :undoc-members:
@@ -12,4 +12,4 @@ Submodules
 .. toctree::
    :maxdepth: 4
 
-   src.corpus.walk_corpus
+   rdf2vecgpu.corpus.walk_corpus

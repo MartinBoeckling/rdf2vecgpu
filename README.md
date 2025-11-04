@@ -13,6 +13,7 @@ The content of this repository readme can be found here:
 - [gpuRDF2Vec](#gpurdf2vec)
 - [Table of contents](#table-of-contents)
 - [Package installation](#package-installation)
+- [Package documentation](#package-documentation)
 - [Repository setup](#repository-setup)
 - [gpuRDF2Vec overview](#gpurdf2vec-overview)
   - [Repository Structure](#repository-structure)
@@ -32,29 +33,15 @@ pip install rdf2vecgpu
 > [!IMPORTANT]
 > Make sure to install the accompanying cuda version as outlined in the [following section](#repository-setup)
 
+## Package documentation
+You can find the documentation of the package under the following [page](https://rdf2vecgpu.readthedocs.io/en/latest/), where the overall usage of the package is described together with the API references. In case there is any information missing, feel free to open a dedicated [documentation issue](https://github.com/MartinBoeckling/rdf2vecgpu/issues/new?template=documentation-improvement.md).
+
 ## Repository setup
-The repository setup builds on top of two major libraries. Both Pytorch lightning as well as the RAPIDS libraries cuDF and cuGraph. We provide the exeplanatory installation details for Cuda 12.6:
-1. Pytorch [installation page](https://pytorch.org/get-started/locally/)
-Cuda 12.6 installation
-```bash
-pip install torch torchvision torchaudio
-```
-2. Detailed cudf installation instruction [here](https://docs.rapids.ai/install/).
-Cudf Cuda 12 install
-```bash
-pip install \
-    --extra-index-url=https://pypi.nvidia.com \
-    "cudf-cu12==25.4.*" "dask-cudf-cu12==25.4.*" \
-    "cugraph-cu12==25.4.*" "nx-cugraph-cu12==25.4.*" \
-    "nx-cugraph-cu12==25.4.*"
-```
-The requirement files and conda environment files can be found here: 
-- [Conda environment](performance/env_files/rdf2vecgpu_environment.yml)
-- [Requirement file](performance/env_files/rdf2vecgpu_requirements.txt)
+The repository setup builds on top of two major libraries. Both Pytorch lightning as well as the RAPIDS libraries cuDF and cuGraph. 
 ## gpuRDF2Vec overview
 RDF2Vec is a powerful technique to generate vector embeddings of entities in RDF graphs via random walks and Word2Vec. This repository provides a GPU-optimized reimplementation, enabling:
 
-- **Speedups** on dense graphs with millions of nodes
+- **Speedups** on dense graphs with millions of nodes and edges
 - **Scalability** to industrial-scale knowledge bases
 - **Reproducible experiments** to test and qualify the overall implementation details
 ### Repository Structure
@@ -174,7 +161,7 @@ embeddings.to_parquet("data/wikidata5m/wikidata5m_embeddings.parquet", index=Fal
 We achieve order-of-magnitude for large and dense graphs over CPU-bound RDF2Vec by engineering both the **walk extraction** and the **Word2Vec training** pipelines:
 1. **GPU-Native Walk Extraction**  
    - All random-walk and BFS operations leverage cuDF/cuGraph kernels to avoid CPU–GPU data transfers and minimize latency.  
-   - To generate *k* walks per node in one pass, we replicate node indices in a single cuDF DataFrame rather than looping—fully utilizing GPU parallelism and eliminating Python-loop overhead (∼15× speedup).  
+   - To generate *k* walks per node in one pass, we replicate node indices in a single cuDF DataFrame rather than looping—fully utilizing GPU parallelism and eliminating Python-loop overhead (∼15× speedup).
    - BFS walks currently use GPU-side recursive joins; future work will reconstruct walks entirely in CUDA to remove join overhead.
 
 2. **cuDF→PyTorch Lightning Handoff**  
@@ -183,11 +170,11 @@ We achieve order-of-magnitude for large and dense graphs over CPU-bound RDF2Vec 
    - An “index-only” strategy (workers pull tensor indices instead of slices) uses CUDA’s pointer arithmetic for constant-time access, collapsing DataLoader overhead from ~85% of epoch time to near parity with model compute.
 
 3. **Optimized Word2Vec Training**  
-   - **Batch-Size Heuristic:** Estimate per-sample GPU footprint from cuDF loader, then set initial batch = (total VRAM) / (4 × footprint). This “divide-by-four” rule quickly homes in on a viable batch size, reducing tuning runs.  
-   - **Kernel Fusion:** All sampling and tensor transforms migrated into PyTorch’s C++ back end, removing Python loops and the GIL, for consistent high throughput.  
+   - **Batch-Size Heuristic:** Estimate per-sample GPU footprint from cuDF loader, then set initial batch = (total VRAM) / (4 × footprint). This “divide-by-four” rule quickly homes in on a viable batch size, reducing tuning runs.
+   - **Kernel Fusion:** All sampling and tensor transforms migrated into PyTorch’s C++ back end, removing Python loops and the GIL, for consistent high throughput.
 
 4. **Scalable Data-Parallel Training**  
-   - We use PyTorch Distributed + NCCL: each GPU holds the same graph shard but a unique walk corpus.  
+   - We use PyTorch Distributed + NCCL: each GPU holds the same graph shard but a unique walk corpus.
    - Gradients are synchronized via `all_reduce` at regular intervals (~500 ms), amortizing PCIe/NVLink costs and ensuring linear scaling across nodes.
 ## License
 The overview of the used MIT license can be found [here](LICENSE)
@@ -197,7 +184,7 @@ The overview of the used MIT license can be found [here](LICENSE)
 - [ ] Provide weighted walks for spatial datasets [Issue item](https://github.com/MartinBoeckling/rdf2vecgpu/issues/4)
 - [ ] Provide logging capabilities of complete Word2Vec pipeline for [Wandb](https://wandb.ai/site/) and [mlflow](https://mlflow.org/). [Issue item](https://github.com/MartinBoeckling/rdf2vecgpu/issues/5)
 ## Report issues and bugs
-In case you have found a bug or unexpected behaviour, please reach out by opening an issue:
+In case you have found a bug or unexpected behavior, please reach out by opening a [dedicated bug issue](https://github.com/MartinBoeckling/rdf2vecgpu/issues/new?template=bug_report.md):
 1. When opening an issue, please tag the issue with the label **Bug**. Please include the following information:
     - **Environment**: OS, Python/CUDA/PyTorch/RAPIDS versions (cuDF, cuGraph)
     - **Reproduction steps**: Exact commands or small code snippet

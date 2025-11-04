@@ -66,10 +66,16 @@ This project is licensed under the MIT License.
    training
    vectorretrieval
 
+.. toctree::
+   :maxdepth: 2
+   :hidden:
+   :caption: Advanced Topics
+
+   advanced/distributedtraining
+   advanced/performanceconsiderations
 
 Indices and tables
 ------------------
 
 - :ref:`genindex`
 - :ref:`modindex`
-- :ref:`search`

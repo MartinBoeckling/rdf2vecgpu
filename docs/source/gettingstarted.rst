@@ -19,7 +19,7 @@ the data into embeddings in one step. Both can also be independently called usin
 Basic usage 
 ~~~~~~~~~~~~
 .. code-block:: python
-
+    
    from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
     # Instantiate the gpu RDF2Vec library settings
     gpu_rdf2vec_model = GPU_RDF2Vec(

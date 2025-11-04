@@ -85,8 +85,6 @@ If you are working with the sources in this repo:
    python -m pip install -U pip setuptools wheel
    python -m pip install -e .
 
-   # Optional: install test/dev tools if provided by the project
-   # python -m pip install -e ".[dev]"
 
 Verify your installation
 ------------------------
@@ -115,13 +113,13 @@ Troubleshooting
 
 - No matching distribution found / pip cannot find a wheel:
   - Upgrade pip: ``python -m pip install -U pip``
-  - Ensure your Python version is supported (Python 3.8+).
+  - Ensure your Python version is supported (Python 3.12+).
   - On some platforms/architectures, building from source may require build tools.
 
 - CUDA or GPU not detected:
   - Verify your PyTorch install: ``python -c "import torch; print(torch.cuda.is_available())"``
   - Install a CUDA-enabled PyTorch build matching your driver/runtime.
-  - macOS does not support CUDA; use CPU.
+  - macOS does not support CUDA; **library cannot be used**
 
 - Permission errors on Linux:
   - Use a virtual environment, or add ``--user`` to pip installs.
