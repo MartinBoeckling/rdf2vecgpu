@@ -25,8 +25,8 @@
 
     <doap:release>
       <doap:Version>
-        <doap:revision>0.2.1</doap:revision>
-        <doap:created>2025-11-02</doap:created>
+        <doap:revision>0.2.3</doap:revision>
+        <doap:created>2025-11-14</doap:created>
         <doap:download-page rdf:resource="https://pypi.org/project/rdf2vecgpu/" />
       </doap:Version>
     </doap:release>

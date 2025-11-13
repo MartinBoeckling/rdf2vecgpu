@@ -18,7 +18,7 @@ from .embedders.word2vec_loader import (
 )
 from .reader.kg_reader import read_kg_file
 from .corpus.walk_corpus import single_gpu_walk_corpus, multi_gpu_walk_corpus
-from .logger.mlflow_logger import make_tracker
+# from .logger.mlflow_logger import make_tracker
 import cudf
 import dask.dataframe as dd
 from loguru import logger
@@ -173,6 +173,8 @@ class GPU_RDF2Vec:
         self.learning_rate = learning_rate
         self.tune_batch_size = tune_batch_size
         self.num_nodes = number_nodes
+        self.generate_artifact = generate_artifact
+        self.cpu_count = cpu_count
 
         self._validate_config()
         # Handle client
@@ -197,10 +199,9 @@ class GPU_RDF2Vec:
             self.client = None
         # Initialize the cugraph graph
         self.knowledge_graph = Graph(directed=True)
-        self.generate_artifact = generate_artifact
+        
         self.word2vec_model = None
         self.word2idx = None
-        self.cpu_count = cpu_count
         self.comms_initialized = False  # Track Comms initialization
 
     def load_data(self, path: str) -> cudf.DataFrame:
@@ -441,8 +442,8 @@ class GPU_RDF2Vec:
          >>> edges = rdf2vec.load_data("example.parquet")
          >>> rdf2vec.fit(edges)
         """
-        if self.tracker:
-            self.tracker.start_pipeline(self.tracker_run_name, self.tracker_tags)
+        # if self.tracker:
+        #     self.tracker.start_pipeline(self.tracker_run_name, self.tracker_tags)
         if self.multi_gpu:
             walk_instance = multi_gpu_walk_corpus(
                 self.knowledge_graph,
@@ -563,7 +564,6 @@ class GPU_RDF2Vec:
                 steps_per_trial=1,
                 init_val=round(len(context_tensor) / (self.cpu_count * 2)),
                 max_trials=12,
-                num_nodes=self.num_nodes,
             )
         trainer.fit(word2vec_model, datamodule)
 
