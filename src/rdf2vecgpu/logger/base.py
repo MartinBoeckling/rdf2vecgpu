@@ -12,7 +12,7 @@ class BaseTracker:
 
     def start_pipeline(
         self, run_name: Optional[str], tags: Optional[Dict[str, str]] = None
-    ) -> None:
+    ) -> BaseTracker:
         return self
 
     @contextmanager
@@ -28,7 +28,7 @@ class BaseTracker:
     def log_artifact(self, path: str, artifact_path: Optional[str] = None):
         pass
 
-    def log_figure(self, figure: Any, artifact_path: str):
+    def log_figure(self, figure: Any, artifact_file: str, artifact_path: str):
         pass
 
     def close(self):
