@@ -86,6 +86,7 @@ class RDF2VecConfig(BaseModel):
     min_count: int = Field(default=1, ge=0)
     negative_samples: int = Field(default=5, ge=0)
     learning_rate: float = Field(default=0.0001, gt=0)
+    embedding_backend: Literal["pytorch", "gensim"] = "pytorch"
     # library settings
     random_state: int = Field(default=42, ge=0)
     reproducible: bool = False
@@ -94,3 +95,5 @@ class RDF2VecConfig(BaseModel):
     cpu_count: int = Field(default=4, gt=0)
     tune_batch_size: bool = True
     num_nodes: int = Field(default=1, gt=0)
+    tracker: Literal["mlflow", "wandb", "none"] = "none"
+    tracker_kwargs: Optional[dict] = None

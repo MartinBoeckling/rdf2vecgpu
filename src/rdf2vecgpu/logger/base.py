@@ -25,6 +25,11 @@ class BaseTracker:
     def log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None):
         pass
 
+    def log_data(
+        self, sample_data, data_name, artifact_path, tags: Optional[Dict[str, str]]
+    ):
+        pass
+
     def log_artifact(self, path: str, artifact_path: Optional[str] = None):
         pass
 
@@ -36,3 +41,7 @@ class BaseTracker:
 
     def log_model_pytorch(self, model, artifact_path: str):
         pass
+
+
+def NoOpTracker(BaseTracker):
+    pass

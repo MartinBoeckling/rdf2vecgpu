@@ -1,3 +1,4 @@
+from os import pathconf_names
 from typing import Optional
 from cugraph import Graph
 from pathlib import Path
@@ -17,9 +18,10 @@ from .embedders.word2vec_loader import (
     OrderAwareSkipGramDataModule,
     OrderAwareCBOWDataModule,
 )
-from .reader.kg_reader import read_kg_file
+from .reader.kg_file_reader import KGFileReader
 from .corpus.walk_corpus import single_gpu_walk_corpus, multi_gpu_walk_corpus
-
+from .logger.base import BaseTracker, base_tracker_list
+from .
 # from .logger.mlflow_logger import make_tracker
 import cudf
 import dask.dataframe as dd
@@ -146,7 +148,7 @@ class GPU_RDF2Vec:
         # Initialize class variables
         self.config = config
         # Handle client
-        if multi_gpu:
+        if self.config.multi_gpu:
             if client is None:
                 raise ValueError(
                     "multi_gpu=True requires a Dask client. Please create a "
@@ -171,8 +173,62 @@ class GPU_RDF2Vec:
         self.word2vec_model = None
         self.word2idx = None
 
-    # TODO - Put load data logic to reader subpackage
-    def load_data(self, path: str) -> cudf.DataFrame:
+    def read_data(
+        self,
+        path: str,
+        col_map: Optional[dict] = None,
+        read_kwargs: Optional[dict] = None,
+    ):
+        kg_reader = KGFileReader(
+            file_path=path,
+            multi_gpu=self.config.multi_gpu,
+            col_map=col_map,
+            read_kwargs=read_kwargs,
+        )
+        kg_data = kg_reader.read()
+        return kg_data
+
+    def generate_vocab(self, kg_data):
+        word2idx = _generate_vocab(kg_data, self.config.multi_gpu)
+        self.word2idx = word2idx
+        return word2idx
+
+    def construct_graph(self, kg_data):
+        if self.config.multi_gpu:
+            kg_data = kg_data[["subject", "predicate", "object"]]
+            if cugraph.dask.comms.is_initialized():
+                self.knowledge_graph.from_dask_cudf_edgelist(
+                    kg_data,
+                    source="subject",
+                    destination="object",
+                    edge_attr="predicate",
+                    renumber=False,
+                )
+            else:
+                logger.error(
+                    "The communicator for multi-gpu cuGraph is not initalized."
+                )
+                raise ValueError(
+                    "The communicator for multi-gpu cuGraph is not initalized."
+                )
+        else:
+            self.knowledge_graph.from_cudf_edgelist(
+                kg_data,
+                source="subject",
+                destination="object",
+                edge_attr="predicate",
+                renumber=False,
+            )
+
+        logger.info(f"Graph has {self.knowledge_graph.number_of_edges()} edges")
+        logger.info(f"Graph has {self.knowledge_graph.number_of_vertices()} vertices")
+
+    def load_data(
+        self,
+        path: str,
+        col_map: Optional[dict] = None,
+        read_kwargs: Optional[dict] = None,
+    ) -> cudf.DataFrame | dask.dataframe:
         """
         Load a triple file, build the token vocabulary, and populate the internal
         cuGraph instance.
@@ -220,143 +276,13 @@ class GPU_RDF2Vec:
             a`fit`).
 
         """
-
-        file_path = Path(path)
-        file_ending = file_path.suffix
-        if file_ending == ".parquet":
-            if self.config.multi_gpu:
-                kg_data = dd.read_parquet(
-                    path, columns=["subject", "predicate", "object"]
-                )
-            else:
-                kg_data = cudf.read_parquet(
-                    path, columns=["subject", "predicate", "object"]
-                )
-        elif file_ending == ".csv":
-            if self.config.multi_gpu:
-                kg_data = dd.read_csv(
-                    path, names=["subject", "predicate", "object"], header=None
-                )
-            else:
-                kg_data = cudf.read_csv(
-                    path, names=["subject", "predicate", "object"], header=None
-                )
-        elif file_ending == ".txt":
-            if self.config.multi_gpu:
-                kg_data = dd.read_csv(
-                    path, sep=" ", names=["subject", "predicate", "object"], header=None
-                )
-            else:
-                kg_data = cudf.read_text(path, names=["subject", "predicate", "object"])
-        # In order to read the .nt file we will use the csv reader extension and clean up the data
-        elif file_ending == ".nt":
-            if self.config.multi_gpu:
-                kg_data = dd.read_csv(
-                    path,
-                    sep=" ",
-                    names=["subject", "predicate", "object", "dot"],
-                    header=None,
-                )
-            else:
-                kg_data = cudf.read_csv(
-                    path, sep=" ", names=["subject", "predicate", "object"], header=None
-                )
-            kg_data = kg_data.drop(["dot"], axis=1)
-            kg_data["subject"] = (
-                kg_data["subject"].str.strip().str.replace("<", "").str.replace(">", "")
-            )
-            kg_data["predicate"] = (
-                kg_data["predicate"]
-                .str.strip()
-                .str.replace("<", "")
-                .str.replace(">", "")
-            )
-            kg_data["object"] = (
-                kg_data["object"].str.strip().str.replace("<", "").str.replace(">", "")
-            )
-        else:
-            # Use rdflib to provide a support for general purpose RDF formats and return the kg as a tuple
-            if self.config.multi_gpu:
-                raise ValueError(
-                    f"Multi-GPU support is not enabled for the file format: {file_ending}. Please consider one of the supported multi gpu formats: .parquet, .csv, .txt, .nt"
-                )
-            kg_format = guess_format(path)
-            if kg_format:
-                kg_tuple = read_kg_file(path)
-                kg_data = cudf.DataFrame(
-                    kg_tuple, columns=["subject", "object", "predicate"]
-                )
-            else:
-                raise ValueError(
-                    f"Unsupported file format: {file_ending}. Please consider either a valid RDF format or a .parquet, .csv, .txt file."
-                )
-        if self.config.multi_gpu:
-            word2idx = _generate_vocab(kg_data, self.config.multi_gpu)
-            subjects = word2idx[word2idx["role"] == "subject"][["row_id", "token"]]
-            subjects = subjects.rename(columns={"token": "subject"})
-
-            # Filter for predicates
-            predicates = word2idx[word2idx["role"] == "predicate"][["row_id", "token"]]
-            predicates = predicates.rename(columns={"token": "predicate"})
-
-            # Filter for objects
-            objects = word2idx[word2idx["role"] == "object"][["row_id", "token"]]
-            objects = objects.rename(columns={"token": "object"})
-
-            # Merge them back together using the row_id
-            subjects = subjects.set_index("row_id")
-            predicates = predicates.set_index("row_id")
-            objects = objects.set_index("row_id")
-            kg_data = dd.concat([subjects, predicates, objects], axis=1).reset_index()
-            kg_data = kg_data.astype(
-                {"subject": "int64", "predicate": "int64", "object": "int64"}
-            )
-            word2idx = (
-                word2idx[["token", "word"]].drop_duplicates().reset_index(drop=True)
-            )
-
-        else:
-            tokenization, word = _generate_vocab(kg_data, self.config.multi_gpu)
-            word2idx = cudf.concat(
-                [cudf.Series(tokenization), cudf.Series(word)], axis=1
-            )
-            word2idx.columns = ["token", "word"]
-            kg_data["subject"] = kg_data.merge(
-                word2idx, left_on="subject", right_on="word", how="left"
-            )["token"]
-            kg_data["predicate"] = kg_data.merge(
-                word2idx, left_on="predicate", right_on="word", how="left"
-            )["token"]
-            kg_data["object"] = kg_data.merge(
-                word2idx, left_on="object", right_on="word", how="left"
-            )["token"]
-            kg_data = kg_data.astype("int32")
-        if self.config.generate_artifact:
-            word2idx.to_parquet(
-                f"vector/word2idx_{file_path.stem}.parquet", index=False
-            )
-        self.word2idx = word2idx
-
-        # Load the edge list into the graph
-        if self.config.multi_gpu:
-            kg_data = kg_data[["subject", "predicate", "object"]]
-            self.knowledge_graph.from_dask_cudf_edgelist(
-                kg_data,
-                source="subject",
-                destination="object",
-                edge_attr="predicate",
-                renumber=False,
-            )
-            logger.info(f"Graph has {self.knowledge_graph.number_of_edges()} edges")
-        else:
-            self.knowledge_graph.from_cudf_edgelist(
-                kg_data,
-                source="subject",
-                destination="object",
-                edge_attr="predicate",
-                renumber=False,
-            )
-        return kg_data
+        kg_data = self.read_data(
+            path=path,
+            col_map=col_map,
+            read_kwargs=read_kwargs,
+        )
+        word2idx = self.generate_vocab(kg_data)
+        self.construct_graph(kg_data)
 
     def fit(self, edge_df: cudf.DataFrame, walk_vertices: cudf.Series = None) -> None:
         """
@@ -432,10 +358,6 @@ class GPU_RDF2Vec:
                 random_state=self.config.random_state,
                 word2vec_model=self.config.embedding_model,
                 min_count=self.config.min_count,
-            )
-        else:
-            raise ValueError(
-                f"Unsupported walk strategy: {self.config.walk_strategy}. Please choose either 'random' or 'bfs'."
             )
 
         if self.config.embedding_model == "skipgram":

@@ -37,3 +37,6 @@ include = ["src/rdf2vecgpu"]
 mlflow = [
     "mlflow>=3.5.1",
 ]
+wandb = [
+    "wandb>=0.23.0",
+]

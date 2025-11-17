@@ -73,6 +73,13 @@ class MlflowTracker(BaseTracker):
         mlflow.log_artifact(path, artifact_path=artifact_path)
 
     @override
+    def log_data(
+        self, sample_data, data_name, artifact_path, tags: Optional[Dict[str, str]]
+    ):
+        dataset = mlflow.data.from_pandas(sample_data, name=data_name)
+        mlflow.log_table(dataset, artifact_path=artifact_path, tags=tags)
+
+    @override
     def log_figure(self, fig, artifact_file, artifact_path):
         with tempfile.TemporaryDirectory() as tmpdir:
             p = os.path.join(tmpdir, artifact_file)

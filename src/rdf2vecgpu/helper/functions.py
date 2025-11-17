@@ -1,9 +1,6 @@
-from loguru import logger
 import cudf
 import dask.dataframe as dd
-import dask_cudf
-from dask_cuda import LocalCUDACluster
-from dask.distributed import Client
+import torch
 
 
 def _generate_vocab(
@@ -52,15 +49,51 @@ def _generate_vocab(
         vocabulary_categories = edge_melted.categorize(subset=["word"])
         vocabulary_categories["token"] = vocabulary_categories["word"].cat.codes
         vocabulary_categories["word"] = vocabulary_categories["word"].astype("string")
-        return vocabulary_categories
+        subjects = vocabulary_categories[vocabulary_categories["role"] == "subject"][
+            ["row_id", "token"]
+        ]
+        subjects = subjects.rename(columns={"token": "subject"})
+
+        # Filter for predicates
+        predicates = vocabulary_categories[
+            vocabulary_categories["role"] == "predicate"
+        ][["row_id", "token"]]
+        predicates = predicates.rename(columns={"token": "predicate"})
+
+        # Filter for objects
+        objects = vocabulary_categories[vocabulary_categories["role"] == "object"][
+            ["row_id", "token"]
+        ]
+        objects = objects.rename(columns={"token": "object"})
+
+        # Merge them back together using the row_id
+        subjects = subjects.set_index("row_id")
+        predicates = predicates.set_index("row_id")
+        objects = objects.set_index("row_id")
+        kg_data = dd.concat([subjects, predicates, objects], axis=1).reset_index()
+        kg_data = kg_data.astype(
+            {"subject": "int64", "predicate": "int64", "object": "int64"}
+        )
+        word2idx = (
+            vocabulary_categories[["token", "word"]]
+            .drop_duplicates()
+            .reset_index(drop=True)
+        )
+        return word2idx
 
     else:
         vocabulary = cudf.concat(
             [edge_df["subject"], edge_df["predicate"], edge_df["object"]],
             ignore_index=True,
         ).unique()
-        tokeninzation, word = vocabulary.factorize()
-        return tokeninzation, word
+        tokenization, word = vocabulary.factorize()
+        word2idx = cudf.concat([cudf.Series(tokenization), cudf.Series(word)], axis=1)
+        word2idx.columns = ["token", "word"]
+        return word2idx
+
+
+def cudf_to_torch_tensor(df, column_name: str):
+    return torch.utils.dlpack.from_dlpack(df[column_name].to_dlpack()).contiguous()
 
 
 def determine_optimal_chunksize(length_iterable: int, cpu_count: int) -> int:
