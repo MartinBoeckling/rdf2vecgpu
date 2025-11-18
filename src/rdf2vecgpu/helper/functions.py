@@ -96,6 +96,15 @@ def cudf_to_torch_tensor(df, column_name: str):
     return torch.utils.dlpack.from_dlpack(df[column_name].to_dlpack()).contiguous()
 
 
+def torch_to_cudf(torch_tensor, multi_gpu: bool):
+    if multi_gpu:
+        raise NotImplementedError(
+            "Conversion from torch Tensor to cuDF DataFrame is not implemented for multi-GPU."
+        )
+    else:
+        cudf.from_dlpack(torch_tensor.to_dlpack())
+
+
 def determine_optimal_chunksize(length_iterable: int, cpu_count: int) -> int:
     """Method to determine optimal chunksize for parallelism of unordered method
 

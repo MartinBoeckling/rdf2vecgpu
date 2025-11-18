@@ -1,16 +1,12 @@
-from os import pathconf_names
 from typing import Optional
 from cugraph import Graph
-from pathlib import Path
-import multiprocessing as mp
-from rdflib.util import guess_format
+import cugraph
 import lightning as L
 import torch
 import dask
-from cugraph.dask.comms import comms as Comms
 from torch.utils.dlpack import to_dlpack
 from lightning.pytorch.tuner import Tuner
-from .helper.functions import _generate_vocab
+from .helper.functions import _generate_vocab, cudf_to_torch_tensor, torch_to_cudf
 from .embedders.word2vec import SkipGram, CBOW, OrderAwareSkipgram, OrderAwareCBOW
 from .embedders.word2vec_loader import (
     SkipGramDataModule,
@@ -20,9 +16,7 @@ from .embedders.word2vec_loader import (
 )
 from .reader.kg_file_reader import KGFileReader
 from .corpus.walk_corpus import single_gpu_walk_corpus, multi_gpu_walk_corpus
-from .logger.base import BaseTracker, base_tracker_list
-from .
-# from .logger.mlflow_logger import make_tracker
+from .logger import BaseTracker, NoOpTracker, build_tracker
 import cudf
 import dask.dataframe as dd
 from loguru import logger
@@ -172,6 +166,10 @@ class GPU_RDF2Vec:
         self.knowledge_graph = Graph(directed=True)
         self.word2vec_model = None
         self.word2idx = None
+        self.tracker = build_tracker(
+            spec=self.config.tracker,
+            kwargs=self.config.tracker_kwargs,
+        )
 
     def read_data(
         self,
@@ -179,56 +177,82 @@ class GPU_RDF2Vec:
         col_map: Optional[dict] = None,
         read_kwargs: Optional[dict] = None,
     ):
+        self.tracker.start_pipeline(
+            run_name=self.config.tracker_run_name,
+            tags={"lib": "gpu-rdf2vec", "backend": self.config.backend},
+        )
         kg_reader = KGFileReader(
             file_path=path,
             multi_gpu=self.config.multi_gpu,
             col_map=col_map,
             read_kwargs=read_kwargs,
         )
-        kg_data = kg_reader.read()
+        with self.tracker.stage("data_loading"):
+            kg_data = kg_reader.read()
+            self.tracker.log_params(
+                {
+                    "data_path": path,
+                    "number_rows": kg_data.shape[0],
+                    "number_columns": kg_data.shape[1],
+                }
+            )
         return kg_data
 
     def generate_vocab(self, kg_data):
-        word2idx = _generate_vocab(kg_data, self.config.multi_gpu)
+        with self.tracker.stage("Word2idx_Generation"):
+            word2idx = _generate_vocab(kg_data, self.config.multi_gpu)
+            self.tracker.log_params({"vocab_size": word2idx.shape[0]})
         self.word2idx = word2idx
         return word2idx
 
     def construct_graph(self, kg_data):
-        if self.config.multi_gpu:
-            kg_data = kg_data[["subject", "predicate", "object"]]
-            if cugraph.dask.comms.is_initialized():
-                self.knowledge_graph.from_dask_cudf_edgelist(
+        with self.tracker.stage("Graph_Construction"):
+            if self.config.multi_gpu:
+                kg_data = kg_data[["subject", "predicate", "object"]]
+                if cugraph.dask.comms.is_initialized():
+                    self.knowledge_graph.from_dask_cudf_edgelist(
+                        kg_data,
+                        source="subject",
+                        destination="object",
+                        edge_attr="predicate",
+                        renumber=False,
+                    )
+                else:
+                    logger.error(
+                        "The communicator for multi-gpu cuGraph is not initalized."
+                    )
+                    raise ValueError(
+                        "The communicator for multi-gpu cuGraph is not initalized."
+                    )
+            else:
+                self.knowledge_graph.from_cudf_edgelist(
                     kg_data,
                     source="subject",
                     destination="object",
                     edge_attr="predicate",
                     renumber=False,
                 )
-            else:
-                logger.error(
-                    "The communicator for multi-gpu cuGraph is not initalized."
-                )
-                raise ValueError(
-                    "The communicator for multi-gpu cuGraph is not initalized."
-                )
-        else:
-            self.knowledge_graph.from_cudf_edgelist(
-                kg_data,
-                source="subject",
-                destination="object",
-                edge_attr="predicate",
-                renumber=False,
+            degree = self.knowledge_graph.degree()
+            number_nodes = self.knowledge_graph.number_of_vertices()
+            number_edges = self.knowledge_graph.number_of_edges()
+            self.tracker.log_metrics(
+                {
+                    "number_nodes": number_nodes,
+                    "number_edges": number_edges,
+                    "average_degree": degree.mean(),
+                    "min_degree": degree.min(),
+                    "max_degree": degree.max(),
+                }
             )
-
-        logger.info(f"Graph has {self.knowledge_graph.number_of_edges()} edges")
-        logger.info(f"Graph has {self.knowledge_graph.number_of_vertices()} vertices")
+            logger.debug(f"Graph has {number_edges} edges")
+            logger.debug(f"Graph has {number_nodes} vertices")
 
     def load_data(
         self,
         path: str,
         col_map: Optional[dict] = None,
         read_kwargs: Optional[dict] = None,
-    ) -> cudf.DataFrame | dask.dataframe:
+    ):
         """
         Load a triple file, build the token vocabulary, and populate the internal
         cuGraph instance.
@@ -284,6 +308,55 @@ class GPU_RDF2Vec:
         word2idx = self.generate_vocab(kg_data)
         self.construct_graph(kg_data)
 
+    def walk_generation(
+        self, edge_df: cudf.DataFrame, walk_vertices: cudf.Series = None
+    ) -> cudf.DataFrame:
+        with self.tracker.stage("Walk_Generation"):
+            if self.config.multi_gpu:
+                walk_instance = multi_gpu_walk_corpus(
+                    self.knowledge_graph,
+                    self.config.window_size,
+                )
+            else:
+                walk_instance = single_gpu_walk_corpus(
+                    self.knowledge_graph,
+                    self.config.window_size,
+                )
+            if self.config.walk_strategy == "random":
+                if walk_vertices is None:
+                    walk_vertices = self.knowledge_graph.nodes()
+                walk_vertices = walk_vertices.repeat(self.config.walk_number)
+                walk_corpus = walk_instance.random_walk(
+                    edge_df=edge_df,
+                    walk_vertices=walk_vertices,
+                    walk_depth=self.config.walk_depth,
+                    random_state=self.config.random_state,
+                    word2vec_model=self.config.embedding_model,
+                    min_count=self.config.min_count,
+                )
+            elif self.config.walk_strategy == "bfs":
+                if walk_vertices is None:
+                    walk_vertices = self.knowledge_graph.nodes()
+                walk_corpus = walk_instance.bfs_walk(
+                    edge_df=edge_df,
+                    walk_vertices=walk_vertices,
+                    walk_depth=self.config.walk_depth,
+                    random_state=self.config.random_state,
+                    word2vec_model=self.config.embedding_model,
+                    min_count=self.config.min_count,
+                )
+            self.tracker.log_params(
+                {
+                    "walk_depth": self.config.walk_depth,
+                    "random_state": self.config.random_state,
+                    "walk_strategy": self.config.walk_strategy,
+                    "walk_number": self.config.walk_number,
+                    "min_count": self.config.min_count,
+                }
+            )
+
+        return walk_corpus
+
     def fit(self, edge_df: cudf.DataFrame, walk_vertices: cudf.Series = None) -> None:
         """
          Train a Word2Vec model on random-walk sequences generated from the
@@ -324,128 +397,96 @@ class GPU_RDF2Vec:
          >>> edges = rdf2vec.load_data("example.parquet")
          >>> rdf2vec.fit(edges)
         """
-        # if self.tracker:
-        #     self.tracker.start_pipeline(self.tracker_run_name, self.tracker_tags)
-        if self.config.multi_gpu:
-            walk_instance = multi_gpu_walk_corpus(
-                self.knowledge_graph,
-                self.config.window_size,
-            )
-        else:
-            walk_instance = single_gpu_walk_corpus(
-                self.knowledge_graph,
-                self.config.window_size,
-            )
-        if self.config.walk_strategy == "random":
-            if walk_vertices is None:
-                walk_vertices = self.knowledge_graph.nodes()
-            walk_vertices = walk_vertices.repeat(self.config.walk_number)
-            walk_corpus = walk_instance.random_walk(
-                edge_df=edge_df,
-                walk_vertices=walk_vertices,
-                walk_depth=self.config.walk_depth,
-                random_state=self.config.random_state,
-                word2vec_model=self.config.embedding_model,
-                min_count=self.config.min_count,
-            )
-        elif self.config.walk_strategy == "bfs":
-            if walk_vertices is None:
-                walk_vertices = self.knowledge_graph.nodes()
-            walk_corpus = walk_instance.bfs_walk(
-                edge_df=edge_df,
-                walk_vertices=walk_vertices,
-                walk_depth=self.config.walk_depth,
-                random_state=self.config.random_state,
-                word2vec_model=self.config.embedding_model,
-                min_count=self.config.min_count,
-            )
-
-        if self.config.embedding_model == "skipgram":
-            word2vec_model = SkipGram(
-                vocab_size=self.word2idx.shape[0],
-                embedding_dim=self.config.vector_size,
-                neg_samples=self.config.negative_samples,
-                learning_rate=self.config.learning_rate,
-            )
-            center_tensor = torch.utils.dlpack.from_dlpack(
-                walk_corpus["center"].to_dlpack()
-            ).contiguous()
-            context_tensor = torch.utils.dlpack.from_dlpack(
-                walk_corpus["context"].to_dlpack()
-            ).contiguous()
-            datamodule = SkipGramDataModule(
-                center_tensor=center_tensor,
-                context_tensor=context_tensor,
-                batch_size=(
-                    self.config.batch_size
-                    if self.config.batch_size
-                    else round(len(context_tensor) / (self.config.cpu_count))
-                ),
-            )
-
-        elif self.config.embedding_model == "cbow":
-            word2vec_model = CBOW(
-                vocab_size=self.word2idx.shape[0],
-                embedding_dim=self.config.vector_size,
-                learning_rate=self.config.learning_rate,
-            )
-            center_tensor = torch.utils.dlpack.from_dlpack(
-                walk_corpus["center"].to_dlpack()
-            ).contiguous()
-            context_series = walk_corpus["context"]
-            exploded_df = (
-                context_series.to_frame("context").explode("context").reset_index()
-            )
-            exploded_df["pos"] = exploded_df.groupby("index").cumcount()
-            pivot_df = exploded_df.pivot(index="index", columns="pos", values="context")
-            reset_pivot_df = pivot_df.reset_index(drop=True)
-            reset_pivot_df = reset_pivot_df.fillna(-1).astype("int32")
-            context_tensor = torch.utils.dlpack.from_dlpack(
-                reset_pivot_df.to_dlpack()
-            ).contiguous()
-            datamodule = CBOWDataModule(
-                center_tensor=center_tensor,
-                context_tensor=context_tensor,
-                batch_size=(
-                    self.config.batch_size
-                    if self.config.batch_size
-                    else round(len(context_tensor) / (self.config.cpu_count))
-                ),
-            )
-
-        else:
-            logger.error(
-                f"Unsupported embedding model: {self.config.embedding_model}. Please choose either 'skipgram' or 'cbow'."
-            )
-            raise ValueError(
-                f"Unsupported embedding model: {self.config.embedding_model}. Please choose either 'skipgram' or 'cbow'."
-            )
-        # word2vec_model = torch.compile(word2vec_model) -> Stabalize model compilation for speedup
-        if self.config.reproducible:
-            logger.info(
-                "Setting up reproducible training, might increase training time."
-            )
-            L.seed_everything(self.config.random_state, workers=True)
-        trainer = L.Trainer(
-            max_epochs=self.config.epochs,
-            log_every_n_steps=1,
-            accelerator="gpu",
-            precision=16,
-            devices="auto",
+        walk_corpus = self.walk_generation(
+            edge_df=edge_df,
+            walk_vertices=walk_vertices,
         )
-        if self.config.tune_batch_size:
-            tuner = Tuner(trainer)
-            tuner.scale_batch_size(
-                word2vec_model,
-                mode="power",
-                datamodule=datamodule,
-                steps_per_trial=1,
-                init_val=round(len(context_tensor) / (self.config.cpu_count * 2)),
-                max_trials=12,
-            )
-        trainer.fit(word2vec_model, datamodule)
+        center_tensor = torch.utils.dlpack.from_dlpack(walk_corpus, "center")
+        context_tensor = torch.utils.dlpack.from_dlpack(walk_corpus, "context")
+        with self.tracker.stage("Word2Vec_Training"):
+            if self.config.embedding_model == "skipgram":
+                word2vec_model = SkipGram(
+                    vocab_size=self.word2idx.shape[0],
+                    embedding_dim=self.config.vector_size,
+                    neg_samples=self.config.negative_samples,
+                    learning_rate=self.config.learning_rate,
+                )
+                datamodule = SkipGramDataModule(
+                    center_tensor=center_tensor,
+                    context_tensor=context_tensor,
+                    batch_size=(
+                        self.config.batch_size
+                        if self.config.batch_size
+                        else round(len(context_tensor) / (self.config.cpu_count))
+                    ),
+                )
 
-        self.word2vec_model = word2vec_model
+            elif self.config.embedding_model == "cbow":
+                word2vec_model = CBOW(
+                    vocab_size=self.word2idx.shape[0],
+                    embedding_dim=self.config.vector_size,
+                    learning_rate=self.config.learning_rate,
+                )
+                # TODO: Optimize context tensor creation
+                context_series = walk_corpus["context"]
+                exploded_df = (
+                    context_series.to_frame("context").explode("context").reset_index()
+                )
+                exploded_df["pos"] = exploded_df.groupby("index").cumcount()
+                pivot_df = exploded_df.pivot(
+                    index="index", columns="pos", values="context"
+                )
+                reset_pivot_df = pivot_df.reset_index(drop=True)
+                reset_pivot_df = reset_pivot_df.fillna(-1).astype("int32")
+                context_tensor = torch.utils.dlpack.from_dlpack(
+                    reset_pivot_df.to_dlpack()
+                ).contiguous()
+                datamodule = CBOWDataModule(
+                    center_tensor=center_tensor,
+                    context_tensor=context_tensor,
+                    batch_size=(
+                        self.config.batch_size
+                        if self.config.batch_size
+                        else round(len(context_tensor) / (self.config.cpu_count))
+                    ),
+                )
+
+            else:
+                logger.error(
+                    f"Unsupported embedding model: {self.config.embedding_model}. Please choose either 'skipgram' or 'cbow'."
+                )
+                raise ValueError(
+                    f"Unsupported embedding model: {self.config.embedding_model}. Please choose either 'skipgram' or 'cbow'."
+                )
+            if self.config.reproducible:
+                logger.info(
+                    "Setting up reproducible training, might increase training time."
+                )
+                L.seed_everything(self.config.random_state, workers=True)
+            self.tracker.log_pytorch()
+            trainer = L.Trainer(
+                max_epochs=self.config.epochs,
+                log_every_n_steps=1,
+                accelerator="gpu",
+                precision=16,
+                devices="auto",
+                num_nodes=self.config.num_nodes,
+            )
+            if self.config.tune_batch_size:
+                tuner = Tuner(trainer)
+                tuner.scale_batch_size(
+                    word2vec_model,
+                    mode="power",
+                    datamodule=datamodule,
+                    steps_per_trial=1,
+                    init_val=round(len(context_tensor) / (self.config.cpu_count * 2)),
+                    max_trials=12,
+                )
+            trainer.fit(word2vec_model, datamodule)
+            self.tracker.log_model_pytorch(
+                word2vec_model, artifact_path="word2vec_model"
+            )
+            self.word2vec_model = word2vec_model
 
     def transform(self) -> cudf.DataFrame:
         """
@@ -484,22 +525,25 @@ class GPU_RDF2Vec:
 
         """
         # Check if model is fitted and word2idx is available
-        if self.word2vec_model is not None and self.word2idx is not None:
-            model_embeddings = self.word2vec_model.in_embeddings.weight
-            model_embeddings_df = cudf.from_dlpack(to_dlpack(model_embeddings.T)).T
-            model_embeddings_df.columns = model_embeddings_df.columns.astype(str)
-            model_embeddings_df = model_embeddings_df.add_prefix("embedding_")
-            embedding_df = cudf.concat([self.word2idx, model_embeddings_df], axis=1)
-            if self.config.generate_artifact:
-                embedding_df.to_parquet(
-                    f"vector/embeddings_{self.word2vec_model}.parquet", index=False
+        with self.tracker.stage("Embedding_Extraction"):
+            if self.word2vec_model is not None and self.word2idx is not None:
+                model_embeddings = self.word2vec_model.in_embeddings.weight
+                model_embeddings_df = torch_to_cudf(
+                    model_embeddings.T, self.config.multi_gpu
+                ).T
+                model_embeddings_df.columns = model_embeddings_df.columns.astype(str)
+                model_embeddings_df = model_embeddings_df.add_prefix("embedding_")
+                embedding_df = cudf.concat([self.word2idx, model_embeddings_df], axis=1)
+                if self.config.generate_artifact:
+                    embedding_df.to_parquet(
+                        f"vector/embeddings_{self.word2vec_model}.parquet", index=False
+                    )
+                return embedding_df
+            else:
+                raise ValueError(
+                    "The transform method is not possible to call without a fitted model or a generated word2idx setup."
+                    "Please call the 'fit' method first or the 'load_data' method to generate the word2idx setup."
                 )
-            return embedding_df
-        else:
-            raise ValueError(
-                "The transform method is not possible to call without a fitted model or a generated word2idx setup."
-                "Please call the 'fit' method first or the 'load_data' method to generate the word2idx setup."
-            )
 
     def fit_transform(
         self, edge_df: cudf.DataFrame, walk_vertices: cudf.DataFrame

@@ -1,4 +1,5 @@
 ## gpuRDF2Vec
+
 A scalable GPU based implementation of RDF2Vec embeddings for large and dense Knowledge Graphs.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
@@ -9,7 +10,9 @@ A scalable GPU based implementation of RDF2Vec embeddings for large and dense Kn
 > This package is under active development in the beta phase. The overall class/ method design will most probably change and introduce breaking changes between releases
 
 ## Table of contents
+
 The content of this repository readme can be found here:
+
 - [gpuRDF2Vec](#gpurdf2vec)
 - [Table of contents](#table-of-contents)
 - [Package installation](#package-installation)
@@ -24,23 +27,30 @@ The content of this repository readme can be found here:
 - [Report issues and bugs](#report-issues-and-bugs)
 
 ## Package installation
+
 Install the package rdf2vecgpu by running the following command:
 
 ```
 pip install rdf2vecgpu
 ```
+
 > [!IMPORTANT]
 > Make sure to install the accompanying cuda version as outlined in the [following section](#repository-setup)
 
 ## Repository setup
+
 The repository setup builds on top of two major libraries. Both Pytorch lightning as well as the RAPIDS libraries cuDF and cuGraph. We provide the exeplanatory installation details for Cuda 12.6:
+
 1. Pytorch [installation page](https://pytorch.org/get-started/locally/)
 Cuda 12.6 installation
+
 ```bash
 pip install torch torchvision torchaudio
 ```
+
 2. Detailed cudf installation instruction [here](https://docs.rapids.ai/install/).
 Cudf Cuda 12 install
+
 ```bash
 pip install \
     --extra-index-url=https://pypi.nvidia.com \
@@ -48,16 +58,22 @@ pip install \
     "cugraph-cu12==25.4.*" "nx-cugraph-cu12==25.4.*" \
     "nx-cugraph-cu12==25.4.*"
 ```
-The requirement files and conda environment files can be found here: 
+
+The requirement files and conda environment files can be found here:
+
 - [Conda environment](performance/env_files/rdf2vecgpu_environment.yml)
 - [Requirement file](performance/env_files/rdf2vecgpu_requirements.txt)
+
 ## gpuRDF2Vec overview
+
 RDF2Vec is a powerful technique to generate vector embeddings of entities in RDF graphs via random walks and Word2Vec. This repository provides a GPU-optimized reimplementation, enabling:
 
 - **Speedups** on dense graphs with millions of nodes
 - **Scalability** to industrial-scale knowledge bases
 - **Reproducible experiments** to test and qualify the overall implementation details
+
 ### Repository Structure
+
 ```bash
 .
 ├── README.md
@@ -109,13 +125,16 @@ RDF2Vec is a powerful technique to generate vector embeddings of entities in RDF
         ├── functions_test.py
         └── kg_reader_test.py
 ```
+
 ### Capability overview
+
 - GPU-backed walk generation over CUDA Kernels
 - Batched Word2Vec training with Pytorch lightning
 - Pluggable rdf loaders and parquet, csv, txt integration
 - Performance comparison can be found in the following [folder](performance/)
 
 ## Quick start
+
 ```python
 from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
 # Instantiate the gpu RDF2Vec library settings
@@ -146,6 +165,7 @@ embeddings = gpu_rdf2vec_model.fit_transform(edge_df=edge_data, walk_vertices=No
 # Write embedding to file format. Return format is a cuDf dataframe
 embeddings.to_parquet("data/wikidata5m/wikidata5m_embeddings.parquet", index=False)
 ```
+
 - Supported file formats:
   - .csv
   - .txt
@@ -169,9 +189,11 @@ embeddings.to_parquet("data/wikidata5m/wikidata5m_embeddings.parquet", index=Fal
   - multi_gpu: `bool`
   - generate_artifact: `bool`
   - cpu_count: `int`
+
 ## Implementation Details
 
 We achieve order-of-magnitude for large and dense graphs over CPU-bound RDF2Vec by engineering both the **walk extraction** and the **Word2Vec training** pipelines:
+
 1. **GPU-Native Walk Extraction**  
    - All random-walk and BFS operations leverage cuDF/cuGraph kernels to avoid CPU–GPU data transfers and minimize latency.  
    - To generate *k* walks per node in one pass, we replicate node indices in a single cuDF DataFrame rather than looping—fully utilizing GPU parallelism and eliminating Python-loop overhead (∼15× speedup).  
@@ -189,15 +211,22 @@ We achieve order-of-magnitude for large and dense graphs over CPU-bound RDF2Vec 
 4. **Scalable Data-Parallel Training**  
    - We use PyTorch Distributed + NCCL: each GPU holds the same graph shard but a unique walk corpus.  
    - Gradients are synchronized via `all_reduce` at regular intervals (~500 ms), amortizing PCIe/NVLink costs and ensuring linear scaling across nodes.
+
 ## License
+
 The overview of the used MIT license can be found [here](LICENSE)
+
 ## Roadmap
+
 - [ ] Order aware Word2Vec following the details of [Ling, Wang, et al. "Two/too simple adaptations of word2vec for syntax problems.](https://aclanthology.org/N15-1142.pdf). [Issue item](https://github.com/MartinBoeckling/rdf2vecgpu/issues/2)
 - [ ] Provide spilling to single GPU training to work around potential OOM issues faced during rdf2vec training [Issue Item](https://github.com/MartinBoeckling/rdf2vecgpu/issues/3)
 - [ ] Provide weighted walks for spatial datasets [Issue item](https://github.com/MartinBoeckling/rdf2vecgpu/issues/4)
 - [ ] Provide logging capabilities of complete Word2Vec pipeline for [Wandb](https://wandb.ai/site/) and [mlflow](https://mlflow.org/). [Issue item](https://github.com/MartinBoeckling/rdf2vecgpu/issues/5)
+
 ## Report issues and bugs
+
 In case you have found a bug or unexpected behaviour, please reach out by opening an issue:
+
 1. When opening an issue, please tag the issue with the label **Bug**. Please include the following information:
     - **Environment**: OS, Python/CUDA/PyTorch/RAPIDS versions (cuDF, cuGraph)
     - **Reproduction steps**: Exact commands or small code snippet
@@ -207,3 +236,33 @@ In case you have found a bug or unexpected behaviour, please reach out by openin
 
 2. We aim to respond to open issues within 3 business days
 3. If you have identified a fix, fork the repo, branch off `main`, implement & test then open a PR referencing the issue.
+
+## Citation
+
+If you use gpuRDF2Vec in your research, please cite the following paper:
+
+```bixbtex
+@InProceedings{10.1007/978-3-032-09530-5_14,
+  author="B{\"o}ckling, Martin and Paulheim, Heiko",
+  editor="Garijo, Daniel
+  and Kirrane, Sabrina
+  and Salatino, Angelo
+  and Shimizu, Cogan
+  and Acosta, Maribel
+  and Nuzzolese, Andrea Giovanni
+  and Ferrada, Sebasti{\'a}n
+  and Soulard, Thibaut
+  and Kozaki, Kouji
+  and Takeda, Hideaki
+  and Gentile, Anna Lisa",
+  title="gpuRDF2vec -- Scalable GPU-Based RDF2vec",
+  booktitle="The Semantic Web -- ISWC 2025",
+  year="2026",
+  publisher="Springer Nature Switzerland",
+  address="Cham",
+  pages="240--257",
+  isbn="978-3-032-09530-5"
+}
+
+
+```

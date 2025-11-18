@@ -8,7 +8,6 @@ license = { text = "MIT" }
 dependencies = [
     "cudf-cu12>=25.6.0",
     "cugraph-cu12==25.6.*",
-    "cupy-cuda12x>=13.5.1",
     "dask-cudf-cu12>=25.6.0",
     "dask[complete]>=2025.5.0",
     "lightning>=2.5.2",
@@ -35,7 +34,7 @@ include = ["src/rdf2vecgpu"]
 
 [project.optional-dependencies]
 mlflow = [
-    "mlflow>=3.5.1",
+    "mlflow-skinny>=3.6.0",
 ]
 wandb = [
     "wandb>=0.23.0",

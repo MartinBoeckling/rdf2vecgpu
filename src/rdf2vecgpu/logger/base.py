@@ -30,6 +30,9 @@ class BaseTracker:
     ):
         pass
 
+    def log_pytorch(self):
+        pass
+
     def log_artifact(self, path: str, artifact_path: Optional[str] = None):
         pass
 

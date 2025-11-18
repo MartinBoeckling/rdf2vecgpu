@@ -80,11 +80,15 @@ class MlflowTracker(BaseTracker):
         mlflow.log_table(dataset, artifact_path=artifact_path, tags=tags)
 
     @override
-    def log_figure(self, fig, artifact_file, artifact_path):
+    def log_figure(self, figure, artifact_file, artifact_path):
         with tempfile.TemporaryDirectory() as tmpdir:
             p = os.path.join(tmpdir, artifact_file)
-            fig.savefig(p)
+            figure.savefig(p)
             self.log_artifact(p, artifact_path=artifact_path)
+
+    @override
+    def log_pytorch(self):
+        mlflow.pytorch.autolog(log_models=False)
 
     @override
     def log_model_pytorch(self, model, artifact_path: str):
