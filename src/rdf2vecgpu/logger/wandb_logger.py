@@ -72,6 +72,26 @@ class WandbTracker(BaseTracker):
             open(p, "w", encoding="utf-8").write(text)
             self.log_artifact(p, artifact_path or "notes")
 
+    def log_pytorch(self):
+        self.wandb.Run.watch()
+
+    def log_model_pytorch(self, model, artifact_path: str):
+        import tempfile
+        import os
+        import torch
+
+        with tempfile.TemporaryDirectory() as td:
+            model_path = os.path.join(td, "model.pt")
+            torch.save(model.state_dict(), model_path)
+
+            at = self.wandb.Artifact(artifact_path, type="model")
+            at.add_file(model_path)
+            self.wandb.run.log_artifact(at)
+
+    def log_data(self, sample_data, data_name, artifact_path, tags=None):
+        tbl = self.wandb.Table(dataframe=sample_data)
+        self.wand.log({data_name: tbl})
+
     def close(self):
         try:
             self.wandb.finish()

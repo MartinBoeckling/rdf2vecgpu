@@ -78,7 +78,7 @@ class KGFileReader:
 
     def _parquet_reader(self) -> DataFrameLike:
         if self.multi_gpu:
-            kg_data = dask.read_parquet(
+            kg_data = dd.read_parquet(
                 self.file_path,
                 columns=[
                     self.col_map["subject"],
@@ -102,7 +102,7 @@ class KGFileReader:
 
     def _csv_reader(self) -> DataFrameLike:
         if self.multi_gpu:
-            kg_data = dask.dataframe.read_csv(
+            kg_data = dd.read_csv(
                 self.file_path,
                 **self.read_kwargs,
             )
@@ -116,37 +116,23 @@ class KGFileReader:
 
     def _nt_reader(self) -> DataFrameLike:
         if self.multi_gpu:
-            kg_data = dask.dataframe.read_csv(
-                self.file_path,
-                sep=" ",
-                names=["subject", "predicate", "object", "dot"],
-                header=None,
-                **self.read_kwargs,
-            )
+            df = dd.read_text(self.file_path).to_dataframe()
+            df.columns = ["raw"]
         else:
-            kg_data = cudf.read_csv(
-                self.file_path,
-                sep=" ",
-                names=["subject", "predicate", "object"],
-                header=None,
-                **self.read_kwargs,
-            )
+            df = cudf.read_text(self.file_path)
+            df.columns = ["raw"]
 
-        kg_data = kg_data.drop(["dot"], axis=1)
-        kg_data["subject"] = (
-            kg_data["subject"].str.strip().str.replace("<", "").str.replace(">", "")
-        )
-        kg_data["predicate"] = (
-            kg_data["predicate"].str.strip().str.replace("<", "").str.replace(">", "")
-        )
-        kg_data["object"] = (
-            kg_data["object"].str.strip().str.replace("<", "").str.replace(">", "")
-        )
+        nt_pattern = r"^<([^>]+)>\s+<([^>]+)>\s+(.*)\s+\.\s*$"
+        extracted = df["raw"].str.extract(nt_pattern)
+        extracted.columns = ["subject", "predicate", "object"]
+
+        extracted["object"] = extracted["object"].str.replace(r"^<|>$", "", regex=True)
+        kg_data = extracted[["subject", "predicate", "object"]]
         return kg_data
 
     def _orc_reader(self) -> DataFrameLike:
         if self.multi_gpu:
-            kg_data = dask.dataframe.read_orc(
+            kg_data = dd.read_orc(
                 self.file_path,
                 **self.read_kwargs,
             )
@@ -159,15 +145,16 @@ class KGFileReader:
 
     def _hdf_reader(self) -> DataFrameLike:
         if self.multi_gpu:
-            dask.dataframe.read_hdf(
+            edge_df = dd.read_hdf(
                 self.file_path,
                 **self.read_kwargs,
             )
         else:
-            cudf.read_hdf(
+            edge_df = cudf.read_hdf(
                 self.file_path,
                 **self.read_kwargs,
             )
+        return edge_df
 
     def _rdf_lib_reader(self) -> DataFrameLike:
         kg = rdfGraph()

@@ -200,10 +200,10 @@ class GPU_RDF2Vec:
 
     def generate_vocab(self, kg_data):
         with self.tracker.stage("Word2idx_Generation"):
-            word2idx = _generate_vocab(kg_data, self.config.multi_gpu)
+            kg_data, word2idx = _generate_vocab(kg_data, self.config.multi_gpu)
             self.tracker.log_params({"vocab_size": word2idx.shape[0]})
         self.word2idx = word2idx
-        return word2idx
+        return kg_data, word2idx
 
     def construct_graph(self, kg_data):
         with self.tracker.stage("Graph_Construction"):
@@ -232,20 +232,24 @@ class GPU_RDF2Vec:
                     edge_attr="predicate",
                     renumber=False,
                 )
-            degree = self.knowledge_graph.degree()
-            number_nodes = self.knowledge_graph.number_of_vertices()
-            number_edges = self.knowledge_graph.number_of_edges()
-            self.tracker.log_metrics(
-                {
-                    "number_nodes": number_nodes,
-                    "number_edges": number_edges,
-                    "average_degree": degree.mean(),
-                    "min_degree": degree.min(),
-                    "max_degree": degree.max(),
-                }
-            )
-            logger.debug(f"Graph has {number_edges} edges")
-            logger.debug(f"Graph has {number_nodes} vertices")
+            if self.config.tracker == "none":
+                pass
+            else:
+                degree = self.knowledge_graph.degree()
+                number_nodes = self.knowledge_graph.number_of_vertices()
+                number_edges = self.knowledge_graph.number_of_edges()
+
+                self.tracker.log_metrics(
+                    {
+                        "number_nodes": number_nodes,
+                        "number_edges": number_edges,
+                        "average_degree": degree.mean(),
+                        "min_degree": degree.min(),
+                        "max_degree": degree.max(),
+                    }
+                )
+                logger.debug(f"Graph has {number_edges} edges")
+                logger.debug(f"Graph has {number_nodes} vertices")
 
     def load_data(
         self,
@@ -305,8 +309,8 @@ class GPU_RDF2Vec:
             col_map=col_map,
             read_kwargs=read_kwargs,
         )
-        word2idx = self.generate_vocab(kg_data)
-        self.construct_graph(kg_data)
+        encoded_kg_data, word2idx = self.generate_vocab(kg_data)
+        self.construct_graph(encoded_kg_data)
 
     def walk_generation(
         self, edge_df: cudf.DataFrame, walk_vertices: cudf.Series = None

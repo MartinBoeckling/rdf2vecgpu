@@ -79,7 +79,7 @@ def _generate_vocab(
             .drop_duplicates()
             .reset_index(drop=True)
         )
-        return word2idx
+        return kg_data, word2idx
 
     else:
         vocabulary = cudf.concat(
@@ -89,7 +89,25 @@ def _generate_vocab(
         tokenization, word = vocabulary.factorize()
         word2idx = cudf.concat([cudf.Series(tokenization), cudf.Series(word)], axis=1)
         word2idx.columns = ["token", "word"]
-        return word2idx
+        # Merge back to edge_df
+        edge_df = edge_df.merge(word2idx, left_on="subject", right_on="word")
+        edge_df = edge_df.drop(columns=["subject", "word"]).rename(
+            columns={"token": "subject"}
+        )
+        edge_df = edge_df.merge(
+            word2idx, left_on="predicate", right_on="word", how="left"
+        )
+        edge_df = edge_df.drop(columns=["predicate", "word"]).rename(
+            columns={"token": "predicate"}
+        )
+        edge_df = edge_df.merge(word2idx, left_on="object", right_on="word", how="left")
+        edge_df = edge_df.drop(columns=["object", "word"]).rename(
+            columns={"token": "object"}
+        )
+        edge_df = edge_df.dropna().astype(
+            {"subject": "int32", "predicate": "int32", "object": "int32"}
+        )
+        return edge_df, word2idx
 
 
 def cudf_to_torch_tensor(df, column_name: str):
@@ -102,7 +120,7 @@ def torch_to_cudf(torch_tensor, multi_gpu: bool):
             "Conversion from torch Tensor to cuDF DataFrame is not implemented for multi-GPU."
         )
     else:
-        cudf.from_dlpack(torch_tensor.to_dlpack())
+        return cudf.from_dlpack(torch_tensor.to_dlpack())
 
 
 def determine_optimal_chunksize(length_iterable: int, cpu_count: int) -> int:

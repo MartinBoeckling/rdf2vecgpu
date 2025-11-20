@@ -46,5 +46,5 @@ class BaseTracker:
         pass
 
 
-def NoOpTracker(BaseTracker):
+class NoOpTracker(BaseTracker):
     pass
