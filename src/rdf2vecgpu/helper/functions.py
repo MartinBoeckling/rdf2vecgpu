@@ -1,6 +1,8 @@
 import cudf
 import dask.dataframe as dd
 import torch
+from torch.utils.dlpack import to_dlpack
+import cupy as cp
 
 
 def _generate_vocab(
@@ -46,7 +48,7 @@ def _generate_vocab(
         edge_df.index = edge_df.index.rename("row_id")
         edge_df = edge_df.reset_index()
         edge_melted = edge_df.melt(id_vars="row_id", var_name="role", value_name="word")
-        vocabulary_categories = edge_melted.categorize(subset=["word"])
+        vocabulary_categories = edge_melted.categorize(columns=["word"])
         vocabulary_categories["token"] = vocabulary_categories["word"].cat.codes
         vocabulary_categories["word"] = vocabulary_categories["word"].astype("string")
         subjects = vocabulary_categories[vocabulary_categories["role"] == "subject"][
@@ -71,6 +73,7 @@ def _generate_vocab(
         predicates = predicates.set_index("row_id")
         objects = objects.set_index("row_id")
         kg_data = dd.concat([subjects, predicates, objects], axis=1).reset_index()
+        print(kg_data.head())
         kg_data = kg_data.astype(
             {"subject": "int64", "predicate": "int64", "object": "int64"}
         )
@@ -111,6 +114,8 @@ def _generate_vocab(
 
 
 def cudf_to_torch_tensor(df, column_name: str):
+    if column_name not in df.columns:
+        raise ValueError(f"Column '{column_name}' does not exist in the DataFrame.")
     return torch.utils.dlpack.from_dlpack(df[column_name].to_dlpack()).contiguous()
 
 
@@ -120,7 +125,12 @@ def torch_to_cudf(torch_tensor, multi_gpu: bool):
             "Conversion from torch Tensor to cuDF DataFrame is not implemented for multi-GPU."
         )
     else:
-        return cudf.from_dlpack(torch_tensor.to_dlpack())
+        column_major_tensor = torch_tensor.t().contiguous().t()
+
+        dlpack_capsule = to_dlpack(column_major_tensor)
+
+        # cp_farray = cp.asfortranarray(cp_arr)
+        return cudf.from_dlpack(dlpack_capsule)
 
 
 def determine_optimal_chunksize(length_iterable: int, cpu_count: int) -> int:

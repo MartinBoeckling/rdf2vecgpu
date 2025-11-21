@@ -51,23 +51,31 @@ class KGFileReader:
                 "Install the multi-GPU extras, e.g.: `pip install gpu-rdf2vec[multi-gpu]`"
             )
 
+    def _change_column_names(self, df: DataFrameLike) -> DataFrameLike:
+        if self.multi_gpu:
+            renamed_df = df.rename(columns=self.col_map)
+        else:
+            renamed_df = df.rename(mapper=self.col_map, axis=1)
+        renamed_df = renamed_df[["subject", "predicate", "object"]]
+        return renamed_df
+
     def read(self) -> DataFrameLike:
         # Check sequence for file ending
         if self.file_ending == ".parquet":
-            return self._parquet_reader()
+            df = self._parquet_reader()
         elif self.file_ending in [".nt", ".nq"]:
-            return self._nt_reader()
+            df = self._nt_reader()
         elif self.file_ending == ".csv":
-            return self._csv_reader()
+            df = self._csv_reader()
         elif self.file_ending == ".orc":
-            return self._orc_reader()
-        elif self.file_ending in [".hdf", ".hdf5"]:
-            return self._hdf_reader()
+            df = self._orc_reader()
+        #        elif self.file_ending in [".hdf", ".hdf5"]:
+        #            df = self._hdf_reader()
         else:
             # Check if file format is parseable by rdflib
-            rdf_format = guess_format(self.file_path)
+            rdf_format = guess_format(str(self.file_path))
             if rdf_format is not None:
-                self._rdf_lib_reader()
+                df = self._rdf_lib_reader()
             else:
                 logger.error(
                     f"Parsing of file format {self.file_ending} is currently not supported."
@@ -75,6 +83,8 @@ class KGFileReader:
                 raise NotImplementedError(
                     f"Parsing of file format {self.file_ending} is currently not supported."
                 )
+        renamed_df = self._change_column_names(df)
+        return renamed_df
 
     def _parquet_reader(self) -> DataFrameLike:
         if self.multi_gpu:
@@ -119,8 +129,9 @@ class KGFileReader:
             df = dd.read_text(self.file_path).to_dataframe()
             df.columns = ["raw"]
         else:
-            df = cudf.read_text(self.file_path)
+            df = cudf.read_text(self.file_path, delimiter="\n").to_frame()
             df.columns = ["raw"]
+            print(df.columns)
 
         nt_pattern = r"^<([^>]+)>\s+<([^>]+)>\s+(.*)\s+\.\s*$"
         extracted = df["raw"].str.extract(nt_pattern)
@@ -165,5 +176,8 @@ class KGFileReader:
         if self.multi_gpu:
             edge_df = dask.dataframe.from_pandas(pd_edge_df)
         else:
-            edge_df = cudf.from_pandas(pd_edge_df)
+            print(self.multi_gpu)
+            edge_df = cudf.DataFrame.from_pandas(pd_edge_df)
+            print(type(edge_df))
+            print(edge_df)
         return edge_df

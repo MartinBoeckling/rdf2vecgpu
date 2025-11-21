@@ -15,6 +15,7 @@ dependencies = [
     "numpy>=2.2.6",
     "pydantic>=2.12.3",
     "rdflib>=7.1.4",
+    "tables>=3.10.2",
     "torch>=2.7.1",
     "tqdm>=4.67.1",
 ]
@@ -38,4 +39,8 @@ mlflow = [
 ]
 wandb = [
     "wandb>=0.23.0",
+]
+test = [
+    "pytest>=9.0.1",
+    "pytest-cov>=7.0.0",
 ]
