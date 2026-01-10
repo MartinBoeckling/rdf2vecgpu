@@ -455,6 +455,15 @@ class GPU_RDF2Vec:
                     ),
                 )
 
+            # TODO write the order aware implementations
+            elif self.config.embedding_model == "skipgram_order":
+                word2vec_model = OrderAwareSkipgram(
+                    vocab_size=self.word2idx.shape[0],
+                    embedding_dim=self.config.vector_size,
+                    learning_rate=self.config.learning_rate,
+                )
+                context_series = walk
+
             else:
                 logger.error(
                     f"Unsupported embedding model: {self.config.embedding_model}. Please choose either 'skipgram' or 'cbow'."

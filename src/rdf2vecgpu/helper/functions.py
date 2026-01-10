@@ -5,6 +5,17 @@ from torch.utils.dlpack import to_dlpack
 import cupy as cp
 
 
+def _dask_unique_id(df, partition_info=None) -> cudf.Series:
+    part_idx = partition_info["number"] if partition_info else 0
+
+    local_idx = cudf.Series(cp.arange(len(df)), index=df.index)
+
+    # Now the assignment aligns perfectly
+    df["unique_id"] = f"P{part_idx}_" + local_idx.astype(str)
+
+    return df
+
+
 def _generate_vocab(
     edge_df: cudf.DataFrame, multi_gpu: bool
 ) -> tuple[cudf.Series, cudf.Series]:
@@ -45,44 +56,30 @@ def _generate_vocab(
       across partitions before resetting the index.
     """
     if multi_gpu:
-        edge_df.index = edge_df.index.rename("row_id")
-        edge_df = edge_df.reset_index()
-        edge_melted = edge_df.melt(id_vars="row_id", var_name="role", value_name="word")
-        vocabulary_categories = edge_melted.categorize(columns=["word"])
-        vocabulary_categories["token"] = vocabulary_categories["word"].cat.codes
-        vocabulary_categories["word"] = vocabulary_categories["word"].astype("string")
-        subjects = vocabulary_categories[vocabulary_categories["role"] == "subject"][
-            ["row_id", "token"]
-        ]
-        subjects = subjects.rename(columns={"token": "subject"})
-
-        # Filter for predicates
-        predicates = vocabulary_categories[
-            vocabulary_categories["role"] == "predicate"
-        ][["row_id", "token"]]
-        predicates = predicates.rename(columns={"token": "predicate"})
-
-        # Filter for objects
-        objects = vocabulary_categories[vocabulary_categories["role"] == "object"][
-            ["row_id", "token"]
-        ]
-        objects = objects.rename(columns={"token": "object"})
-
-        # Merge them back together using the row_id
-        subjects = subjects.set_index("row_id")
-        predicates = predicates.set_index("row_id")
-        objects = objects.set_index("row_id")
-        kg_data = dd.concat([subjects, predicates, objects], axis=1).reset_index()
-        print(kg_data.head())
-        kg_data = kg_data.astype(
-            {"subject": "int64", "predicate": "int64", "object": "int64"}
+        # construct word2idx
+        vocabulary = dd.concat(
+            [edge_df["subject"], edge_df["predicate"], edge_df["object"]]
+        ).unique()
+        vocabulary_df = vocabulary.to_frame(name="word")
+        word2idx = vocabulary_df.categorize(columns=["word"])
+        word2idx["token"] = word2idx["word"].cat.codes
+        word2idx = word2idx.astype({"word": "string[pyarrow]"})
+        edge_df = (
+            edge_df.merge(word2idx, left_on="subject", right_on="word")
+            .drop(["word", "subject"], axis=1)
+            .rename(columns={"token": "subject"})
         )
-        word2idx = (
-            vocabulary_categories[["token", "word"]]
-            .drop_duplicates()
-            .reset_index(drop=True)
+        edge_df = (
+            edge_df.merge(word2idx, left_on="predicate", right_on="word")
+            .drop(["word", "predicate"], axis=1)
+            .rename(columns={"token": "predicate"})
         )
-        return kg_data, word2idx
+        edge_df = (
+            edge_df.merge(word2idx, left_on="object", right_on="word")
+            .drop(["word", "object"], axis=1)
+            .rename(columns={"token": "object"})
+        )
+        return edge_df, word2idx
 
     else:
         vocabulary = cudf.concat(
@@ -131,18 +128,3 @@ def torch_to_cudf(torch_tensor, multi_gpu: bool):
 
         # cp_farray = cp.asfortranarray(cp_arr)
         return cudf.from_dlpack(dlpack_capsule)
-
-
-def determine_optimal_chunksize(length_iterable: int, cpu_count: int) -> int:
-    """Method to determine optimal chunksize for parallelism of unordered method
-
-    Args:
-        length_iterable (int): Size of iterable
-
-    Returns:
-        int: determined chunksize
-    """
-    chunksize, extra = divmod(length_iterable, cpu_count * 4)
-    if extra:
-        chunksize += 1
-    return chunksize

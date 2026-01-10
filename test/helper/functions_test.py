@@ -45,7 +45,7 @@ def _make_cudf_df():
 
 
 def _make_dask_cudf_df():
-    return dask_cudf.from_cudf(_make_cudf_df(), npartitions=2)
+    return dask_cudf.from_cudf(_make_edge_df(), npartitions=2)
 
 
 def _make_tensor_data():
@@ -66,7 +66,7 @@ def test_generate_vocab_multi_gpu():
     edge_df, vocab = _generate_vocab(edge_df, multi_gpu=True)
     assert isinstance(vocab, dask_cudf.DataFrame)
     assert isinstance(edge_df, dask_cudf.DataFrame)
-    assert list(vocab.columns) == ["token", "word"]
+    assert list(vocab.columns) == ["word", "token"]
     assert list(edge_df.columns) == ["subject", "predicate", "object"]
     assert vocab.compute().shape == (4, 2)
 

@@ -3,7 +3,6 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
 
-@dataclass
 class RDF2VecConfig(BaseModel):
     """
     Configuration object for GPU-accelerated RDF2Vec.
