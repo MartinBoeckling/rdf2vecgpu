@@ -1,0 +1,59 @@
+cff-version: 1.2.0
+title: gpurdf2vec
+message: If you use this software please cite it as below
+type: software
+authors:
+  - family-names: Böckling
+    given-names: Martin
+    orcid: 'https://orcid.org/0000-0002-1143-4686'
+  - family-names: Paulheim
+    given-names: Heiko
+    orcid: 'https://orcid.org/0000-0003-4386-8195'
+url: 'https://github.com/MartinBoeckling/rdf2vecgpu'
+version: 0.2.3
+date-released: '2025-11-14'
+preferred-citation:
+  type: conference-paper
+  title: "gpuRDF2vec – Scalable GPU-Based RDF2vec"
+  authors:
+      - family-names: Böckling
+        given-names: Martin
+        orcid: 'https://orcid.org/0000-0002-1143-4686'
+      - family-names: Paulheim
+        given-names: Heiko
+        orcid: 'https://orcid.org/0000-0003-4386-8195'
+  doi: 10.1007/978-3-032-09530-5_14
+
+  collection-title: The Semantic Web -- ISWC 2025
+  year: 2025
+  editors:
+      - family-names: Garijo
+        given-names: Daniel
+      - family-names: Kirrane
+        given-names: Sabrina
+      - family-names: Salatino
+        given-names: Angelo
+      - family-names: Shimizu
+        given-names: Cogan
+      - family-names: Acosta
+        given-names: Maribel
+      - family-names: Nuzzolese
+        given-names: Andrea Giovanni
+      - family-names: Ferrada
+        given-names: Sebastián
+      - family-names: Soulard
+        given-names: Thibaut
+      - family-names: Kozaki
+        given-names: Kouji
+      - family-names: Takeda
+        given-names: Hideaki
+      - family-names: Gentile
+        given-names: Anna Lisa
+  conference:
+      name: 24th International Semantic Web Conference
+      city: Nara
+      country: JP
+      date-start: "2025-11-02"
+      date-end: "2025-11-06"
+  start: 240
+  end: 257
