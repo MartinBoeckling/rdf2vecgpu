@@ -1,20 +1,5 @@
 import pytest
-import torch
 from src.rdf2vecgpu.config import RDF2VecConfig
-
-
-def pytest_addoption(parser):
-    parser.addoption("--gpu", action="store_true", help="run gpu tests")
-
-
-def pytest_runtest_setup(item):
-    if "gpu" in item.keywords:
-        if not item.config.getoption("--gpu"):
-            # If user didn't ask for GPU, skip
-            pytest.skip("need --gpu option to run")
-        if not torch.cuda.is_available():
-            # If user asked but no GPU exists, fail or skip
-            pytest.skip("No GPU available")
 
 
 def test_default_config():
@@ -35,7 +20,7 @@ def test_default_config():
         multi_gpu=False,
         generate_artifact=False,
         cpu_count=20,
-        embedding_backend="pytorch",
+        backend="pytorch",
         tune_batch_size=True,
         num_nodes=1,
         tracker="none",
@@ -70,7 +55,7 @@ def test_config_reject_invalid_strategy():
 
 def test_config_reject_invalid_backend():
     with pytest.raises(ValueError) as exec_info:
-        RDF2VecConfig(embedding_backend="invalid_backend")
+        RDF2VecConfig(backend="invalid_backend")
     msg = str(exec_info.value)
     assert "pytorch" in msg
     assert "gensim" in msg
