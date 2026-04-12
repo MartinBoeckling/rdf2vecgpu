@@ -134,6 +134,78 @@ class CBOWDataModule(L.LightningDataModule):
         )
 
 
+class ParquetSkipGramDataModule(L.LightningDataModule):
+    """DataModule that reads skip-gram pairs from partitioned parquet.
+
+    Designed for multi-GPU DDP training: each rank reads its own subset
+    of parquet files and loads them onto its local GPU.
+
+    Parameters
+    ----------
+    parquet_path : str
+        Directory containing partitioned parquet files (written by dask).
+    batch_size : int
+        Number of (centre, context) pairs per optimisation step.
+    """
+
+    def __init__(self, parquet_path: str, *, batch_size: int):
+        super().__init__()
+        self.parquet_path = parquet_path
+        self.batch_size = batch_size
+        self.center = None
+        self.context = None
+
+    def setup(self, stage: str | None = None):
+        import cudf
+        from glob import glob
+        import os
+
+        files = sorted(glob(os.path.join(self.parquet_path, "*.parquet")))
+        if not files:
+            # dask may write to subdirectory "part.0.parquet" etc.
+            files = sorted(glob(os.path.join(self.parquet_path, "**", "*.parquet"), recursive=True))
+
+        # Distribute files across DDP ranks
+        rank = self.trainer.global_rank if self.trainer else 0
+        world_size = self.trainer.world_size if self.trainer else 1
+        my_files = [f for i, f in enumerate(files) if i % world_size == rank]
+
+        if not my_files:
+            raise RuntimeError(
+                f"Rank {rank}/{world_size} has no parquet files assigned "
+                f"from {len(files)} total files in {self.parquet_path}"
+            )
+
+        # Read assigned parquet files and convert to GPU tensors
+        parts = [cudf.read_parquet(f) for f in my_files]
+        df = cudf.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
+        self.center = torch.utils.dlpack.from_dlpack(
+            df["center"].to_dlpack()
+        ).contiguous()
+        self.context = torch.utils.dlpack.from_dlpack(
+            df["context"].to_dlpack()
+        ).contiguous()
+
+    def train_dataloader(self):
+        dataset = _IndexDataset(len(self.center))
+        sampler = RandomSampler(dataset, replacement=False)
+        batch_sampler = BatchSampler(
+            sampler, batch_size=self.batch_size, drop_last=False
+        )
+
+        def _collate(indices: list[int]):
+            idx = torch.tensor(indices, device=self.center.device)
+            return self.center[idx], self.context[idx]
+
+        return DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=_collate,
+            num_workers=0,
+            pin_memory=False,
+        )
+
+
 class OrderAwareSkipGramDataModule(L.LightningDataModule):
     """
     Dataloading optimised for a GPU‑resident order-aware skip‑gram table.

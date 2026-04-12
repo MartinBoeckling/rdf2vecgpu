@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+from typing import Optional, Dict, Any
 from .base import BaseTracker
 
 
@@ -31,6 +33,7 @@ class WandbTracker(BaseTracker):
             )
         return self
 
+    @contextmanager
     def stage(self, name):
         self.wandb.run.log({"stage/start": name})
         try:
@@ -69,11 +72,12 @@ class WandbTracker(BaseTracker):
 
         with tempfile.TemporaryDirectory() as td:
             p = os.path.join(td, artifact_file)
-            open(p, "w", encoding="utf-8").write(text)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(text)
             self.log_artifact(p, artifact_path or "notes")
 
     def log_pytorch(self):
-        self.wandb.Run.watch()
+        pass
 
     def log_model_pytorch(self, model, artifact_path: str):
         import tempfile
@@ -90,7 +94,7 @@ class WandbTracker(BaseTracker):
 
     def log_data(self, sample_data, data_name, artifact_path, tags=None):
         tbl = self.wandb.Table(dataframe=sample_data)
-        self.wand.log({data_name: tbl})
+        self.wandb.log({data_name: tbl})
 
     def close(self):
         try:

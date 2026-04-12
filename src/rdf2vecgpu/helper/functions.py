@@ -2,18 +2,6 @@ import cudf
 import dask.dataframe as dd
 import torch
 from torch.utils.dlpack import to_dlpack
-import cupy as cp
-
-
-def _dask_unique_id(df, partition_info=None) -> cudf.Series:
-    part_idx = partition_info["number"] if partition_info else 0
-
-    local_idx = cudf.Series(cp.arange(len(df)), index=df.index)
-
-    # Now the assignment aligns perfectly
-    df["unique_id"] = f"P{part_idx}_" + local_idx.astype(str)
-
-    return df
 
 
 def _generate_vocab(
@@ -79,6 +67,9 @@ def _generate_vocab(
             .drop(["word", "object"], axis=1)
             .rename(columns={"token": "object"})
         )
+        edge_df = edge_df.astype(
+            {"subject": "int32", "predicate": "int32", "object": "int32"}
+        )
         return edge_df, word2idx
 
     else:
@@ -89,22 +80,13 @@ def _generate_vocab(
         tokenization, word = vocabulary.factorize()
         word2idx = cudf.concat([cudf.Series(tokenization), cudf.Series(word)], axis=1)
         word2idx.columns = ["token", "word"]
-        # Merge back to edge_df
-        edge_df = edge_df.merge(word2idx, left_on="subject", right_on="word")
-        edge_df = edge_df.drop(columns=["subject", "word"]).rename(
-            columns={"token": "subject"}
+        # Build a word→token lookup map and apply to all three columns at once
+        lookup = cudf.Series(
+            word2idx["token"].values, index=word2idx["word"]
         )
-        edge_df = edge_df.merge(
-            word2idx, left_on="predicate", right_on="word", how="left"
-        )
-        edge_df = edge_df.drop(columns=["predicate", "word"]).rename(
-            columns={"token": "predicate"}
-        )
-        edge_df = edge_df.merge(word2idx, left_on="object", right_on="word", how="left")
-        edge_df = edge_df.drop(columns=["object", "word"]).rename(
-            columns={"token": "object"}
-        )
-        edge_df = edge_df.dropna().astype(
+        for col in ("subject", "predicate", "object"):
+            edge_df[col] = edge_df[col].map(lookup)
+        edge_df = edge_df.dropna(subset=["subject", "predicate", "object"]).astype(
             {"subject": "int32", "predicate": "int32", "object": "int32"}
         )
         return edge_df, word2idx
@@ -125,6 +107,4 @@ def torch_to_cudf(torch_tensor, multi_gpu: bool):
         column_major_tensor = torch_tensor.t().contiguous().t()
 
         dlpack_capsule = to_dlpack(column_major_tensor)
-
-        # cp_farray = cp.asfortranarray(cp_arr)
         return cudf.from_dlpack(dlpack_capsule)

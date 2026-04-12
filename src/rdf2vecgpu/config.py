@@ -1,4 +1,3 @@
-from dataclasses import dataclass
 from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
@@ -23,8 +22,13 @@ class RDF2VecConfig(BaseModel):
     walk_depth : int, default 4
         Maximum depth of each walk.
 
-    walk_number : int, default 10
+    walk_number : int, default 100
         Number of walks started per vertex.
+
+    walk_weighted : bool, default False
+        If True, use edge weights for biased walk transitions via
+        cuGraph's ``biased_random_walks()``. The input data must contain
+        a ``"weights"`` column (cuGraph standard name).
 
     embedding_model : {"skipgram", "cbow"}, default "skipgram"
         Word2Vec variant used for embedding training.
@@ -70,12 +74,30 @@ class RDF2VecConfig(BaseModel):
 
     num_nodes : int, default 1
         Number of nodes involved in multi-GPU setup.
+
+    literal_predicates : list[str] or None, default None
+        Predicates that identify literal (numeric) edges. When set, edges
+        with these predicates are handled according to ``literal_strategy``.
+        Predicate strings must match the values in the data exactly.
+
+    literal_strategy : {"drop", "bin"}, default "drop"
+        How to handle literal edges. ``"drop"`` removes them from the graph
+        (pyRDF2Vec default). ``"bin"`` discretizes the object values into
+        bin tokens so the edge stays in the graph.
+
+    literal_n_bins : int, default 5
+        Number of bins when ``literal_strategy="bin"``.
+
+    literal_bin_strategy : {"quantile", "uniform"}, default "quantile"
+        Binning method. ``"quantile"`` creates equal-frequency bins (robust
+        to skew). ``"uniform"`` creates equal-width bins.
     """
 
     # walk parameter settings
     walk_strategy: Literal["random", "bfs"] = "random"
     walk_depth: int = Field(default=4, gt=0)
     walk_number: int = Field(default=100, gt=0)
+    walk_weighted: bool = False
     # embedding parameter settings
     embedding_model: Literal["skipgram", "cbow"] = "skipgram"
     epochs: int = Field(default=5, gt=0)
@@ -85,7 +107,7 @@ class RDF2VecConfig(BaseModel):
     min_count: int = Field(default=1, ge=0)
     negative_samples: int = Field(default=5, ge=0)
     learning_rate: float = Field(default=0.0001, gt=0)
-    embedding_backend: Literal["pytorch", "gensim"] = "pytorch"
+    backend: Literal["pytorch", "gensim"] = "pytorch"
     # library settings
     random_state: int = Field(default=42, ge=0)
     reproducible: bool = False
@@ -96,3 +118,9 @@ class RDF2VecConfig(BaseModel):
     num_nodes: int = Field(default=1, gt=0)
     tracker: Literal["mlflow", "wandb", "none"] = "none"
     tracker_kwargs: Optional[dict] = None
+    tracker_run_name: Optional[str] = None
+    # literal handling settings
+    literal_predicates: Optional[list[str]] = None
+    literal_strategy: Literal["drop", "bin"] = "drop"
+    literal_n_bins: int = Field(default=5, gt=1)
+    literal_bin_strategy: Literal["quantile", "uniform"] = "quantile"

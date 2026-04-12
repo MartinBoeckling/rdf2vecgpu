@@ -15,7 +15,7 @@ def build_tracker(spec: str | None, kwargs: dict | None = None) -> BaseTracker:
             from .mlflow_logger import MlflowTracker
 
             mlflow_kwargs = kwargs or {}
-            return MLflowTracker(**mlflow_kwargs.get("mlflow", {}))
+            return MlflowTracker(**mlflow_kwargs.get("mlflow", {}))
         except ImportError:
             logger.exception(
                 "mlflow is not installed. Please install it to use MlflowTracker."

@@ -2,7 +2,7 @@ from contextlib import contextmanager
 from typing_extensions import override
 from .base import BaseTracker
 from loguru import logger
-from typing import Dict, Any, Optional, Iterable, Union
+from typing import Dict, Any, Optional
 import os
 import tempfile
 
@@ -36,7 +36,7 @@ class MlflowTracker(BaseTracker):
         tags: Optional[Dict[str, str]] = None,
     ) -> "MlflowTracker":
         if run_name is not None:
-            self._parent_run = mlflow.start_run(run_name)
+            self._parent_run = mlflow.start_run(run_name=run_name)
         else:
             self._parent_run = mlflow.start_run()
         if tags:
@@ -102,11 +102,3 @@ class MlflowTracker(BaseTracker):
         if self._parent_run:
             mlflow.end_run()
             self._parent_run = None
-
-
-def make_tracker(
-    experiment: str, tracking_uri: str, registry_uri: Optional[str] = None
-) -> Union[MlflowTracker, None]:
-    return MlflowTracker(
-        experiment=experiment, tracking_uri=tracking_uri, registry_uri=registry_uri
-    )

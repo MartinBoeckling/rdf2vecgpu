@@ -27,9 +27,11 @@ class KGFileReader:
         multi_gpu: bool,
         col_map: dict[str, str] | None = None,
         read_kwargs: dict | None = None,
+        walk_weighted: bool = False,
     ):
         self.file_path = Path(file_path)
         self.multi_gpu = multi_gpu
+        self.walk_weighted = walk_weighted
         self.file_ending = self.file_path.suffix
         self.col_map = col_map or {
             "subject": "subject",
@@ -56,7 +58,15 @@ class KGFileReader:
             renamed_df = df.rename(columns=self.col_map)
         else:
             renamed_df = df.rename(mapper=self.col_map, axis=1)
-        renamed_df = renamed_df[["subject", "predicate", "object"]]
+        cols = ["subject", "predicate", "object"]
+        if self.walk_weighted:
+            if "weights" not in renamed_df.columns:
+                raise ValueError(
+                    "walk_weighted=True but no 'weights' column found in data. "
+                    "Provide a 'weights' column or add it to col_map."
+                )
+            cols.append("weights")
+        renamed_df = renamed_df[cols]
         return renamed_df
 
     def read(self) -> DataFrameLike:
@@ -69,8 +79,6 @@ class KGFileReader:
             df = self._csv_reader()
         elif self.file_ending == ".orc":
             df = self._orc_reader()
-        #        elif self.file_ending in [".hdf", ".hdf5"]:
-        #            df = self._hdf_reader()
         else:
             # Check if file format is parseable by rdflib
             rdf_format = guess_format(str(self.file_path))
@@ -87,24 +95,23 @@ class KGFileReader:
         return renamed_df
 
     def _parquet_reader(self) -> DataFrameLike:
+        columns = [
+            self.col_map["subject"],
+            self.col_map["predicate"],
+            self.col_map["object"],
+        ]
+        if self.walk_weighted:
+            columns.append("weights")
         if self.multi_gpu:
             kg_data = dd.read_parquet(
                 self.file_path,
-                columns=[
-                    self.col_map["subject"],
-                    self.col_map["predicate"],
-                    self.col_map["object"],
-                ],
+                columns=columns,
                 **self.read_kwargs,
             )
         else:
             kg_data = cudf.read_parquet(
                 self.file_path,
-                columns=[
-                    self.col_map["subject"],
-                    self.col_map["predicate"],
-                    self.col_map["object"],
-                ],
+                columns=columns,
                 **self.read_kwargs,
             )
 
@@ -131,7 +138,6 @@ class KGFileReader:
         else:
             df = cudf.read_text(self.file_path, delimiter="\n").to_frame()
             df.columns = ["raw"]
-            print(df.columns)
 
         nt_pattern = r"^<([^>]+)>\s+<([^>]+)>\s+(.*)\s+\.\s*$"
         extracted = df["raw"].str.extract(nt_pattern)
@@ -154,19 +160,6 @@ class KGFileReader:
             )
         return kg_data
 
-    def _hdf_reader(self) -> DataFrameLike:
-        if self.multi_gpu:
-            edge_df = dd.read_hdf(
-                self.file_path,
-                **self.read_kwargs,
-            )
-        else:
-            edge_df = cudf.read_hdf(
-                self.file_path,
-                **self.read_kwargs,
-            )
-        return edge_df
-
     def _rdf_lib_reader(self) -> DataFrameLike:
         kg = rdfGraph()
         kg.parse(self.file_path)
@@ -174,10 +167,9 @@ class KGFileReader:
         edge_list = [triple for triple in tqdm(kg, desc="Parsing RDF with rdflib")]
         pd_edge_df = pd.DataFrame(edge_list, columns=["subject", "predicate", "object"])
         if self.multi_gpu:
-            edge_df = dask.dataframe.from_pandas(pd_edge_df)
+            import dask_cudf
+            cudf_df = cudf.DataFrame.from_pandas(pd_edge_df)
+            edge_df = dask_cudf.from_cudf(cudf_df, npartitions=1)
         else:
-            print(self.multi_gpu)
             edge_df = cudf.DataFrame.from_pandas(pd_edge_df)
-            print(type(edge_df))
-            print(edge_df)
         return edge_df
