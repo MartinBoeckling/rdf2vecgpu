@@ -64,6 +64,8 @@ autodoc_mock_imports = [
     "igraph",
     "pyspark",
     "sparkkgml",
+    "mlflow",
+    "wandb",
 ]
 
 # Optionally, pick up package version automatically

@@ -136,9 +136,10 @@ RDF2Vec is a powerful technique to generate vector embeddings of entities in RDF
 ## Quick start
 
 ```python
-from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
-# Instantiate the gpu RDF2Vec library settings
-gpu_rdf2vec_model = GPU_RDF2Vec(
+from rdf2vecgpu import GPU_RDF2Vec, RDF2VecConfig
+
+# Bundle all hyperparameters in a config object
+config = RDF2VecConfig(
     walk_strategy="random",
     walk_depth=4,
     walk_number=100,
@@ -154,41 +155,61 @@ gpu_rdf2vec_model = GPU_RDF2Vec(
     reproducible=False,
     multi_gpu=False,
     generate_artifact=False,
-    cpu_count=20
+    cpu_count=20,
 )
+
+# Instantiate the pipeline
+gpu_rdf2vec_model = GPU_RDF2Vec(config=config)
+
 # Path to the triple dataset
 path = "data/wikidata5m/wikidata5m_kg.parquet"
-# Load data and receive edge data
-edge_data = gpu_rdf2vec_model.load_data(path)
+
+# Read data and receive edge data
+edge_data = gpu_rdf2vec_model.read_data(path)
+
 # Fit the Word2Vec model and transform the dataset to an embedding
 embeddings = gpu_rdf2vec_model.fit_transform(edge_df=edge_data, walk_vertices=None)
-# Write embedding to file format. Return format is a cuDf dataframe
+
+# Write embedding to file format. Return format is a cuDF dataframe
 embeddings.to_parquet("data/wikidata5m/wikidata5m_embeddings.parquet", index=False)
 ```
 
 - Supported file formats:
-  - .csv
-  - .txt
-  - .parquet
-  - .nt
+  - `.csv`
+  - `.parquet`
+  - `.orc`
+  - `.nt`, `.nq`
   - All supported [RDFlib file formats](https://rdflib.readthedocs.io/en/stable/plugin_parsers.html)
-- gpuRDF2Vec Parameters:
-  - walk_strategy: `[random, bfs]`
-  - walk_depth: `int`
-  - walk_number: `int`
-  - embedding_model: `[skipgram, cbow]`
-  - epochs: `int`
-  - batch_size: `[None | int]` --> If the batch size is None, we guess internally the batch size based on the data loader and the number of CPU counts provided
-  - vector_size
-  - window_size: `int`
-  - min_count: `int`
-  - learning_rate: `float`
-  - negative_samples: `int`
-  - random_state: `int`
-  - reproducible: `bool`
-  - multi_gpu: `bool`
-  - generate_artifact: `bool`
-  - cpu_count: `int`
+- Core `RDF2VecConfig` parameters (see [Configuration reference](https://rdf2vecgpu.readthedocs.io/en/latest/configuration.html) for the full list):
+  - `walk_strategy`: `["random", "bfs"]`
+  - `walk_depth`: `int`
+  - `walk_number`: `int`
+  - `walk_weighted`: `bool` (uses cuGraph biased random walks; requires a `weights` column)
+  - `embedding_model`: `["skipgram", "cbow"]`
+  - `epochs`: `int`
+  - `batch_size`: `int | None` — if `None`, a heuristic batch size is picked based on the data loader and the available GPU memory
+  - `vector_size`: `int`
+  - `window_size`: `int`
+  - `min_count`: `int`
+  - `learning_rate`: `float`
+  - `negative_samples`: `int`
+  - `random_state`: `int`
+  - `reproducible`: `bool`
+  - `multi_gpu`: `bool`
+  - `generate_artifact`: `bool`
+  - `cpu_count`: `int`
+  - `literal_predicates`, `literal_strategy`, `literal_n_bins`, `literal_bin_strategy` — see the literal handling section of the docs
+  - `tracker`: `["none", "mlflow", "wandb"]` — pluggable experiment tracking backend
+
+### Optional extras
+
+The experiment tracking backends and the test suite are opt-in:
+
+```bash
+pip install "rdf2vecgpu[mlflow]"
+pip install "rdf2vecgpu[wandb]"
+pip install "rdf2vecgpu[test]"
+```
 
 ## Implementation Details
 
@@ -241,7 +262,7 @@ In case you have found a bug or unexpected behaviour, please reach out by openin
 
 If you use gpuRDF2Vec in your research, please cite the following paper:
 
-```bixbtex
+```bibtex
 @InProceedings{10.1007/978-3-032-09530-5_14,
   author="B{\"o}ckling, Martin and Paulheim, Heiko",
   editor="Garijo, Daniel

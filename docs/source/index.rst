@@ -60,11 +60,12 @@ This project is licensed under the MIT License.
    :hidden:
    :caption: gpuRDF2vec Usage
 
-   rdf2vecgpuusage
    gettingstarted
+   configuration
    dataload
    training
    vectorretrieval
+   tracking
 
 
 Indices and tables
