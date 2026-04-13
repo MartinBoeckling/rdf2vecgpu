@@ -35,6 +35,28 @@ Create and activate a virtual environment (recommended), then install:
    # Install rdf2vecgpu from PyPI
    python -m pip install -U rdf2vecgpu
 
+Optional extras
+---------------
+
+``rdf2vecgpu`` ships several optional dependency groups. Install the ones you need:
+
+.. code-block:: bash
+
+   # Experiment tracking backends
+   python -m pip install -U "rdf2vecgpu[mlflow]"
+   python -m pip install -U "rdf2vecgpu[wandb]"
+
+   # Test dependencies
+   python -m pip install -U "rdf2vecgpu[test]"
+
+When working from source with ``uv``, the equivalent commands are:
+
+.. code-block:: bash
+
+   uv sync --extra mlflow
+   uv sync --extra wandb
+   uv sync --extra test
+
 GPU acceleration
 ---------------------------
 

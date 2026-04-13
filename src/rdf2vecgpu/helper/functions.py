@@ -1,9 +1,7 @@
-from loguru import logger
 import cudf
 import dask.dataframe as dd
-import dask_cudf
-from dask_cuda import LocalCUDACluster
-from dask.distributed import Client
+import torch
+from torch.utils.dlpack import to_dlpack
 
 
 def _generate_vocab(
@@ -46,33 +44,67 @@ def _generate_vocab(
       across partitions before resetting the index.
     """
     if multi_gpu:
-        edge_df.index = edge_df.index.rename("row_id")
-        edge_df = edge_df.reset_index()
-        edge_melted = edge_df.melt(id_vars="row_id", var_name="role", value_name="word")
-        vocabulary_categories = edge_melted.categorize(subset=["word"])
-        vocabulary_categories["token"] = vocabulary_categories["word"].cat.codes
-        vocabulary_categories["word"] = vocabulary_categories["word"].astype("string")
-        return vocabulary_categories
+        # construct word2idx
+        vocabulary = dd.concat(
+            [edge_df["subject"], edge_df["predicate"], edge_df["object"]]
+        ).unique()
+        vocabulary_df = vocabulary.to_frame(name="word")
+        word2idx = vocabulary_df.categorize(columns=["word"])
+        word2idx["token"] = word2idx["word"].cat.codes
+        word2idx = word2idx.astype({"word": "string[pyarrow]"})
+        edge_df = (
+            edge_df.merge(word2idx, left_on="subject", right_on="word")
+            .drop(["word", "subject"], axis=1)
+            .rename(columns={"token": "subject"})
+        )
+        edge_df = (
+            edge_df.merge(word2idx, left_on="predicate", right_on="word")
+            .drop(["word", "predicate"], axis=1)
+            .rename(columns={"token": "predicate"})
+        )
+        edge_df = (
+            edge_df.merge(word2idx, left_on="object", right_on="word")
+            .drop(["word", "object"], axis=1)
+            .rename(columns={"token": "object"})
+        )
+        edge_df = edge_df.astype(
+            {"subject": "int32", "predicate": "int32", "object": "int32"}
+        )
+        return edge_df, word2idx
 
     else:
         vocabulary = cudf.concat(
             [edge_df["subject"], edge_df["predicate"], edge_df["object"]],
             ignore_index=True,
         ).unique()
-        tokeninzation, word = vocabulary.factorize()
-        return tokeninzation, word
+        tokenization, word = vocabulary.factorize()
+        word2idx = cudf.concat([cudf.Series(tokenization), cudf.Series(word)], axis=1)
+        word2idx.columns = ["token", "word"]
+        # Build a word→token lookup map and apply to all three columns at once
+        lookup = cudf.Series(
+            word2idx["token"].values, index=word2idx["word"]
+        )
+        for col in ("subject", "predicate", "object"):
+            edge_df[col] = edge_df[col].map(lookup)
+        edge_df = edge_df.dropna(subset=["subject", "predicate", "object"]).astype(
+            {"subject": "int32", "predicate": "int32", "object": "int32"}
+        )
+        return edge_df, word2idx
 
 
-def determine_optimal_chunksize(length_iterable: int, cpu_count: int) -> int:
-    """Method to determine optimal chunksize for parallelism of unordered method
+def cudf_to_torch_tensor(df, column_name: str):
+    if column_name not in df.columns:
+        raise ValueError(f"Column '{column_name}' does not exist in the DataFrame.")
+    return torch.utils.dlpack.from_dlpack(df[column_name].to_dlpack()).contiguous()
 
-    Args:
-        length_iterable (int): Size of iterable
 
-    Returns:
-        int: determined chunksize
-    """
-    chunksize, extra = divmod(length_iterable, cpu_count * 4)
-    if extra:
-        chunksize += 1
-    return chunksize
+def torch_to_cudf(torch_tensor, multi_gpu: bool):
+    if multi_gpu:
+        raise NotImplementedError(
+            "Conversion from torch Tensor to cuDF DataFrame is not implemented for multi-GPU."
+        )
+    else:
+        column_major_tensor = torch_tensor.t().contiguous().t()
+
+        dlpack_capsule = to_dlpack(column_major_tensor)
+        return cudf.from_dlpack(dlpack_capsule)

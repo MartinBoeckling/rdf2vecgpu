@@ -24,6 +24,14 @@ rdf2vecgpu.gpu\_rdf2vec module
    :show-inheritance:
    :undoc-members:
 
+rdf2vecgpu.config module
+------------------------
+
+.. automodule:: rdf2vecgpu.config
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
 Module contents
 ---------------
 

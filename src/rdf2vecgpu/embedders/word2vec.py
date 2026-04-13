@@ -5,8 +5,6 @@ import lightning as L
 import numpy as np
 from torch.nn import functional as F
 
-torch.cuda.set_per_process_memory_fraction(0.9)
-
 
 class SkipGram(L.LightningModule):
     def __init__(

@@ -1,6 +1,6 @@
 [project]
 name = "rdf2vecgpu"
-version = "0.2.3"
+version = "0.3.0"
 description = "GPU-Accelerated RDF2Vec – A high-performance GPU implementation of RDF2Vec that uses CUDA and RAPIDS to generate scalable, embeddings for large dense knowledge graphs."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -8,13 +8,14 @@ license = { text = "MIT" }
 dependencies = [
     "cudf-cu12>=25.6.0",
     "cugraph-cu12==25.6.*",
-    "cupy-cuda12x>=13.5.1",
     "dask-cudf-cu12>=25.6.0",
     "dask[complete]>=2025.5.0",
     "lightning>=2.5.2",
     "loguru>=0.7.3",
     "numpy>=2.2.6",
+    "pydantic>=2.12.3",
     "rdflib>=7.1.4",
+    "tables>=3.10.2",
     "torch>=2.7.1",
     "tqdm>=4.67.1",
 ]
@@ -34,5 +35,16 @@ include = ["src/rdf2vecgpu"]
 
 [project.optional-dependencies]
 mlflow = [
-    "mlflow>=3.5.1",
+    "mlflow-skinny>=3.6.0",
 ]
+wandb = [
+    "wandb>=0.23.0",
+]
+test = [
+    "pytest>=9.0.1",
+    "pytest-cov>=7.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+pythonpath = ["."]

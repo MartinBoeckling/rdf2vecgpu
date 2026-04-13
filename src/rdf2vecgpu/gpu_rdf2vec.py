@@ -1,52 +1,28 @@
-from cugraph import Graph
-from pathlib import Path
-import multiprocessing as mp
-from rdflib.util import guess_format
+from typing import Optional
+from cugraph import MultiGraph
+import cugraph
 import lightning as L
 import torch
 import dask
-from cugraph.dask.comms import comms as Comms
-from torch.utils.dlpack import to_dlpack
 from lightning.pytorch.tuner import Tuner
-from .helper.functions import _generate_vocab
-from .embedders.word2vec import SkipGram, CBOW, OrderAwareSkipgram, OrderAwareCBOW
-from .embedders.word2vec_loader import (
-    SkipGramDataModule,
-    CBOWDataModule,
-    OrderAwareSkipGramDataModule,
-    OrderAwareCBOWDataModule,
-)
-from .reader.kg_reader import read_kg_file
-from .corpus.walk_corpus import single_gpu_walk_corpus, multi_gpu_walk_corpus
-# from .logger.mlflow_logger import make_tracker
+from .helper.functions import _generate_vocab, cudf_to_torch_tensor
+from .embedders.word2vec import SkipGram, CBOW
+from .embedders.word2vec_loader import SkipGramDataModule, CBOWDataModule, ParquetSkipGramDataModule
+from .reader.kg_file_reader import KGFileReader
+from .corpus.walk_corpus import SingleGPUWalkCorpus, MultiGPUWalkCorpus
+from .logger import build_tracker
 import cudf
-import dask.dataframe as dd
 from loguru import logger
+from .config import RDF2VecConfig
 
 
 class GPU_RDF2Vec:
     def __init__(
         self,
-        walk_strategy: str,
-        walk_depth: int,
-        walk_number: int,
-        embedding_model: str,
-        epochs: int,
-        batch_size: int,
-        vector_size: int,
-        window_size: int,
-        min_count: int,
-        negative_samples: int,
-        learning_rate: int,
-        random_state: int,
-        reproducible: bool,
-        multi_gpu: bool,
-        generate_artifact: bool,
-        cpu_count: int,
-        client=None,
-        tune_batch_size: bool = True,
-        number_nodes: int = 1,
-    ):  # Add client parameter
+        config: Optional[RDF2VecConfig] = None,
+        client: Optional[dask.distributed.Client] = None,
+        **kwargs,
+    ):
         """GPU‑accelerated implementation of the RDF2Vec pipeline.
 
         This class wraps every step that is necessary to obtain dense vector
@@ -85,7 +61,7 @@ class GPU_RDF2Vec:
                 Ignore tokens that appear fewer than this number of times when building the vocabulary
             negative_samples (int):
                 Number of negative samples in the negative-sampling loss
-            learning_rate (int):
+            learning_rate (float):
                 Learning rate for the optimiser
             random_state (int):
                 Seed for deterministic sampling operations
@@ -154,31 +130,12 @@ class GPU_RDF2Vec:
         >>> emb_df.head()
 
         """
+        if config is None:
+            config = RDF2VecConfig(**kwargs)
         # Initialize class variables
-        # Walk strategy parameters
-        self.walk_strategy = walk_strategy
-        self.walk_depth = walk_depth
-        self.walk_number = walk_number
-        # Word2Vec parameters
-        self.embedding_model = embedding_model
-        self.epochs = epochs
-        self.batch_size = batch_size
-        self.vector_size = vector_size
-        self.window_size = window_size
-        self.negative_samples = negative_samples
-        self.min_count = min_count
-        self.random_state = random_state
-        self.reproducible = reproducible
-        self.multi_gpu = multi_gpu
-        self.learning_rate = learning_rate
-        self.tune_batch_size = tune_batch_size
-        self.num_nodes = number_nodes
-        self.generate_artifact = generate_artifact
-        self.cpu_count = cpu_count
-
-        self._validate_config()
+        self.config = config
         # Handle client
-        if multi_gpu:
+        if self.config.multi_gpu:
             if client is None:
                 raise ValueError(
                     "multi_gpu=True requires a Dask client. Please create a "
@@ -195,16 +152,243 @@ class GPU_RDF2Vec:
                 f"Using provided Dask client with {len(client.scheduler_info()['workers'])} workers"
             )
             dask.config.set({"dataframe.backend": "cudf"})
+            # Apply cuGraph 25.6 + dask 2025.5 compatibility patches
+            from ._compat import apply_patches
+            apply_patches()
         else:
             self.client = None
+        self._validate_environment()
         # Initialize the cugraph graph
-        self.knowledge_graph = Graph(directed=True)
-        
+        self.knowledge_graph = MultiGraph(directed=True)
         self.word2vec_model = None
         self.word2idx = None
-        self.comms_initialized = False  # Track Comms initialization
+        self.tracker = build_tracker(
+            spec=self.config.tracker,
+            kwargs=self.config.tracker_kwargs,
+        )
 
-    def load_data(self, path: str) -> cudf.DataFrame:
+    def read_data(
+        self,
+        path: str,
+        col_map: Optional[dict] = None,
+        read_kwargs: Optional[dict] = None,
+    ):
+        self.tracker.start_pipeline(
+            run_name=self.config.tracker_run_name,
+            tags={"lib": "gpu-rdf2vec", "backend": self.config.backend},
+        )
+        kg_reader = KGFileReader(
+            file_path=path,
+            multi_gpu=self.config.multi_gpu,
+            col_map=col_map,
+            read_kwargs=read_kwargs,
+            walk_weighted=self.config.walk_weighted,
+        )
+        with self.tracker.stage("data_loading"):
+            kg_data = kg_reader.read()
+            self.tracker.log_params(
+                {
+                    "data_path": path,
+                    "number_rows": kg_data.shape[0],
+                    "number_columns": kg_data.shape[1],
+                }
+            )
+        return kg_data
+
+    def _handle_literals(self, kg_data):
+        """Filter or bin literal edges identified by predicate matching.
+
+        When ``literal_predicates`` is configured, edges whose predicate
+        appears in the list are either removed (``drop``) or their object
+        values are discretized into bin tokens (``bin``).
+        """
+        if not self.config.literal_predicates:
+            return kg_data
+
+        literal_preds = self.config.literal_predicates
+        is_dask = hasattr(kg_data, "map_partitions")
+
+        with self.tracker.stage("Literal_Handling"):
+            if self.config.literal_strategy == "drop":
+                mask = ~kg_data["predicate"].isin(literal_preds)
+                kg_data = kg_data[mask]
+                logger.info(
+                    f"Dropped literal edges for predicates: {literal_preds}"
+                )
+                self.tracker.log_params({
+                    "literal_strategy": "drop",
+                    "literal_predicates": literal_preds,
+                })
+            elif self.config.literal_strategy == "bin":
+                kg_data = self._bin_literals(kg_data, literal_preds, is_dask)
+
+        return kg_data
+
+    def _bin_literals(self, kg_data, literal_preds, is_dask):
+        """Discretize literal object values into bin tokens."""
+        literal_mask = kg_data["predicate"].isin(literal_preds)
+        if is_dask:
+            literal_edges = kg_data[literal_mask].compute()
+            non_literal_edges = kg_data[~literal_mask]
+        else:
+            literal_edges = kg_data[literal_mask].copy()
+            non_literal_edges = kg_data[~literal_mask]
+
+        if len(literal_edges) == 0:
+            return kg_data
+
+        binned_parts = []
+        for pred in literal_preds:
+            subset = literal_edges[literal_edges["predicate"] == pred]
+            if len(subset) == 0:
+                continue
+
+            numeric_vals = cudf.to_numeric(subset["object"], errors="coerce")
+            valid_mask = numeric_vals.notna()
+            valid_subset = subset[valid_mask].copy()
+            numeric_vals = numeric_vals[valid_mask]
+
+            if len(valid_subset) == 0:
+                continue
+
+            import cupy as cp
+            n_unique = len(numeric_vals.unique())
+            n_bins = min(self.config.literal_n_bins, n_unique)
+
+            if self.config.literal_bin_strategy == "uniform":
+                vmin = float(numeric_vals.min())
+                vmax = float(numeric_vals.max())
+                if vmin == vmax:
+                    bin_labels = cudf.Series(
+                        cp.zeros(len(numeric_vals), dtype="int32")
+                    )
+                else:
+                    edges = cp.linspace(vmin, vmax, n_bins + 1)
+                    bin_labels = cudf.Series(
+                        cp.searchsorted(edges[1:-1], numeric_vals.to_cupy())
+                    ).astype("int32")
+            else:  # quantile
+                quantiles = [i / n_bins for i in range(n_bins + 1)]
+                edges = numeric_vals.quantile(quantiles).values_host.tolist()
+                edges = sorted(set(edges))
+                if len(edges) < 2:
+                    bin_labels = cudf.Series(
+                        cp.zeros(len(numeric_vals), dtype="int32")
+                    )
+                else:
+                    edges_cp = cp.array(edges)
+                    bin_labels = cudf.Series(
+                        cp.searchsorted(edges_cp[1:-1], numeric_vals.to_cupy())
+                    ).astype("int32")
+            bin_labels.index = valid_subset.index
+
+            pred_short = pred.rsplit("/", 1)[-1].rsplit("#", 1)[-1]
+            valid_subset["object"] = (
+                pred_short + "_bin_" + bin_labels.astype("str")
+            )
+            binned_parts.append(valid_subset)
+
+        if binned_parts:
+            binned_df = cudf.concat(binned_parts, ignore_index=True)
+        else:
+            binned_df = cudf.DataFrame(columns=non_literal_edges.columns)
+
+        if is_dask:
+            import dask_cudf
+            binned_ddf = dask_cudf.from_cudf(binned_df, npartitions=1)
+            result = dask_cudf.concat([non_literal_edges, binned_ddf])
+        else:
+            result = cudf.concat(
+                [non_literal_edges, binned_df], ignore_index=True
+            )
+
+        logger.info(
+            f"Binned {len(binned_df)} literal edges across "
+            f"{len(literal_preds)} predicates into "
+            f"{self.config.literal_n_bins} bins"
+        )
+        self.tracker.log_params({
+            "literal_strategy": "bin",
+            "literal_predicates": literal_preds,
+            "literal_n_bins": self.config.literal_n_bins,
+            "literal_bin_strategy": self.config.literal_bin_strategy,
+            "literal_edges_binned": len(binned_df),
+        })
+        return result
+
+    def generate_vocab(self, kg_data):
+        with self.tracker.stage("Word2idx_Generation"):
+            kg_data, word2idx = _generate_vocab(kg_data, self.config.multi_gpu)
+            # Materialize dask word2idx for downstream PyTorch model creation
+            if hasattr(word2idx, "compute"):
+                word2idx = word2idx.compute().reset_index(drop=True)
+            self.tracker.log_params({"vocab_size": word2idx.shape[0]})
+        self.word2idx = word2idx
+        return kg_data, word2idx
+
+    def construct_graph(self, kg_data):
+        with self.tracker.stage("Graph_Construction"):
+            # cuGraph does not allow edge_attr and weight simultaneously.
+            # Predicates are always looked up via merge in the walk corpus,
+            # so we only need them stored in the graph for unweighted walks.
+            if self.config.walk_weighted:
+                edge_kwargs = dict(
+                    source="subject",
+                    destination="object",
+                    weight="weights",
+                    renumber=False,
+                )
+            else:
+                edge_kwargs = dict(
+                    source="subject",
+                    destination="object",
+                    edge_attr="predicate",
+                    renumber=False,
+                )
+            if self.config.multi_gpu:
+                cols = ["subject", "predicate", "object"]
+                if self.config.walk_weighted:
+                    cols.append("weights")
+                kg_data = kg_data[cols]
+                if cugraph.dask.comms.comms.is_initialized():
+                    self.knowledge_graph.from_dask_cudf_edgelist(
+                        kg_data, **edge_kwargs
+                    )
+                else:
+                    logger.error(
+                        "The communicator for multi-gpu cuGraph is not initalized."
+                    )
+                    raise ValueError(
+                        "The communicator for multi-gpu cuGraph is not initalized."
+                    )
+            else:
+                self.knowledge_graph.from_cudf_edgelist(
+                    kg_data, **edge_kwargs
+                )
+            if self.config.tracker != "none":
+                degree_df = self.knowledge_graph.degree()
+                degree_col = degree_df["degree"]
+                number_nodes = self.knowledge_graph.number_of_vertices()
+                number_edges = self.knowledge_graph.number_of_edges()
+
+                self.tracker.log_metrics(
+                    {
+                        "number_nodes": int(number_nodes),
+                        "number_edges": int(number_edges),
+                        "average_degree": float(degree_col.mean()),
+                        "min_degree": int(degree_col.min()),
+                        "max_degree": int(degree_col.max()),
+                    }
+                )
+                logger.debug(f"Graph has {number_edges} edges")
+                logger.debug(f"Graph has {number_nodes} vertices")
+
+    def load_data(
+        self,
+        path: str,
+        col_map: Optional[dict] = None,
+        read_kwargs: Optional[dict] = None,
+    ):
         """
         Load a triple file, build the token vocabulary, and populate the internal
         cuGraph instance.
@@ -252,155 +436,74 @@ class GPU_RDF2Vec:
             a`fit`).
 
         """
+        kg_data = self.read_data(
+            path=path,
+            col_map=col_map,
+            read_kwargs=read_kwargs,
+        )
+        kg_data = self._handle_literals(kg_data)
+        encoded_kg_data, word2idx = self.generate_vocab(kg_data)
+        self.construct_graph(encoded_kg_data)
+        return encoded_kg_data
 
-        file_path = Path(path)
-        file_ending = file_path.suffix
-        if file_ending == ".parquet":
-            if self.multi_gpu:
-                kg_data = dd.read_parquet(
-                    path, columns=["subject", "predicate", "object"]
+    def walk_generation(
+        self, edge_df: cudf.DataFrame, walk_vertices: cudf.Series = None
+    ) -> cudf.DataFrame:
+        with self.tracker.stage("Walk_Generation"):
+            if self.config.multi_gpu:
+                walk_instance = MultiGPUWalkCorpus(
+                    self.knowledge_graph,
+                    self.config.window_size,
+                    walk_weighted=self.config.walk_weighted,
                 )
             else:
-                kg_data = cudf.read_parquet(
-                    path, columns=["subject", "predicate", "object"]
+                walk_instance = SingleGPUWalkCorpus(
+                    self.knowledge_graph,
+                    self.config.window_size,
+                    walk_weighted=self.config.walk_weighted,
                 )
-        elif file_ending == ".csv":
-            if self.multi_gpu:
-                kg_data = dd.read_csv(
-                    path, names=["subject", "predicate", "object"], header=None
+            if self.config.walk_strategy == "random":
+                if walk_vertices is None:
+                    walk_vertices = self.knowledge_graph.nodes()
+                # Repeat each vertex walk_number times for walk start points
+                n = self.config.walk_number
+                if hasattr(walk_vertices, "map_partitions"):
+                    walk_vertices = walk_vertices.map_partitions(
+                        lambda s: s.repeat(n).reset_index(drop=True)
+                    )
+                else:
+                    walk_vertices = walk_vertices.repeat(n)
+                walk_corpus = walk_instance.random_walk(
+                    edge_df=edge_df,
+                    walk_vertices=walk_vertices,
+                    walk_depth=self.config.walk_depth,
+                    random_state=self.config.random_state,
+                    word2vec_model=self.config.embedding_model,
+                    min_count=self.config.min_count,
                 )
-            else:
-                kg_data = cudf.read_csv(
-                    path, names=["subject", "predicate", "object"], header=None
+            elif self.config.walk_strategy == "bfs":
+                if walk_vertices is None:
+                    walk_vertices = self.knowledge_graph.nodes()
+                walk_corpus = walk_instance.bfs_walk(
+                    edge_df=edge_df,
+                    walk_vertices=walk_vertices,
+                    walk_depth=self.config.walk_depth,
+                    random_state=self.config.random_state,
+                    word2vec_model=self.config.embedding_model,
+                    min_count=self.config.min_count,
                 )
-        elif file_ending == ".txt":
-            if self.multi_gpu:
-                kg_data = dd.read_csv(
-                    path, sep=" ", names=["subject", "predicate", "object"], header=None
-                )
-            else:
-                kg_data = cudf.read_text(path, names=["subject", "predicate", "object"])
-        # In order to read the .nt file we will use the csv reader extension and clean up the data
-        elif file_ending == ".nt":
-            if self.multi_gpu:
-                kg_data = dd.read_csv(
-                    path,
-                    sep=" ",
-                    names=["subject", "predicate", "object", "dot"],
-                    header=None,
-                )
-            else:
-                kg_data = cudf.read_csv(
-                    path, sep=" ", names=["subject", "predicate", "object"], header=None
-                )
-            kg_data = kg_data.drop(["dot"], axis=1)
-            kg_data["subject"] = (
-                kg_data["subject"].str.strip().str.replace("<", "").str.replace(">", "")
-            )
-            kg_data["predicate"] = (
-                kg_data["predicate"]
-                .str.strip()
-                .str.replace("<", "")
-                .str.replace(">", "")
-            )
-            kg_data["object"] = (
-                kg_data["object"].str.strip().str.replace("<", "").str.replace(">", "")
-            )
-        else:
-            # Use rdflib to provide a support for general purpose RDF formats and return the kg as a tuple
-            if self.multi_gpu:
-                raise ValueError(
-                    f"Multi-GPU support is not enabled for the file format: {file_ending}. Please consider one of the supported multi gpu formats: .parquet, .csv, .txt, .nt"
-                )
-            kg_format = guess_format(path)
-            if kg_format:
-                kg_tuple = read_kg_file(path)
-                kg_data = cudf.DataFrame(
-                    kg_tuple, columns=["subject", "object", "predicate"]
-                )
-            else:
-                raise ValueError(
-                    f"Unsupported file format: {file_ending}. Please consider either a valid RDF format or a .parquet, .csv, .txt file."
-                )
-        if self.multi_gpu:
-            word2idx = _generate_vocab(kg_data, self.multi_gpu)
-            subjects = word2idx[word2idx["role"] == "subject"][["row_id", "token"]]
-            subjects = subjects.rename(columns={"token": "subject"})
-
-            # Filter for predicates
-            predicates = word2idx[word2idx["role"] == "predicate"][["row_id", "token"]]
-            predicates = predicates.rename(columns={"token": "predicate"})
-
-            # Filter for objects
-            objects = word2idx[word2idx["role"] == "object"][["row_id", "token"]]
-            objects = objects.rename(columns={"token": "object"})
-
-            # Merge them back together using the row_id
-            subjects = subjects.set_index("row_id")
-            predicates = predicates.set_index("row_id")
-            objects = objects.set_index("row_id")
-            kg_data = dd.concat([subjects, predicates, objects], axis=1).reset_index()
-            kg_data = kg_data.astype(
-                {"subject": "int64", "predicate": "int64", "object": "int64"}
-            )
-            word2idx = (
-                word2idx[["token", "word"]].drop_duplicates().reset_index(drop=True)
+            self.tracker.log_params(
+                {
+                    "walk_depth": self.config.walk_depth,
+                    "random_state": self.config.random_state,
+                    "walk_strategy": self.config.walk_strategy,
+                    "walk_number": self.config.walk_number,
+                    "walk_weighted": self.config.walk_weighted,
+                    "min_count": self.config.min_count,
+                }
             )
 
-        else:
-            tokenization, word = _generate_vocab(kg_data, self.multi_gpu)
-            word2idx = cudf.concat(
-                [cudf.Series(tokenization), cudf.Series(word)], axis=1
-            )
-            word2idx.columns = ["token", "word"]
-            kg_data["subject"] = kg_data.merge(
-                word2idx, left_on="subject", right_on="word", how="left"
-            )["token"]
-            kg_data["predicate"] = kg_data.merge(
-                word2idx, left_on="predicate", right_on="word", how="left"
-            )["token"]
-            kg_data["object"] = kg_data.merge(
-                word2idx, left_on="object", right_on="word", how="left"
-            )["token"]
-            kg_data = kg_data.astype("int32")
-        if self.generate_artifact:
-            word2idx.to_parquet(
-                f"vector/word2idx_{file_path.stem}.parquet", index=False
-            )
-        self.word2idx = word2idx
-
-        # Load the edge list into the graph
-        if self.multi_gpu:
-            # Initialize Comms only once, when we actually need it
-            if not self.comms_initialized:
-                from cugraph.dask.comms import comms as Comms
-
-                try:
-                    Comms.initialize(p2p=True)
-                    self.comms_initialized = True
-                    logger.info("cuGraph Comms initialized successfully")
-                except Exception as e:
-                    logger.error(f"Failed to initialize cuGraph Comms: {e}")
-                    raise
-
-            kg_data = kg_data[["subject", "predicate", "object"]]
-            self.knowledge_graph.from_dask_cudf_edgelist(
-                kg_data,
-                source="subject",
-                destination="object",
-                edge_attr="predicate",
-                renumber=False,
-            )
-            logger.info(f"Graph has {self.knowledge_graph.number_of_edges()} edges")
-        else:
-            self.knowledge_graph.from_cudf_edgelist(
-                kg_data,
-                source="subject",
-                destination="object",
-                edge_attr="predicate",
-                renumber=False,
-            )
-        return kg_data
+        return walk_corpus
 
     def fit(self, edge_df: cudf.DataFrame, walk_vertices: cudf.Series = None) -> None:
         """
@@ -442,132 +545,170 @@ class GPU_RDF2Vec:
          >>> edges = rdf2vec.load_data("example.parquet")
          >>> rdf2vec.fit(edges)
         """
-        # if self.tracker:
-        #     self.tracker.start_pipeline(self.tracker_run_name, self.tracker_tags)
-        if self.multi_gpu:
-            walk_instance = multi_gpu_walk_corpus(
-                self.knowledge_graph,
-                self.window_size,
-            )
-        else:
-            walk_instance = single_gpu_walk_corpus(
-                self.knowledge_graph,
-                self.window_size,
-            )
-        if self.walk_strategy == "random":
-            if walk_vertices is None:
-                walk_vertices = self.knowledge_graph.nodes()
-            walk_vertices = walk_vertices.repeat(self.walk_number)
-            walk_corpus = walk_instance.random_walk(
-                edge_df=edge_df,
-                walk_vertices=walk_vertices,
-                walk_depth=self.walk_depth,
-                random_state=self.random_state,
-                word2vec_model=self.embedding_model,
-                min_count=self.min_count,
-            )
-        elif self.walk_strategy == "bfs":
-            if walk_vertices is None:
-                walk_vertices = self.knowledge_graph.nodes()
-            walk_corpus = walk_instance.bfs_walk(
-                edge_df=edge_df,
-                walk_vertices=walk_vertices,
-                walk_depth=self.walk_depth,
-                random_state=self.random_state,
-                word2vec_model=self.embedding_model,
-                min_count=self.min_count,
-            )
-        else:
-            raise ValueError(
-                f"Unsupported walk strategy: {self.walk_strategy}. Please choose either 'random' or 'bfs'."
-            )
-
-        if self.embedding_model == "skipgram":
-            word2vec_model = SkipGram(
-                vocab_size=self.word2idx.shape[0],
-                embedding_dim=self.vector_size,
-                neg_samples=self.negative_samples,
-                learning_rate=self.learning_rate,
-            )
-            center_tensor = torch.utils.dlpack.from_dlpack(
-                walk_corpus["center"].to_dlpack()
-            ).contiguous()
-            context_tensor = torch.utils.dlpack.from_dlpack(
-                walk_corpus["context"].to_dlpack()
-            ).contiguous()
-            datamodule = SkipGramDataModule(
-                center_tensor=center_tensor,
-                context_tensor=context_tensor,
-                batch_size=(
-                    self.batch_size
-                    if self.batch_size
-                    else round(len(context_tensor) / (self.cpu_count))
-                ),
-            )
-
-        elif self.embedding_model == "cbow":
-            word2vec_model = CBOW(
-                vocab_size=self.word2idx.shape[0],
-                embedding_dim=self.vector_size,
-                learning_rate=self.learning_rate,
-            )
-            center_tensor = torch.utils.dlpack.from_dlpack(
-                walk_corpus["center"].to_dlpack()
-            ).contiguous()
-            context_series = walk_corpus["context"]
-            exploded_df = (
-                context_series.to_frame("context").explode("context").reset_index()
-            )
-            exploded_df["pos"] = exploded_df.groupby("index").cumcount()
-            pivot_df = exploded_df.pivot(index="index", columns="pos", values="context")
-            reset_pivot_df = pivot_df.reset_index(drop=True)
-            reset_pivot_df = reset_pivot_df.fillna(-1).astype("int32")
-            context_tensor = torch.utils.dlpack.from_dlpack(
-                reset_pivot_df.to_dlpack()
-            ).contiguous()
-            datamodule = CBOWDataModule(
-                center_tensor=center_tensor,
-                context_tensor=context_tensor,
-                batch_size=(
-                    self.batch_size
-                    if self.batch_size
-                    else round(len(context_tensor) / (self.cpu_count))
-                ),
-            )
-
-        else:
-            logger.error(
-                f"Unsupported embedding model: {self.embedding_model}. Please choose either 'skipgram' or 'cbow'."
-            )
-            raise ValueError(
-                f"Unsupported embedding model: {self.embedding_model}. Please choose either 'skipgram' or 'cbow'."
-            )
-        # word2vec_model = torch.compile(word2vec_model) -> Stabalize model compilation for speedup
-        if self.reproducible:
-            logger.info(
-                "Setting up reproducible training, might increase training time."
-            )
-            L.seed_everything(self.random_state, workers=True)
-        trainer = L.Trainer(
-            max_epochs=self.epochs,
-            log_every_n_steps=1,
-            accelerator="gpu",
-            precision=16,
-            devices="auto",
+        walk_corpus = self.walk_generation(
+            edge_df=edge_df,
+            walk_vertices=walk_vertices,
         )
-        if self.tune_batch_size:
-            tuner = Tuner(trainer)
-            tuner.scale_batch_size(
-                word2vec_model,
-                mode="power",
-                datamodule=datamodule,
-                steps_per_trial=1,
-                init_val=round(len(context_tensor) / (self.cpu_count * 2)),
-                max_trials=12,
-            )
-        trainer.fit(word2vec_model, datamodule)
+        # In multi-GPU mode, checkpoint the distributed walk corpus to
+        # parquet and tear down Dask before training.  This avoids
+        # materializing the entire corpus to a single GPU (cudf row limit)
+        # and frees GPU memory held by the Dask cluster for training.
+        if self.config.multi_gpu and hasattr(walk_corpus, "to_parquet"):
+            import tempfile, shutil
+            from dask.distributed import wait as dask_wait
+            # Persist to flatten the dask-expr graph, then write to parquet.
+            # Each Dask worker writes its partition — no single GPU holds all data.
+            walk_corpus = walk_corpus.persist()
+            dask_wait(walk_corpus)
+            self._walk_dir = tempfile.mkdtemp(prefix="rdf2vec_walks_")
+            walk_path = f"{self._walk_dir}/corpus"
+            logger.info(f"Checkpointing walk corpus to {walk_path}")
+            walk_corpus.to_parquet(walk_path, write_index=False)
+            del walk_corpus
+            # Tear down Dask comms + cluster to free GPU memory for DDP training
+            try:
+                import cugraph.dask.comms.comms as Comms
+                if Comms.is_initialized():
+                    Comms.destroy()
+            except Exception:
+                pass
+            if self.client is not None:
+                self.client.close()
+                self.client = None
+            logger.info("Dask cluster shut down, starting DDP training")
+            self._fit_from_parquet(walk_path)
+            shutil.rmtree(self._walk_dir, ignore_errors=True)
+        else:
+            # Single-GPU path: materialize and train in-process
+            if hasattr(walk_corpus, "compute"):
+                walk_corpus = walk_corpus.compute()
+            self._fit_from_tensors(walk_corpus)
 
-        self.word2vec_model = word2vec_model
+    def _fit_from_parquet(self, walk_path: str) -> None:
+        """Train Word2Vec from parquet shards using DDP across all GPUs."""
+        n_gpus = torch.cuda.device_count()
+        with self.tracker.stage("Word2Vec_Training"):
+            if self.config.embedding_model == "skipgram":
+                word2vec_model = SkipGram(
+                    vocab_size=self.word2idx.shape[0],
+                    embedding_dim=self.config.vector_size,
+                    neg_samples=self.config.negative_samples,
+                    learning_rate=self.config.learning_rate,
+                )
+                datamodule = ParquetSkipGramDataModule(
+                    parquet_path=walk_path,
+                    batch_size=self.config.batch_size or 512,
+                )
+            elif self.config.embedding_model == "cbow":
+                # CBOW multi-GPU parquet path: read on single GPU and use
+                # the existing CBOW DataModule (CBOW list aggregation not
+                # yet supported from parquet shards)
+                walk_corpus = cudf.read_parquet(walk_path)
+                self._fit_from_tensors(walk_corpus)
+                return
+            else:
+                raise ValueError(
+                    f"Unsupported embedding model: {self.config.embedding_model}."
+                )
+            if self.config.reproducible:
+                L.seed_everything(self.config.random_state, workers=True)
+            self.tracker.log_pytorch()
+            trainer = L.Trainer(
+                max_epochs=self.config.epochs,
+                log_every_n_steps=1,
+                accelerator="gpu",
+                precision="16-mixed",
+                devices=n_gpus,
+                strategy="ddp" if n_gpus > 1 else "auto",
+                num_nodes=self.config.num_nodes,
+                enable_checkpointing=False,
+            )
+            trainer.fit(word2vec_model, datamodule)
+            self.tracker.log_model_pytorch(
+                word2vec_model, artifact_path="word2vec_model"
+            )
+            self.word2vec_model = word2vec_model
+
+    def _fit_from_tensors(self, walk_corpus) -> None:
+        """Train Word2Vec from an in-memory cudf DataFrame (single-GPU)."""
+        center_tensor = cudf_to_torch_tensor(walk_corpus, "center")
+        with self.tracker.stage("Word2Vec_Training"):
+            if self.config.embedding_model == "skipgram":
+                context_tensor = cudf_to_torch_tensor(walk_corpus, "context")
+                word2vec_model = SkipGram(
+                    vocab_size=self.word2idx.shape[0],
+                    embedding_dim=self.config.vector_size,
+                    neg_samples=self.config.negative_samples,
+                    learning_rate=self.config.learning_rate,
+                )
+                datamodule = SkipGramDataModule(
+                    center_tensor=center_tensor,
+                    context_tensor=context_tensor,
+                    batch_size=(
+                        self.config.batch_size
+                        if self.config.batch_size
+                        else max(1, len(context_tensor) // 100)
+                    ),
+                )
+            elif self.config.embedding_model == "cbow":
+                word2vec_model = CBOW(
+                    vocab_size=self.word2idx.shape[0],
+                    embedding_dim=self.config.vector_size,
+                    learning_rate=self.config.learning_rate,
+                )
+                context_series = walk_corpus["context"]
+                exploded_df = (
+                    context_series.to_frame("context").explode("context").reset_index()
+                )
+                exploded_df["pos"] = exploded_df.groupby("index").cumcount()
+                pivot_df = exploded_df.pivot(
+                    index="index", columns="pos", values="context"
+                )
+                reset_pivot_df = pivot_df.reset_index(drop=True)
+                reset_pivot_df = reset_pivot_df.fillna(-1).astype("int32")
+                context_tensor = torch.utils.dlpack.from_dlpack(
+                    reset_pivot_df.to_dlpack()
+                ).contiguous()
+                datamodule = CBOWDataModule(
+                    center_tensor=center_tensor,
+                    context_tensor=context_tensor,
+                    batch_size=(
+                        self.config.batch_size
+                        if self.config.batch_size
+                        else max(1, len(context_tensor) // 100)
+                    ),
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported embedding model: {self.config.embedding_model}."
+                )
+            if self.config.reproducible:
+                L.seed_everything(self.config.random_state, workers=True)
+            self.tracker.log_pytorch()
+            trainer = L.Trainer(
+                max_epochs=self.config.epochs,
+                log_every_n_steps=1,
+                accelerator="gpu",
+                precision="16-mixed",
+                devices=1,
+                num_nodes=self.config.num_nodes,
+                enable_checkpointing=False,
+            )
+            if self.config.tune_batch_size:
+                tuner = Tuner(trainer)
+                tuner.scale_batch_size(
+                    word2vec_model,
+                    mode="power",
+                    datamodule=datamodule,
+                    steps_per_trial=1,
+                    init_val=max(1, len(center_tensor) // 200),
+                    max_trials=12,
+                )
+            trainer.fit(word2vec_model, datamodule)
+            self.tracker.log_model_pytorch(
+                word2vec_model, artifact_path="word2vec_model"
+            )
+            self.word2vec_model = word2vec_model
 
     def transform(self) -> cudf.DataFrame:
         """
@@ -606,22 +747,28 @@ class GPU_RDF2Vec:
 
         """
         # Check if model is fitted and word2idx is available
-        if self.word2vec_model is not None and self.word2idx is not None:
-            model_embeddings = self.word2vec_model.in_embeddings.weight
-            model_embeddings_df = cudf.from_dlpack(to_dlpack(model_embeddings.T)).T
-            model_embeddings_df.columns = model_embeddings_df.columns.astype(str)
-            model_embeddings_df = model_embeddings_df.add_prefix("embedding_")
-            embedding_df = cudf.concat([self.word2idx, model_embeddings_df], axis=1)
-            if self.generate_artifact:
-                embedding_df.to_parquet(
-                    f"vector/embeddings_{self.word2vec_model}.parquet", index=False
+        with self.tracker.stage("Embedding_Extraction"):
+            if self.word2vec_model is not None and self.word2idx is not None:
+                model_embeddings = self.word2vec_model.in_embeddings.weight.detach().cuda()
+                # Convert via CuPy to avoid cudf from_dlpack column-major requirement
+                import cupy as cp
+                cp_arr = cp.from_dlpack(model_embeddings)
+                model_embeddings_df = cudf.DataFrame(
+                    {str(i): cp_arr[:, i] for i in range(cp_arr.shape[1])}
                 )
-            return embedding_df
-        else:
-            raise ValueError(
-                "The transform method is not possible to call without a fitted model or a generated word2idx setup."
-                "Please call the 'fit' method first or the 'load_data' method to generate the word2idx setup."
-            )
+                model_embeddings_df.columns = model_embeddings_df.columns.astype(str)
+                model_embeddings_df = model_embeddings_df.add_prefix("embedding_")
+                embedding_df = cudf.concat([self.word2idx, model_embeddings_df], axis=1)
+                if self.config.generate_artifact:
+                    embedding_df.to_parquet(
+                        f"vector/embeddings_{self.config.embedding_model}.parquet", index=False
+                    )
+                return embedding_df
+            else:
+                raise ValueError(
+                    "The transform method is not possible to call without a fitted model or a generated word2idx setup. "
+                    "Please call the 'fit' method first or the 'load_data' method to generate the word2idx setup."
+                )
 
     def fit_transform(
         self, edge_df: cudf.DataFrame, walk_vertices: cudf.DataFrame
@@ -663,164 +810,95 @@ class GPU_RDF2Vec:
 
     def close(self):
         """Close the Dask client, cuGraph Comms, and cluster if they exist."""
-        if self.comms_initialized:
-            try:
-                Comms.destroy()
-                logger.info("cuGraph Comms destroyed")
-            except Exception as e:
-                logger.warning(f"Error destroying Comms: {e}")
+        self.tracker.close()
         if self.client is not None:
             self.client.close()
 
-    def _validate_config(self):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    def save(self, path: str) -> None:
+        """Persist config, vocabulary, and trained model to *path*.
+
+        Creates a directory with:
+          - config.json     (RDF2VecConfig as JSON)
+          - word2idx.parquet (token↔word mapping)
+          - model.pt        (PyTorch state dict, only if fit() was called)
+        """
+        from pathlib import Path as _P
+        import json
+
+        out = _P(path)
+        out.mkdir(parents=True, exist_ok=True)
+        # Config
+        (out / "config.json").write_text(self.config.model_dump_json(indent=2))
+        # Vocabulary
+        if self.word2idx is not None:
+            self.word2idx.to_parquet(out / "word2idx.parquet", index=False)
+        # Model weights
+        if self.word2vec_model is not None:
+            torch.save(self.word2vec_model.state_dict(), out / "model.pt")
+        logger.info(f"Saved GPU_RDF2Vec artifacts to {out}")
+
+    @classmethod
+    def load(cls, path: str, client=None) -> "GPU_RDF2Vec":
+        """Restore a GPU_RDF2Vec instance from a previously saved directory."""
+        from pathlib import Path as _P
+        import json
+
+        src = _P(path)
+        config = RDF2VecConfig.model_validate_json((src / "config.json").read_text())
+        instance = cls(config=config, client=client)
+        # Vocabulary
+        word2idx_path = src / "word2idx.parquet"
+        if word2idx_path.exists():
+            instance.word2idx = cudf.read_parquet(word2idx_path)
+        # Model weights
+        model_path = src / "model.pt"
+        if model_path.exists():
+            if config.embedding_model == "skipgram":
+                model = SkipGram(
+                    vocab_size=instance.word2idx.shape[0],
+                    embedding_dim=config.vector_size,
+                    neg_samples=config.negative_samples,
+                    learning_rate=config.learning_rate,
+                )
+            elif config.embedding_model == "cbow":
+                model = CBOW(
+                    vocab_size=instance.word2idx.shape[0],
+                    embedding_dim=config.vector_size,
+                    learning_rate=config.learning_rate,
+                )
+            else:
+                raise ValueError(f"Unknown embedding_model: {config.embedding_model}")
+            model.load_state_dict(torch.load(model_path, weights_only=True))
+            instance.word2vec_model = model
+        logger.info(f"Loaded GPU_RDF2Vec artifacts from {src}")
+        return instance
+
+    def _validate_environment(self):
         """Validates the configuration parameters for the GPU_RDF2Vec class.
 
         This method checks the validity of various configuration parameters, ensuring
         they meet the expected types, ranges, and constraints. If any parameter is invalid,
         an appropriate exception is raised.
 
-            ValueError: If `walk_strategy` is not "random" or "bfs".
-
-            ValueError: If `embedding_model` is not "skipgram" or "cbow".
-
-            TypeError: If any of the following parameters is not an integer:
-            `walk_depth`, `walk_number`, `epochs`, `vector_size`, `window_size`,
-            `min_count`, `negative_samples`, `random_state`, `cpu_count`, `number_nodes`.
-
-            TypeError: If `learning_rate` is not a float.
-
-            TypeError: If any of the following parameters is not a boolean:
-            `reproducible`, `multi_gpu`, `generate_artifact`, `tune_batch_size`.
-
-            ValueError: If any of the following parameters is not a positive integer:
-            `walk_depth`, `walk_number`, `epochs`, `vector_size`, `window_size`,
-            `cpu_count`, `number_nodes`.
-
-            ValueError: If `min_count` or `negative_samples` is negative.
-
-            ValueError: If `learning_rate` is not a positive float.
-
-            TypeError: If `batch_size` is provided and is not an integer.
-
-            ValueError: If `batch_size` is provided and is not greater than 0.
-
-            ValueError: If `window_size` is greater than `walk_depth`.
-
             EnvironmentError: If CUDA is not available on the system.
 
             ValueError: If `multi_gpu` is True but no Dask client is provided.
 
             Warning: If `multi_gpu` is True but fewer than 1 GPU is detected.
-
-            Warning: If `tune_batch_size` is True while `reproducible` is also True.
-
-        Notes:
-            - If `window_size` is greater than `walk_depth`, a warning is logged as it may lead to unexpected behavior.
-            - If `tune_batch_size` is enabled while `reproducible` is True, a warning is logged as it may reduce reproducibility.
-            - If `multi_gpu` is enabled, a Dask client must be provided, and at least one GPU must be visible to the process.
         """
-
-        if self.walk_strategy not in ["random", "bfs"]:
-            raise ValueError(
-                f"Unsupported walk strategy: {self.walk_strategy}. Please choose either 'random' or 'bfs'."
-            )
-        if self.embedding_model not in ["skipgram", "cbow"]:
-            raise ValueError(
-                f"Unsupported embedding model: {self.embedding_model}. Please choose either 'skipgram' or 'cbow'."
-            )
-
-        for name, val in {
-            "walk_depth": self.walk_depth,
-            "walk_number": self.walk_number,
-            "epochs": self.epochs,
-            "vector_size": self.vector_size,
-            "window_size": self.window_size,
-            "min_count": self.min_count,
-            "negative_samples": self.negative_samples,
-            "random_state": self.random_state,
-            "cpu_count": self.cpu_count,
-            "number_nodes": self.num_nodes,
-        }.items():
-            if not isinstance(val, int):
-                raise TypeError(f"{name} must be int, got {type(val)}")
-
-        # Boolean checks
-        if not isinstance(self.learning_rate, float):
-            raise TypeError(
-                f"learning_rate must be a float value, got {type(self.learning_rate)}"
-            )
-        if not isinstance(self.reproducible, bool):
-            raise TypeError(
-                f"reproducible must be a bool value, got {type(self.reproducible)}"
-            )
-        if not isinstance(self.multi_gpu, bool):
-            raise TypeError(
-                f"multi_gpu must be a bool value, got {type(self.multi_gpu)}"
-            )
-        if not isinstance(self.generate_artifact, bool):
-            raise TypeError(
-                f"generate_artifact must be a bool value, got {type(self.generate_artifact)}"
-            )
-        if not isinstance(self.tune_batch_size, bool):
-            raise TypeError(
-                f"tune_batch_size must be a bool value, got {type(self.tune_batch_size)}"
-            )
-
-        # Numeric value checks
-        if self.walk_depth <= 0:
-            raise ValueError("walk_depth must be a positive integer")
-        if self.walk_number <= 0:
-            raise ValueError("walk_number must be a positive integer")
-        if self.epochs <= 0:
-            raise ValueError("epochs must be a positive integer")
-        if self.vector_size <= 0:
-            raise ValueError("vector_size must be a positive integer")
-        if self.window_size <= 0:
-            raise ValueError("window_size must be a positive integer")
-        if self.min_count < 0:
-            raise ValueError("min_count must be a non-negative integer")
-        if self.negative_samples < 0:
-            raise ValueError("negative_samples must be a non-negative integer")
-        if self.learning_rate <= 0:
-            raise ValueError("learning_rate must be a positive float value")
-        if self.cpu_count <= 0:
-            raise ValueError("cpu_count must be a positive integer")
-        if self.num_nodes <= 0:
-            raise ValueError("number_nodes must be a positive integer")
-
-        if hasattr(self, "batch_size") and self.batch_size is not None:
-            if not isinstance(self.batch_size, int):
-                raise TypeError(
-                    f"batch_size must be int when provided, got {type(self.batch_size).__name__}"
-                )
-            if self.batch_size <= 0:
-                raise ValueError("batch_size must be > 0 when provided")
-
-        if self.window_size > self.walk_depth:
-            logger.warning(
-                "window_size is greater than walk_depth; this may lead to unexpected behavior."
-            )
-        if self.reproducible and self.tune_batch_size:
-            logger.warning(
-                "tune_batch_size=True may reduce reproducibility; consider disabling when reproducible=True."
-            )
 
         if not torch.cuda.is_available():
             raise EnvironmentError(
                 "CUDA is not available. A GPU is required to run this code."
             )
-        if self.multi_gpu and self.client is None:
-            raise ValueError(
-                "multi_gpu=True requires a Dask client. Please create a "
-                "LocalCUDACluster and Client, then pass the client to GPU_RDF2Vec.\n"
-                "Example:\n"
-                "  from dask_cuda import LocalCUDACluster\n"
-                "  from dask.distributed import Client\n"
-                "  cluster = LocalCUDACluster(...)\n"
-                "  client = Client(cluster)\n"
-                "  rdf2vec = GPU_RDF2Vec(..., client=client)"
-            )
-        if self.multi_gpu and torch.cuda.device_count() < 1:
+        if self.config.multi_gpu and torch.cuda.device_count() < 2:
             logger.warning(
-                "multi_gpu=True but torch reports <1 visible GPU on this process."
+                f"multi_gpu=True but torch reports {torch.cuda.device_count()} visible GPU on this process."
             )
