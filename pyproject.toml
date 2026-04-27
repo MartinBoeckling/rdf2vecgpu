@@ -1,6 +1,6 @@
 [project]
 name = "rdf2vecgpu"
-version = "0.3.0"
+version = "0.4.0"
 description = "GPU-Accelerated RDF2Vec – A high-performance GPU implementation of RDF2Vec that uses CUDA and RAPIDS to generate scalable, embeddings for large dense knowledge graphs."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -39,6 +39,10 @@ mlflow = [
 ]
 wandb = [
     "wandb>=0.23.0",
+]
+gensim = [
+    "gensim>=4.3.0",
+    "pyarrow>=15",
 ]
 test = [
     "pytest>=9.0.1",

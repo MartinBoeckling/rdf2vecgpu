@@ -15,6 +15,49 @@ import torch
 # (concat, sort_values, merge, groupby, rename, assign) is identical.
 
 
+def _walks_to_lists(vertices_s, edge_attrs_s, walk_length):
+    """Reshape cuGraph's flat random-walk output into per-walk list rows.
+
+    Sister helper to `_build_walk_steps`: same input contract, but emits one
+    row per walk with `vertices: list<int>` + `predicates: list<int>` columns
+    instead of per-step rows. This matches the schema gensim's `WalkCorpus`
+    streaming iterator consumes (see `embedders.gensim_word2vec.WalkCorpus`)
+    and the schema `tools/walk_gen.py` uses for parquet output.
+
+    Like `_build_walk_steps`, the input partitions must hold an integer
+    multiple of (walk_length + 1) vertex elements (cuGraph's dask API
+    guarantees this alignment when emitting walks).
+
+    Walks shorter than `walk_length` are padded with cuGraph's `-1` sentinel;
+    we keep those `-1` cells in the lists so the gensim walk-streaming
+    iterator can trim them at first occurrence (matches the standalone
+    tool's behavior).
+    """
+    stride_v = walk_length + 1
+    stride_p = walk_length
+    n_walks = len(vertices_s) // stride_v
+    if n_walks * stride_v != len(vertices_s):
+        raise ValueError(
+            f"vertex partition size {len(vertices_s)} is not a multiple of "
+            f"walk stride {stride_v}; cuGraph's walk output is expected to be "
+            f"stride-aligned"
+        )
+    if len(edge_attrs_s) != n_walks * stride_p:
+        raise ValueError(
+            f"edge_attrs partition size {len(edge_attrs_s)} does not match "
+            f"expected {n_walks * stride_p} (n_walks={n_walks}, "
+            f"walk_length={walk_length})"
+        )
+    vs = cp.asarray(vertices_s.values).reshape(n_walks, stride_v)
+    ps = cp.asarray(edge_attrs_s.values).reshape(n_walks, stride_p)
+    return cudf.DataFrame(
+        {
+            "vertices": cudf.Series(vs.tolist()),
+            "predicates": cudf.Series(ps.tolist()),
+        }
+    )
+
+
 def _build_walk_steps(vertices_s, edge_attrs_s, walk_length, walk_id_offset=0):
     """Reshape cuGraph's flat random-walk output into per-step rows.
 
@@ -302,6 +345,33 @@ class SingleGPUWalkCorpus:
         tokens = _triples_to_tokens(merged_walks, min_count, concat_fn=cudf.concat)
         return _dispatch_pairs(tokens, self.window_size, word2vec_model, concat_fn=cudf.concat)
 
+    def random_walk_sequences(
+        self,
+        walk_vertices: cudf.Series,
+        walk_depth: int,
+        random_state: int,
+    ) -> cudf.DataFrame:
+        """Walks-as-sequences output (vertices + predicates list columns).
+
+        Sister method to `random_walk` for the gensim training backend, which
+        wants raw walk sequences (it builds its own skip-gram windows
+        internally). Output schema:
+            vertices   : list<int32>   length = walk_depth + 1
+            predicates : list<int32>   length = walk_depth
+
+        Walks shorter than `walk_depth` keep cuGraph's `-1` sentinel slots in
+        the lists so the gensim streaming iterator can trim them at first
+        occurrence.
+        """
+        walk_fn = biased_random_walks if self.walk_weighted else uniform_random_walks
+        random_walks, edge_attrs, max_length = walk_fn(
+            self.G,
+            start_vertices=walk_vertices,
+            max_depth=walk_depth,
+            random_state=random_state,
+        )
+        return _walks_to_lists(random_walks, edge_attrs, walk_length=int(max_length))
+
 
 # ── Multi-GPU Walk Corpus ───────────────────────────────────────────────────
 
@@ -424,6 +494,69 @@ class MultiGPUWalkCorpus:
         tokens = _triples_to_tokens(merged, min_count, concat_fn=dcudf.concat)
         pairs = _dispatch_pairs(tokens, self.window_size, word2vec_model, concat_fn=dcudf.concat)
         return pairs
+
+    def random_walk_sequences(
+        self,
+        walk_vertices,
+        walk_depth: int,
+        random_state: int,
+    ):
+        """Multi-GPU walks-as-sequences output (vertices + predicates list cols).
+
+        Sister method to `random_walk` for the gensim training backend. Returns
+        a `dask_cudf.DataFrame` with one row per walk and `vertices` / `predicates`
+        list columns; mirrors the parquet schema produced by `tools/walk_gen.py`,
+        which is what `embedders.gensim_word2vec.WalkCorpus` consumes.
+        """
+        if isinstance(walk_vertices, dcudf.Series):
+            start_vertices = walk_vertices
+        else:
+            start_vertices = _ensure_dask_frame(
+                cudf.DataFrame({"v": walk_vertices})
+            )["v"]
+
+        walk_fn = dask_biased_random_walks if self.walk_weighted else dask_uniform_random_walks
+        walk_label = "biased" if self.walk_weighted else "uniform"
+        logger.info(
+            f"Running multi-GPU {walk_label}_random_walks (sequences output) …"
+        )
+        from dask.distributed import wait as dask_wait
+
+        walks_s, edge_attrs_s, max_len = walk_fn(
+            self.G,
+            start_vertices=start_vertices,
+            max_depth=walk_depth,
+        )
+        walk_length = int(max_len)
+        # Persist + wait so the reshape sees a stable walks output (uniform_random_walks
+        # is stochastic).
+        walks_s = walks_s.persist()
+        edge_attrs_s = edge_attrs_s.persist()
+        dask_wait([walks_s, edge_attrs_s])
+
+        # Combine the two aligned series partition-wise; each partition emits
+        # one row per walk.
+        meta = cudf.DataFrame(
+            {
+                "vertices": cudf.Series([], dtype="object"),
+                "predicates": cudf.Series([], dtype="object"),
+            }
+        )
+        walks_delayed = walks_s.to_delayed()
+        edges_delayed = edge_attrs_s.to_delayed()
+        if len(walks_delayed) != len(edges_delayed):
+            raise RuntimeError(
+                f"vertex/edge_attr partition layout drift: "
+                f"{len(walks_delayed)} vs {len(edges_delayed)}"
+            )
+        parts = [
+            dask.delayed(_walks_to_lists)(walks_delayed[i], edges_delayed[i], walk_length)
+            for i in range(len(walks_delayed))
+        ]
+        sequences = dcudf.from_delayed(parts, meta=meta)
+        sequences = sequences.persist()
+        dask_wait(sequences)
+        return sequences
 
     def bfs_walk(
         self,

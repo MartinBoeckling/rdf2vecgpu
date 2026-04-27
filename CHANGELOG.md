@@ -5,10 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] — 2026-04-27
+
+This release bundles a four-PR upstream-port sequence that ports
+Wikidata-scale fixes and a new optional gensim training backend back into
+the library. The pipeline now scales to the 1.38 B-edge / 390 M-vertex
+Wikidata graph end-to-end on 2× RTX A6000.
 
 ### Added
 
+- **Optional gensim Word2Vec backend.** New
+  `backend="gensim"` config field on `RDF2VecConfig` (alongside the
+  default `"pytorch"`); `GPU_RDF2Vec.fit()` dispatches on it. The gensim
+  path consumes walks-as-sequences via streaming parquet
+  (`pyarrow.parquet.ParquetFile.iter_batches`) and trains via
+  `gensim.models.Word2Vec`'s C-level negative-sampling loop — typically
+  5–10× faster on CPU than the equivalent PyTorch skip-gram on the same
+  corpus, with constant-memory streaming on multi-billion-walk corpora.
+  Opt in via `pip install rdf2vecgpu[gensim]`.
+- `embedders/gensim_word2vec.py` — new module with three exports:
+  - `WalkCorpus`: streaming parquet iterator over walk sequences (trims
+    cuGraph `-1` sentinels, skips walks with <2 valid vertices).
+  - `load_id_to_word`: scatters `_generate_vocab`'s contiguous token range
+    into a numpy object array indexed by token (avoids the ~45 GB
+    Python-dict overhead the original gensim recipe measured at Wikidata
+    scale).
+  - `train_gensim_word2vec`: thin wrapper around `gensim.models.Word2Vec`
+    forwarding the relevant `RDF2VecConfig` fields.
+- `_walks_to_lists` helper in `corpus/walk_corpus.py` — sister to
+  `_build_walk_steps` (added in this release) that emits per-walk rows
+  with `vertices: list<int>` + `predicates: list<int>` columns. Used by
+  the new `random_walk_sequences()` methods on both `SingleGPUWalkCorpus`
+  and `MultiGPUWalkCorpus`.
+- `GPU_RDF2Vec.walk_generation_sequences()` and
+  `GPU_RDF2Vec._fit_via_gensim()` orchestration methods on the main
+  pipeline class.
 - `_build_walk_steps(vertices_s, edge_attrs_s, walk_length, walk_id_offset)`
   in `rdf2vecgpu.corpus.walk_corpus` — a per-partition reshape helper that
   consumes cuGraph's flat `(vertices, edge_attrs)` walk output and emits
@@ -28,6 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (catches row drift from broadcast merges or unstable shuffles).
 - `gpu` pytest marker registered in `pyproject.toml`'s
   `[tool.pytest.ini_options]`.
+- `test/embedders/gensim_word2vec_test.py` — CPU-only tests for the
+  new gensim backend (streaming `WalkCorpus` semantics, sentinel
+  trimming, contiguous-token guard in `load_id_to_word`, end-to-end
+  smoke through `train_gensim_word2vec`). Skipped at module import if
+  the `gensim` extra isn't installed.
+- `[project.optional-dependencies].gensim` group in `pyproject.toml`
+  (`gensim>=4.3.0`, `pyarrow>=15`).
 
 ### Documentation
 
@@ -39,8 +77,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `helper/functions.py`. Also documents the two `_compat` patches
   (`_patch_convert_to_cudf` and `_patch_dask_cudf_from_cudf`) and notes
   that the long-term fix for both is upstream in cuGraph / dask-cudf.
-- Roadmap entry for the planned optional gensim Word2Vec trainer
-  backend (`train_backend="gensim"`).
+- Roadmap entry for the optional gensim Word2Vec trainer backend
+  (now shipped in this same `0.4.0` — see "Optional gensim Word2Vec
+  backend" under Added).
 
 ### Changed
 

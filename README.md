@@ -292,13 +292,14 @@ The overview of the used MIT license can be found [here](LICENSE)
 - [ ] Provide spilling to single GPU training to work around potential OOM issues faced during rdf2vec training [Issue Item](https://github.com/MartinBoeckling/rdf2vecgpu/issues/3)
 - [X] Provide weighted walks for spatial datasets [Issue item](https://github.com/MartinBoeckling/rdf2vecgpu/issues/4)
 - [X] Provide logging capabilities of complete Word2Vec pipeline for [Wandb](https://wandb.ai/site/) and [mlflow](https://mlflow.org/). [Issue item](https://github.com/MartinBoeckling/rdf2vecgpu/issues/5)
-- [ ] Optional gensim Word2Vec trainer backend (`train_backend="gensim"`)
+- [X] Optional gensim Word2Vec trainer backend (`backend="gensim"`)
   alongside the default PyTorch Lightning trainer. The gensim C path is
   5–10× faster on CPU for very large corpora (~390 M-token vocab,
   multi-billion walks) and supports constant-memory streaming via
   `pyarrow.parquet.ParquetFile.iter_batches`. Useful when running on a
   CPU-rich + GPU-light box where the PyTorch trainer is bottlenecked on
-  data movement rather than compute.
+  data movement rather than compute. Shipped in `v0.4.0`; opt in via
+  `pip install rdf2vecgpu[gensim]` and `RDF2VecConfig(backend="gensim")`.
 
 ## Report issues and bugs
 
