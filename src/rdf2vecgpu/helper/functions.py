@@ -1,7 +1,27 @@
 import cudf
+import cupy
+import dask
 import dask.dataframe as dd
+import dask_cudf
 import torch
 from torch.utils.dlpack import to_dlpack
+
+
+def _assign_ids(partition, offset):
+    """Per-partition int32 token assignment via `cupy.arange + offset`.
+
+    Used as the per-partition body of the multi-GPU vocab build. Each partition
+    of the deduplicated vocab gets a contiguous block of integer ids starting
+    at `offset` (computed from the cumulative sum of preceding partition
+    sizes), so token ids are globally unique and form a contiguous `[0, n)`
+    range without any cross-partition shuffle.
+    """
+    return cudf.DataFrame(
+        {
+            "word": partition["word"].astype("string[pyarrow]"),
+            "token": (cupy.arange(len(partition), dtype="int32") + int(offset)),
+        }
+    )
 
 
 def _generate_vocab(
@@ -44,14 +64,66 @@ def _generate_vocab(
       across partitions before resetting the index.
     """
     if multi_gpu:
-        # construct word2idx
-        vocabulary = dd.concat(
+        # Build word2idx via hash-partition + per-partition arange.
+        #
+        # The previous approach was `concat(s, p, o).unique()` followed by
+        # `vocabulary_df.categorize(columns=["word"])`, which funnels the full
+        # deduplicated vocabulary onto a single worker for `sort_values()`. On
+        # Wikidata-scale graphs (~390 M unique tokens) that single-worker sort
+        # exceeds 40 GB of intermediate state and either OOMs the GPU or hangs
+        # the worker. The replacement is embarrassingly parallel:
+        #
+        #   1. concat(s, p, o) into a single `word` column (still lazy)
+        #   2. shuffle by `hash(word)` so identical strings co-locate on the
+        #      same partition
+        #   3. drop_duplicates() locally per partition — globally unique by
+        #      construction
+        #   4. persist so the follow-up `sizes.compute()` and per-partition id
+        #      assignment see the *same* shuffle output (without persist, the
+        #      shuffle re-rolls and partition assignments drift — we observed
+        #      23 M → 15 M row loss between sizes.compute and the eventual
+        #      write)
+        #   5. compute partition sizes (a tiny cumsum payload) → per-partition
+        #      offsets
+        #   6. dask.delayed(_assign_ids) per partition: `cupy.arange + offset`
+        #      gives globally-unique int32 token ids without any cross-
+        #      partition shuffle
+        n_hash_partitions = max(1, edge_df.npartitions)
+        vocabulary_df = dd.concat(
             [edge_df["subject"], edge_df["predicate"], edge_df["object"]]
-        ).unique()
-        vocabulary_df = vocabulary.to_frame(name="word")
-        word2idx = vocabulary_df.categorize(columns=["word"])
-        word2idx["token"] = word2idx["word"].cat.codes
-        word2idx = word2idx.astype({"word": "string[pyarrow]"})
+        ).to_frame(name="word")
+        vocabulary_df = vocabulary_df.shuffle(
+            on="word",
+            npartitions=n_hash_partitions,
+            shuffle_method="tasks",
+        )
+        vocabulary_df = vocabulary_df.drop_duplicates()
+        # Persist so the follow-up `sizes.compute()` and per-partition id
+        # assignment see the *same* shuffle output. The subsequent `compute()`
+        # on partition sizes drains the persist, so an explicit
+        # `distributed.wait` is unnecessary (and would require an active
+        # Client, breaking unit tests that use the default synchronous
+        # scheduler).
+        vocabulary_df = vocabulary_df.persist()
+
+        sizes = vocabulary_df.map_partitions(len).compute()
+        offsets = [0]
+        for s in sizes[:-1]:
+            offsets.append(offsets[-1] + int(s))
+
+        word2idx_meta = cudf.DataFrame(
+            {
+                "word": cudf.Series([], dtype="string[pyarrow]"),
+                "token": cudf.Series([], dtype="int32"),
+            }
+        )
+        delayed_parts = [
+            dask.delayed(_assign_ids)(
+                vocabulary_df.get_partition(i), offsets[i]
+            )
+            for i in range(vocabulary_df.npartitions)
+        ]
+        word2idx = dask_cudf.from_delayed(delayed_parts, meta=word2idx_meta)
         edge_df = (
             edge_df.merge(word2idx, left_on="subject", right_on="word")
             .drop(["word", "subject"], axis=1)
