@@ -5,7 +5,61 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.1] — 2026-04-27
+## [Unreleased]
+
+### Added
+
+- `_build_walk_steps(vertices_s, edge_attrs_s, walk_length, walk_id_offset)`
+  in `rdf2vecgpu.corpus.walk_corpus` — a per-partition reshape helper that
+  consumes cuGraph's flat `(vertices, edge_attrs)` walk output and emits
+  the `[src, predicate, dst, walk_id, step]` schema downstream code already
+  consumes. Drops cuGraph's `-1` sentinel rows for early-terminating walks.
+- `_assign_ids(partition, offset)` private helper in
+  `rdf2vecgpu.helper.functions` — per-partition `cupy.arange + offset` used
+  by the new multi-GPU vocab builder.
+- `test/corpus/walk_corpus_test.py` — regression tests for the reshape
+  helper layout, walk_id offsetting, sentinel handling, stride validation,
+  and an integration smoke that asserts emitted predicates exist between
+  the (src, dst) pair the walker actually stepped on.
+- `test/helper/functions_test.py` —
+  `test_generate_vocab_multi_gpu_unique_tokens_contiguous_range` (catches
+  off-by-one in cumsum offsets) and
+  `test_generate_vocab_multi_gpu_round_trip_decodes_to_original_strings`
+  (catches row drift from broadcast merges or unstable shuffles).
+- `gpu` pytest marker registered in `pyproject.toml`'s
+  `[tool.pytest.ini_options]`.
+
+### Changed
+
+- **Multi-GPU vocab build: hash-partition rewrite (replaces categorize
+  funnel).** The previous `dd.concat(s, p, o).unique()` followed by
+  `vocabulary_df.categorize(columns=["word"])` funneled the full
+  deduplicated vocabulary onto a single worker for `sort_values()`. On
+  Wikidata-scale graphs (~390 M unique tokens) the single-worker sort
+  exceeded 40 GB of intermediate state and either OOM'd the GPU or hung
+  the worker. The replacement is embarrassingly parallel:
+  `shuffle(on="word", shuffle_method="tasks") → drop_duplicates() →
+  persist+wait → cumsum offsets → dask.delayed _assign_ids` per partition
+  with `cupy.arange + offset`. Token ids remain globally unique and form a
+  contiguous `[0, n)` range without any cross-partition shuffle. Result on
+  2× RTX A6000: ~13 min for the 390 M-token Wikidata vocab vs.
+  never-completes with the previous code path.
+- **Multi-GPU vocab build: persist+wait stabilizes the shuffle output.**
+  Without persist, the hash-shuffle re-rolls every time `sizes.compute()`
+  or the per-partition id assignment reads from it, and partition
+  assignments drift between rolls (the standalone tool that pioneered this
+  pattern observed 23 M → 15 M row loss between sizes.compute and the
+  eventual write). Persist + `dask.distributed.wait()` pins the shuffle
+  output before downstream consumers read it.
+- **Encode-side merges now use `broadcast=True`.** The three `.merge()`
+  calls that join `word2idx` into the edge table didn't specify
+  `broadcast=True`, so dask defaulted them to hash-shuffle joins. With a
+  small word2idx partition count, the 1.38 B-row edge side got funneled
+  through one worker — observed 6+ hours at 100 % single-GPU utilization
+  with no progress on Wikidata-scale runs. `broadcast=True` replicates the
+  small word2idx to every worker so each edge partition does a local hash
+  join with no shuffle of the large side; one hash-table build per worker
+  per merge instead of one per partition.
 
 ### Fixed
 
@@ -43,17 +97,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Wikidata-scale graphs (1.38 B edges, 390 M vertices, walks_per_vertex=10,
   walk_length=8) the merge was the pipeline's worst-scaling stage after
   vocab generation. The reshape pattern is O(n_walks).
-
-### Added
-
-- `_build_walk_steps(vertices_s, edge_attrs_s, walk_length, walk_id_offset)`
-  in `rdf2vecgpu.corpus.walk_corpus` — a per-partition reshape helper that
-  consumes cuGraph's flat `(vertices, edge_attrs)` walk output and emits
-  the `[src, predicate, dst, walk_id, step]` schema downstream code already
-  consumes. Drops cuGraph's `-1` sentinel rows for early-terminating walks.
-- `test/corpus/walk_corpus_test.py` — regression tests for the reshape
-  helper layout, walk_id offsetting, sentinel handling, stride validation,
-  and an integration smoke that asserts emitted predicates exist between
-  the (src, dst) pair the walker actually stepped on.
-- `gpu` pytest marker registered in `pyproject.toml`'s
-  `[tool.pytest.ini_options]`.

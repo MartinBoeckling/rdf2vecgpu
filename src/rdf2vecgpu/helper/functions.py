@@ -124,20 +124,27 @@ def _generate_vocab(
             for i in range(vocabulary_df.npartitions)
         ]
         word2idx = dask_cudf.from_delayed(delayed_parts, meta=word2idx_meta)
+
+        # Encode the three edge columns by broadcast-joining word2idx into the
+        # edge table. The previous code used three plain `.merge()` calls
+        # without `broadcast=True`, which default to a hash-shuffle join; with
+        # a small word2idx partition count, the 1.38 B-row edge side gets
+        # funneled through one worker (we observed 6+ hours at 100 % on a
+        # single GPU with no progress). `broadcast=True` replicates the small
+        # word2idx to every worker, so each edge partition does a local hash
+        # join — no shuffle of the large side, one hash-table build per worker
+        # per merge instead of one per partition.
+        w2i_s = word2idx.rename(columns={"word": "subject", "token": "s_tok"})
+        w2i_p = word2idx.rename(columns={"word": "predicate", "token": "p_tok"})
+        w2i_o = word2idx.rename(columns={"word": "object", "token": "o_tok"})
         edge_df = (
-            edge_df.merge(word2idx, left_on="subject", right_on="word")
-            .drop(["word", "subject"], axis=1)
-            .rename(columns={"token": "subject"})
+            edge_df
+            .merge(w2i_s, on="subject", broadcast=True)
+            .merge(w2i_p, on="predicate", broadcast=True)
+            .merge(w2i_o, on="object", broadcast=True)
         )
-        edge_df = (
-            edge_df.merge(word2idx, left_on="predicate", right_on="word")
-            .drop(["word", "predicate"], axis=1)
-            .rename(columns={"token": "predicate"})
-        )
-        edge_df = (
-            edge_df.merge(word2idx, left_on="object", right_on="word")
-            .drop(["word", "object"], axis=1)
-            .rename(columns={"token": "object"})
+        edge_df = edge_df[["s_tok", "p_tok", "o_tok"]].rename(
+            columns={"s_tok": "subject", "p_tok": "predicate", "o_tok": "object"}
         )
         edge_df = edge_df.astype(
             {"subject": "int32", "predicate": "int32", "object": "int32"}
