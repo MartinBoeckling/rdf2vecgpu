@@ -29,6 +29,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `gpu` pytest marker registered in `pyproject.toml`'s
   `[tool.pytest.ini_options]`.
 
+### Documentation
+
+- New "Distributed correctness — when to `persist`" subsection under
+  Implementation Details in the README. Captures the two
+  contributor-facing dask patterns that produce silent data drift if
+  ignored (persist-before-second-consumer; `broadcast=True` on
+  small-table merges), with concrete cite-points in `walk_corpus.py`
+  and `helper/functions.py`. Also documents the two `_compat` patches
+  (`_patch_convert_to_cudf` and `_patch_dask_cudf_from_cudf`) and notes
+  that the long-term fix for both is upstream in cuGraph / dask-cudf.
+- Roadmap entry for the planned optional gensim Word2Vec trainer
+  backend (`train_backend="gensim"`).
+
 ### Changed
 
 - **Multi-GPU vocab build: hash-partition rewrite (replaces categorize

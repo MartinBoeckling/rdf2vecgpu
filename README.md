@@ -233,6 +233,55 @@ We achieve order-of-magnitude for large and dense graphs over CPU-bound RDF2Vec 
    - We use PyTorch Distributed + NCCL: each GPU holds the same graph shard but a unique walk corpus.  
    - Gradients are synchronized via `all_reduce` at regular intervals (~500 ms), amortizing PCIe/NVLink costs and ensuring linear scaling across nodes.
 
+5. **Distributed correctness — when to `persist`**
+
+   The multi-GPU code paths use `dask_cudf` for the vocab build, the
+   broadcast-encode of edge triples, and the random-walk reshape. Two patterns
+   are easy to get wrong and produce silent data drift rather than visible
+   crashes; both are documented inline at the relevant call sites and re-stated
+   here for contributors.
+
+   **(a) Any non-deterministic dask output that is read more than once must be
+   `.persist()`-ed before the second consumer.** Examples:
+
+   - `MultiGPUWalkCorpus.random_walk` persists the cuGraph walk output before
+     it computes per-partition sizes for the reshape (see
+     `corpus/walk_corpus.py` around the `walks_s.persist()` call).
+   - `_generate_vocab` persists the post-shuffle deduplicated vocabulary
+     before reading partition sizes for the `cumsum` offsets that drive the
+     per-partition `cupy.arange` token assignment (see
+     `helper/functions.py` around the `vocabulary_df.persist()` call).
+
+     Without persist, every consumer triggers a re-roll of the underlying
+     hash-shuffle / random-walk generator. Because `drop_duplicates` over a
+     non-deterministic shuffle is itself non-deterministic, partition
+     assignments drift between rolls — we observed 23 M → 15 M row loss
+     between a partition-sizes pass and the eventual write on the standalone
+     tool that pioneered this pattern.
+
+   **(b) When using `.merge()` against a small table, prefer `broadcast=True`.**
+   Without it, dask defaults to a hash-shuffle join. With a small right-side
+   partition count, the large left side gets funneled through a single worker
+   — observed 6+ hours at 100 % single-GPU utilization on Wikidata-scale
+   `_generate_vocab` runs before this fix landed. `broadcast=True` replicates
+   the small side to every worker so each large-side partition does a local
+   hash join with no shuffle.
+
+   **Compatibility patches.** `_compat.apply_patches()` (called from
+   `GPU_RDF2Vec.__init__` when `multi_gpu=True`) currently fixes two upstream
+   issues that are still alive at the cuGraph 25.6 / dask >= 2025.5 versions
+   we pin:
+
+   - `_patch_convert_to_cudf` — `cugraph.dask`'s random-walk
+     `convert_to_cudf` helper crashes on `renumber=False` graphs because it
+     unconditionally dereferences `number_map.implementation.numbered`.
+   - `_patch_dask_cudf_from_cudf` — works around a dask-expr backend
+     breakage in dask >= 2025.5 that affects `dask_cudf.from_cudf`.
+
+   Both patches are self-contained workarounds; the long-term fix is upstream
+   in cuGraph / dask-cudf. Track those there and remove the patches once they
+   land.
+
 ## License
 
 The overview of the used MIT license can be found [here](LICENSE)
@@ -243,6 +292,13 @@ The overview of the used MIT license can be found [here](LICENSE)
 - [ ] Provide spilling to single GPU training to work around potential OOM issues faced during rdf2vec training [Issue Item](https://github.com/MartinBoeckling/rdf2vecgpu/issues/3)
 - [X] Provide weighted walks for spatial datasets [Issue item](https://github.com/MartinBoeckling/rdf2vecgpu/issues/4)
 - [X] Provide logging capabilities of complete Word2Vec pipeline for [Wandb](https://wandb.ai/site/) and [mlflow](https://mlflow.org/). [Issue item](https://github.com/MartinBoeckling/rdf2vecgpu/issues/5)
+- [ ] Optional gensim Word2Vec trainer backend (`train_backend="gensim"`)
+  alongside the default PyTorch Lightning trainer. The gensim C path is
+  5–10× faster on CPU for very large corpora (~390 M-token vocab,
+  multi-billion walks) and supports constant-memory streaming via
+  `pyarrow.parquet.ParquetFile.iter_batches`. Useful when running on a
+  CPU-rich + GPU-light box where the PyTorch trainer is bottlenecked on
+  data movement rather than compute.
 
 ## Report issues and bugs
 
