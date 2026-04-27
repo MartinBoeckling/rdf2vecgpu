@@ -1,5 +1,6 @@
 import cupy as cp
 import cudf
+import dask
 import dask_cudf as dcudf
 from loguru import logger
 from cugraph import uniform_random_walks, biased_random_walks, filter_unreachable, bfs
@@ -12,6 +13,64 @@ import torch
 # ── Shared corpus-building helpers ──────────────────────────────────────────
 # These work on both cudf and dask_cudf DataFrames because the API surface
 # (concat, sort_values, merge, groupby, rename, assign) is identical.
+
+
+def _build_walk_steps(vertices_s, edge_attrs_s, walk_length, walk_id_offset=0):
+    """Reshape cuGraph's flat random-walk output into per-step rows.
+
+    cuGraph's `uniform_random_walks` / `biased_random_walks` emit two parallel
+    series:
+      vertices_s:   length n_walks * (walk_length + 1)  — vertex sequence per walk
+      edge_attrs_s: length n_walks *  walk_length       — predicate per step
+
+    Both are stride-aligned: each partition holds an integer multiple of the
+    stride. We reshape directly to `(n_walks, stride)` and emit the schema
+    downstream `_triples_to_tokens` already consumes:
+        [src, predicate, dst, walk_id, step]
+
+    `walk_id_offset` lets callers assign globally-unique walk_ids when this
+    helper is invoked per-partition under dask: pass the cumulative walk count
+    of all preceding partitions so walk_ids don't collide.
+
+    Walks shorter than `walk_length` are padded with cuGraph's `-1` sentinel;
+    we drop steps where any of (src, predicate, dst) is -1.
+    """
+    stride_v = walk_length + 1
+    stride_p = walk_length
+    n_walks = len(vertices_s) // stride_v
+    if n_walks * stride_v != len(vertices_s):
+        raise ValueError(
+            f"vertex partition size {len(vertices_s)} is not a multiple of "
+            f"walk stride {stride_v}; cuGraph's walk output is expected to be "
+            f"stride-aligned"
+        )
+    if len(edge_attrs_s) != n_walks * stride_p:
+        raise ValueError(
+            f"edge_attrs partition size {len(edge_attrs_s)} does not match "
+            f"expected {n_walks * stride_p} (n_walks={n_walks}, "
+            f"walk_length={walk_length})"
+        )
+    vs = cp.asarray(vertices_s.values).reshape(n_walks, stride_v)
+    ps = cp.asarray(edge_attrs_s.values).reshape(n_walks, stride_p)
+    src = vs[:, :-1].reshape(-1)
+    dst = vs[:, 1:].reshape(-1)
+    predicate = ps.reshape(-1)
+    walk_id = cp.repeat(
+        cp.arange(n_walks, dtype="int64") + int(walk_id_offset), stride_p
+    )
+    step = cp.tile(cp.arange(stride_p, dtype="int64"), n_walks)
+    df = cudf.DataFrame(
+        {
+            "src": src,
+            "predicate": predicate,
+            "dst": dst,
+            "walk_id": walk_id,
+            "step": step,
+        }
+    )
+    # Drop padded steps (cuGraph sentinels).
+    mask = (df["src"] != -1) & (df["dst"] != -1) & (df["predicate"] != -1)
+    return df[mask].reset_index(drop=True)
 
 
 def _triples_to_tokens_partition(df):
@@ -221,27 +280,24 @@ class SingleGPUWalkCorpus:
         min_count: int,
     ) -> cudf.DataFrame:
         walk_fn = biased_random_walks if self.walk_weighted else uniform_random_walks
-        random_walks, _, max_length = walk_fn(
+        # Capture all three returns: (vertex_paths, edge_attrs, max_length).
+        # When the graph was built with `edge_attr="predicate"`, edge_attrs is
+        # the per-step predicate cuGraph actually used — no need to merge it
+        # back from `edge_df`. The previous merge-based recovery picked an
+        # arbitrary predicate per (src, dst) pair on `MultiGraph` (silent
+        # correctness bug for graphs with parallel edges).
+        random_walks, edge_attrs, max_length = walk_fn(
             self.G,
             start_vertices=walk_vertices,
             max_depth=walk_depth,
             random_state=random_state,
         )
-        group_keys = cudf.Series(cp.arange(len(random_walks))) // max_length
-        transformed_random_walk = random_walks.to_frame(name="src")
-        transformed_random_walk["walk_id"] = group_keys
-        transformed_random_walk["dst"] = transformed_random_walk["src"].shift(-1)
-        transformed_random_walk = transformed_random_walk.mask(
-            transformed_random_walk == -1, [None, None, None]
-        ).dropna()
-
-        transformed_random_walk["step"] = transformed_random_walk.groupby(
-            "walk_id"
-        ).cumcount()
-        merged_walks = transformed_random_walk.merge(
-            edge_df, left_on=["src", "dst"], right_on=["subject", "object"], how="left"
-        )[["src", "predicate", "dst", "walk_id", "step"]]
-        merged_walks = merged_walks.dropna()
+        merged_walks = _build_walk_steps(
+            random_walks, edge_attrs, walk_length=int(max_length)
+        )
+        # `_build_walk_steps` already drops the cuGraph -1 sentinel rows and
+        # emits stride-aligned (walk_id, step) — preserve the legacy explicit
+        # sort so downstream behavior is unchanged.
         merged_walks = merged_walks.sort_values(["walk_id", "step"])
         tokens = _triples_to_tokens(merged_walks, min_count, concat_fn=cudf.concat)
         return _dispatch_pairs(tokens, self.window_size, word2vec_model, concat_fn=cudf.concat)
@@ -300,38 +356,67 @@ class MultiGPUWalkCorpus:
         walk_fn = dask_biased_random_walks if self.walk_weighted else dask_uniform_random_walks
         walk_label = "biased" if self.walk_weighted else "uniform"
         logger.info(f"Running multi-GPU {walk_label}_random_walks …")
-        # cuGraph requires unique seeds per GPU — omit to let it auto-seed
-        walks_s, _, max_len = walk_fn(
+        # cuGraph requires unique seeds per GPU — omit to let it auto-seed.
+        # Capture all three returns: (vertex_paths, edge_attrs, max_length).
+        # edge_attrs carries the per-step predicate cuGraph actually used
+        # (when the graph was built with edge_attr="predicate"). Using it
+        # directly avoids the multi-billion-row merge against `edge_ddf` that
+        # the previous implementation did, and removes a silent correctness
+        # bug on `MultiGraph` (the merge picked an arbitrary predicate per
+        # parallel edge).
+        from dask.distributed import wait as dask_wait
+
+        walks_s, edge_attrs_s, max_len = walk_fn(
             self.G,
             start_vertices=start_vertices,
             max_depth=walk_depth,
         )
+        walk_length = int(max_len)
 
-        def _build_walk_df(s, max_len):
-            """Build walk DataFrame with walk_id, dst, step from vertex Series."""
-            df = s.to_frame(name="src").reset_index(drop=True)
-            df["global_pos"] = cp.arange(len(df))
-            df["walk_id"] = df["global_pos"].astype("int64") // max_len
-            df["dst"] = df["src"].shift(-1)
-            # Drop last row of each partition (incomplete src→dst pair)
-            df = df.iloc[:-1]
-            df["step"] = df.groupby("walk_id").cumcount()
-            return df
+        # Persist + wait BEFORE the reshape so the walk generator doesn't
+        # re-roll on the per-partition size pass below (uniform_random_walks
+        # is stochastic; without persist, every consumer triggers a fresh
+        # roll).
+        walks_s = walks_s.persist()
+        edge_attrs_s = edge_attrs_s.persist()
+        dask_wait([walks_s, edge_attrs_s])
 
-        walks = walks_s.map_partitions(_build_walk_df, max_len)
+        # Compute per-partition walk counts so we can assign globally-unique
+        # walk_ids. The previous per-partition `cp.arange(len(df)) // max_len`
+        # produced partition-local ids that collided across partitions, which
+        # poisoned the downstream skip-gram merge on (walk_id, pos).
+        stride_v = walk_length + 1
+        vertex_part_sizes = walks_s.map_partitions(len).compute()
+        walks_per_part = [int(s) // stride_v for s in vertex_part_sizes]
+        offsets = [0]
+        for c in walks_per_part[:-1]:
+            offsets.append(offsets[-1] + c)
 
-        merged = walks.merge(
-            edge_ddf,
-            left_on=["src", "dst"],
-            right_on=["subject", "object"],
-            how="left",
-        ).dropna(subset=["predicate"])
-        merged = merged[["src", "predicate", "dst", "walk_id", "step"]]
+        # Combine the two aligned series partition-wise via from_delayed so
+        # each partition gets its own walk_id offset. The reshape replaces
+        # the previous `shift(-1) + iloc[:-1]` pattern, which silently dropped
+        # the row at every partition boundary.
+        walks_delayed = walks_s.to_delayed()
+        edges_delayed = edge_attrs_s.to_delayed()
+        meta = cudf.DataFrame(
+            {
+                "src": cudf.Series([], dtype=walks_s.dtype),
+                "predicate": cudf.Series([], dtype=edge_attrs_s.dtype),
+                "dst": cudf.Series([], dtype=walks_s.dtype),
+                "walk_id": cudf.Series([], dtype="int64"),
+                "step": cudf.Series([], dtype="int64"),
+            }
+        )
+        merged_parts = [
+            dask.delayed(_build_walk_steps)(
+                walks_delayed[i], edges_delayed[i], walk_length, offsets[i]
+            )
+            for i in range(len(walks_delayed))
+        ]
+        merged = dcudf.from_delayed(merged_parts, meta=meta)
 
-        # Materialize the merged walks across Dask workers.  This collapses
-        # the dask-expr lazy graph (walks + edge merge) into concrete
-        # partitions before the token/pair extraction builds further on top.
-        from dask.distributed import wait as dask_wait
+        # Materialize the reshape across workers before the token/pair stage
+        # consumes it (preserves the original persist+wait idiom).
         merged = merged.persist()
         dask_wait(merged)
 
