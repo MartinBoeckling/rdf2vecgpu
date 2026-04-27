@@ -17,7 +17,7 @@ cycler==0.12.1
 docker-pycreds==0.4.0
 eval_type_backport @ file:///home/conda/feedstock_root/build_artifacts/eval_type_backport_1734857727836/work
 fastparquet @ file:///home/conda/feedstock_root/build_artifacts/fastparquet_1731705211092/work
-fonttools==4.57.0
+fonttools==4.60.2
 frozenlist @ file:///home/conda/feedstock_root/build_artifacts/frozenlist_1737645236190/work
 fsspec @ file:///home/conda/feedstock_root/build_artifacts/fsspec_1743437245292/work
 gensim @ file:///home/conda/feedstock_root/build_artifacts/gensim_1725378702959/work
@@ -40,7 +40,7 @@ nvidia-cuda-runtime-cu11==11.7.99
 nvidia-cudnn-cu11==8.5.0.96
 packaging==24.2
 pandas @ file:///home/conda/feedstock_root/build_artifacts/pandas_1744430447393/work
-pillow==11.2.1
+pillow==12.2.0
 platformdirs @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_platformdirs_1742485085/work
 propcache @ file:///home/conda/feedstock_root/build_artifacts/propcache_1744524934684/work
 protobuf @ file:///home/conda/feedstock_root/build_artifacts/protobuf_1741124568415/work/bazel-bin/python/dist/protobuf-5.29.3-cp310-abi3-linux_x86_64.whl#sha256=afe363dc4c34775b243aadb0083a4a4dc7d1a532a3d3084fcebb1eecb1f3bdd9
@@ -65,7 +65,7 @@ six @ file:///home/conda/feedstock_root/build_artifacts/six_1733380938961/work
 smart_open @ file:///home/conda/feedstock_root/build_artifacts/smart_open_1734485076778/work/dist
 smmap @ file:///home/conda/feedstock_root/build_artifacts/smmap_1739781697784/work
 tomlkit==0.7.2
-torch==1.13.1
+torch==2.8.0
 tqdm==4.67.1
 typing-inspection @ file:///home/conda/feedstock_root/build_artifacts/typing-inspection_1741438046699/work
 typing_extensions @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_typing_extensions_1744302253/work
