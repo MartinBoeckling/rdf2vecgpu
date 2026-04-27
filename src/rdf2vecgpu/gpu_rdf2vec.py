@@ -505,6 +505,67 @@ class GPU_RDF2Vec:
 
         return walk_corpus
 
+    def walk_generation_sequences(
+        self, edge_df: cudf.DataFrame, walk_vertices: cudf.Series = None
+    ):
+        """Walks-as-sequences output for the gensim training backend.
+
+        Sister to `walk_generation`, but emits walks as parallel
+        `vertices: list<int>` + `predicates: list<int>` columns (one row per
+        walk) instead of pre-built (center, context) skip-gram pairs.
+        Gensim builds its own skip-gram windows internally, so it wants the
+        raw walk sequences, not pre-computed pairs.
+
+        Only the "random" walk strategy is supported for the gensim backend
+        in this release — bfs walks would need a parallel BFS-to-sequences
+        path on the corpus classes.
+        """
+        with self.tracker.stage("Walk_Generation"):
+            if self.config.multi_gpu:
+                walk_instance = MultiGPUWalkCorpus(
+                    self.knowledge_graph,
+                    self.config.window_size,
+                    walk_weighted=self.config.walk_weighted,
+                )
+            else:
+                walk_instance = SingleGPUWalkCorpus(
+                    self.knowledge_graph,
+                    self.config.window_size,
+                    walk_weighted=self.config.walk_weighted,
+                )
+            if self.config.walk_strategy != "random":
+                raise NotImplementedError(
+                    f"backend='gensim' currently supports walk_strategy='random' "
+                    f"only (got {self.config.walk_strategy!r}). bfs+gensim would "
+                    f"need a parallel sequences output on bfs_walk."
+                )
+            if walk_vertices is None:
+                walk_vertices = self.knowledge_graph.nodes()
+            n = self.config.walk_number
+            if hasattr(walk_vertices, "map_partitions"):
+                walk_vertices = walk_vertices.map_partitions(
+                    lambda s: s.repeat(n).reset_index(drop=True)
+                )
+            else:
+                walk_vertices = walk_vertices.repeat(n)
+            walk_sequences = walk_instance.random_walk_sequences(
+                walk_vertices=walk_vertices,
+                walk_depth=self.config.walk_depth,
+                random_state=self.config.random_state,
+            )
+            self.tracker.log_params(
+                {
+                    "walk_depth": self.config.walk_depth,
+                    "random_state": self.config.random_state,
+                    "walk_strategy": self.config.walk_strategy,
+                    "walk_number": self.config.walk_number,
+                    "walk_weighted": self.config.walk_weighted,
+                    "min_count": self.config.min_count,
+                    "backend": "gensim",
+                }
+            )
+        return walk_sequences
+
     def fit(self, edge_df: cudf.DataFrame, walk_vertices: cudf.Series = None) -> None:
         """
          Train a Word2Vec model on random-walk sequences generated from the
@@ -545,6 +606,15 @@ class GPU_RDF2Vec:
          >>> edges = rdf2vec.load_data("example.parquet")
          >>> rdf2vec.fit(edges)
         """
+        # backend dispatch: gensim consumes walks-as-sequences via parquet
+        # streaming and trains on CPU; pytorch consumes (center, context)
+        # skip-gram pairs and trains on GPU via Lightning.
+        if self.config.backend == "gensim":
+            walk_sequences = self.walk_generation_sequences(
+                edge_df=edge_df, walk_vertices=walk_vertices
+            )
+            self._fit_via_gensim(walk_sequences)
+            return
         walk_corpus = self.walk_generation(
             edge_df=edge_df,
             walk_vertices=walk_vertices,
@@ -583,6 +653,102 @@ class GPU_RDF2Vec:
             if hasattr(walk_corpus, "compute"):
                 walk_corpus = walk_corpus.compute()
             self._fit_from_tensors(walk_corpus)
+
+    def _fit_via_gensim(self, walk_sequences) -> None:
+        """Train Word2Vec via the optional gensim backend.
+
+        Materializes the walks-as-sequences corpus to a temp parquet directory
+        (gensim's streaming `WalkCorpus` iterator reads parquet files), tears
+        down the dask cluster if multi-GPU was used so the GPU memory is
+        released before CPU-side training, then fits gensim's
+        negative-sampling Word2Vec.
+
+        The trained gensim model is stored on `self.word2vec_model` (same
+        attribute the pytorch backend uses); `transform()` branches on
+        backend to extract embeddings into the standard `[token, word,
+        embedding_*]` cudf DataFrame.
+        """
+        from .embedders.gensim_word2vec import train_gensim_word2vec
+        import tempfile, shutil
+
+        with self.tracker.stage("Word2Vec_Training"):
+            walk_dir = tempfile.mkdtemp(prefix="rdf2vec_gensim_walks_")
+            try:
+                walks_parquet = f"{walk_dir}/walks"
+                logger.info(f"Checkpointing walk sequences to {walks_parquet}")
+                if hasattr(walk_sequences, "to_parquet"):
+                    # dask_cudf.DataFrame: each worker writes its partition.
+                    # `random_walk_sequences()` already persist+wait-ed the
+                    # walk output, but re-pin defensively here so a future
+                    # refactor that moves the persist out of the corpus class
+                    # doesn't silently re-roll the stochastic walk generator
+                    # on this `to_parquet`. Matches the explicit persist+wait
+                    # the PyTorch checkpoint path uses.
+                    from dask.distributed import wait as dask_wait
+
+                    walk_sequences = walk_sequences.persist()
+                    dask_wait(walk_sequences)
+                    walk_sequences.to_parquet(walks_parquet, write_index=False)
+                else:
+                    # cudf.DataFrame: single-file write under the directory.
+                    import os as _os
+                    _os.makedirs(walks_parquet, exist_ok=True)
+                    walk_sequences.to_parquet(
+                        f"{walks_parquet}/part.0.parquet", index=False
+                    )
+
+                # Free GPU resources before CPU-side gensim training. Mirrors
+                # the multi-GPU pytorch path's teardown so the gensim workers
+                # have full host RAM.
+                if self.config.multi_gpu:
+                    try:
+                        import cugraph.dask.comms.comms as Comms
+
+                        if Comms.is_initialized():
+                            Comms.destroy()
+                    except Exception:
+                        pass
+                    if self.client is not None:
+                        self.client.close()
+                        self.client = None
+                    logger.info(
+                        "Dask cluster shut down; starting gensim training"
+                    )
+
+                logger.info(
+                    f"Training gensim Word2Vec "
+                    f"(vector_size={self.config.vector_size}, "
+                    f"window={self.config.window_size}, "
+                    f"epochs={self.config.epochs}, "
+                    f"workers={self.config.cpu_count})"
+                )
+                gensim_model = train_gensim_word2vec(
+                    walks_dir=walks_parquet,
+                    word2idx_df=self.word2idx,
+                    vector_size=self.config.vector_size,
+                    window=self.config.window_size,
+                    min_count=self.config.min_count,
+                    embedding_model=self.config.embedding_model,
+                    negative=self.config.negative_samples,
+                    epochs=self.config.epochs,
+                    workers=self.config.cpu_count,
+                    learning_rate=self.config.learning_rate,
+                    random_state=self.config.random_state,
+                )
+                self.word2vec_model = gensim_model
+                self.tracker.log_params(
+                    {
+                        "vector_size": self.config.vector_size,
+                        "window_size": self.config.window_size,
+                        "epochs": self.config.epochs,
+                        "negative_samples": self.config.negative_samples,
+                        "embedding_model": self.config.embedding_model,
+                        "learning_rate": self.config.learning_rate,
+                        "backend": "gensim",
+                    }
+                )
+            finally:
+                shutil.rmtree(walk_dir, ignore_errors=True)
 
     def _fit_from_parquet(self, walk_path: str) -> None:
         """Train Word2Vec from parquet shards using DDP across all GPUs."""
@@ -748,27 +914,81 @@ class GPU_RDF2Vec:
         """
         # Check if model is fitted and word2idx is available
         with self.tracker.stage("Embedding_Extraction"):
-            if self.word2vec_model is not None and self.word2idx is not None:
-                model_embeddings = self.word2vec_model.in_embeddings.weight.detach().cuda()
-                # Convert via CuPy to avoid cudf from_dlpack column-major requirement
-                import cupy as cp
-                cp_arr = cp.from_dlpack(model_embeddings)
-                model_embeddings_df = cudf.DataFrame(
-                    {str(i): cp_arr[:, i] for i in range(cp_arr.shape[1])}
-                )
-                model_embeddings_df.columns = model_embeddings_df.columns.astype(str)
-                model_embeddings_df = model_embeddings_df.add_prefix("embedding_")
-                embedding_df = cudf.concat([self.word2idx, model_embeddings_df], axis=1)
-                if self.config.generate_artifact:
-                    embedding_df.to_parquet(
-                        f"vector/embeddings_{self.config.embedding_model}.parquet", index=False
-                    )
-                return embedding_df
-            else:
+            if self.word2vec_model is None or self.word2idx is None:
                 raise ValueError(
                     "The transform method is not possible to call without a fitted model or a generated word2idx setup. "
                     "Please call the 'fit' method first or the 'load_data' method to generate the word2idx setup."
                 )
+            if self.config.backend == "gensim":
+                embedding_df = self._extract_embeddings_gensim()
+            else:
+                embedding_df = self._extract_embeddings_pytorch()
+            if self.config.generate_artifact:
+                embedding_df.to_parquet(
+                    f"vector/embeddings_{self.config.embedding_model}.parquet",
+                    index=False,
+                )
+            return embedding_df
+
+    def _extract_embeddings_pytorch(self) -> cudf.DataFrame:
+        """Pull `[token, word, embedding_0..n]` cudf DataFrame from the
+        PyTorch trainer's in-embeddings weight matrix."""
+        import cupy as cp
+
+        model_embeddings = (
+            self.word2vec_model.in_embeddings.weight.detach().cuda()
+        )
+        # Convert via CuPy to avoid cudf from_dlpack column-major requirement
+        cp_arr = cp.from_dlpack(model_embeddings)
+        model_embeddings_df = cudf.DataFrame(
+            {str(i): cp_arr[:, i] for i in range(cp_arr.shape[1])}
+        )
+        model_embeddings_df.columns = model_embeddings_df.columns.astype(str)
+        model_embeddings_df = model_embeddings_df.add_prefix("embedding_")
+        return cudf.concat([self.word2idx, model_embeddings_df], axis=1)
+
+    def _extract_embeddings_gensim(self) -> cudf.DataFrame:
+        """Pull `[token, word, embedding_0..n]` cudf DataFrame from the
+        gensim KeyedVectors output.
+
+        Row alignment is delegated to
+        `embedders.gensim_word2vec.kv_to_token_aligned_matrix`, which is a
+        pure-numpy helper unit-tested separately. The cudf concat below joins
+        the resulting token-ordered matrix with a token-sorted `word2idx` so
+        each row is `[token, word, embedding_*]` for the same token id.
+
+        Note: gensim's `min_count` filter (when `min_count > 1`) drops tokens
+        from the KV; those rows get a zero embedding here. The PyTorch path
+        keeps its random-init weight in the same situation. Both behaviors
+        are technically lossy and worth normalizing in a follow-up.
+        """
+        import cupy as cp
+        from .embedders.gensim_word2vec import kv_to_token_aligned_matrix
+
+        kv = self.word2vec_model.wv  # gensim.models.KeyedVectors
+        # Numeric, token-indexed matrix (zeros for any token gensim filtered).
+        vectors = kv_to_token_aligned_matrix(kv, self.word2idx)
+        if len(kv.index_to_key) < vectors.shape[0]:
+            logger.warning(
+                f"gensim KV vocab ({len(kv.index_to_key):,}) is smaller than "
+                f"word2idx ({vectors.shape[0]:,}); "
+                f"{vectors.shape[0] - len(kv.index_to_key):,} tokens were "
+                f"filtered by min_count and will appear as zero embeddings."
+            )
+        cp_arr = cp.asarray(vectors)
+        model_embeddings_df = cudf.DataFrame(
+            {str(i): cp_arr[:, i] for i in range(cp_arr.shape[1])}
+        )
+        model_embeddings_df.columns = model_embeddings_df.columns.astype(str)
+        model_embeddings_df = model_embeddings_df.add_prefix("embedding_")
+        # `self.word2idx` may be dask_cudf; materialize to cudf for the concat,
+        # and sort by token so the row order matches the matrix above.
+        if hasattr(self.word2idx, "compute"):
+            w2i = self.word2idx.compute()
+        else:
+            w2i = self.word2idx
+        w2i = w2i.sort_values("token").reset_index(drop=True)
+        return cudf.concat([w2i, model_embeddings_df], axis=1)
 
     def fit_transform(
         self, edge_df: cudf.DataFrame, walk_vertices: cudf.DataFrame
