@@ -71,6 +71,92 @@ def test_generate_vocab_multi_gpu():
     assert vocab.compute().shape == (4, 2)
 
 
+def _make_larger_dask_cudf_df(npartitions: int = 4):
+    """A 12-row triple table chosen so the unique vocab is exactly 11 strings.
+
+    Used to exercise the multi-GPU vocab build with multiple hash partitions.
+    The vocab is intentionally larger than `npartitions` so the cumsum-offset
+    arithmetic actually has multiple non-empty partitions to stitch together.
+    """
+    return dask_cudf.from_cudf(
+        cudf.DataFrame(
+            {
+                "subject": cudf.Series(
+                    ["A", "B", "C", "D", "E", "F", "A", "B", "C", "D", "E", "F"]
+                ),
+                "predicate": cudf.Series(
+                    ["p1", "p2", "p3", "p1", "p2", "p3", "p1", "p2", "p3", "p1", "p2", "p3"]
+                ),
+                "object": cudf.Series(
+                    ["X", "Y", "Z", "X", "Y", "Z", "Y", "Z", "X", "Z", "X", "Y"]
+                ),
+            }
+        ),
+        npartitions=npartitions,
+    )
+
+
+@pytest.mark.gpu
+def test_generate_vocab_multi_gpu_unique_tokens_contiguous_range():
+    """Every (word, token) pair is unique and tokens form a contiguous [0, n).
+
+    Catches off-by-one in the per-partition cumsum offsets — if any partition's
+    `_assign_ids` started at the wrong offset, tokens would either collide
+    (overlap) or skip ids (gap), breaking contiguity.
+    """
+    edge_df = _make_larger_dask_cudf_df(npartitions=4)
+    _, vocab_dd = _generate_vocab(edge_df, multi_gpu=True)
+    vocab = vocab_dd.compute()
+    # Vocab is the union of {A..F, p1..p3, X..Z} = 12 unique strings.
+    expected_words = {"A", "B", "C", "D", "E", "F", "p1", "p2", "p3", "X", "Y", "Z"}
+    assert set(vocab["word"].to_pandas()) == expected_words
+    # Token ids are unique.
+    tokens = sorted(vocab["token"].to_pandas().tolist())
+    assert len(tokens) == len(set(tokens)), "duplicate token ids"
+    # Token ids form a contiguous [0, n) range.
+    assert tokens == list(range(len(tokens)))
+
+
+@pytest.mark.gpu
+def test_generate_vocab_multi_gpu_round_trip_decodes_to_original_strings():
+    """edge_df decoded back through word2idx equals the original triple set.
+
+    Catches drift where the broadcast merges or the per-partition reshape
+    silently lose rows (e.g. if `drop_duplicates` got re-rolled without
+    persist, or a broadcast merge dropped non-matching rows).
+    """
+    original = _make_larger_dask_cudf_df(npartitions=4).compute().reset_index(drop=True)
+    encoded_dd, vocab_dd = _generate_vocab(
+        _make_larger_dask_cudf_df(npartitions=4), multi_gpu=True
+    )
+    encoded = encoded_dd.compute().reset_index(drop=True)
+    vocab = vocab_dd.compute()
+
+    # Build a token → word lookup from the materialized vocab.
+    token_to_word = dict(
+        zip(vocab["token"].to_pandas().tolist(), vocab["word"].to_pandas().tolist())
+    )
+    decoded_subject = encoded["subject"].to_pandas().map(token_to_word).tolist()
+    decoded_predicate = encoded["predicate"].to_pandas().map(token_to_word).tolist()
+    decoded_object = encoded["object"].to_pandas().map(token_to_word).tolist()
+
+    decoded_triples = set(zip(decoded_subject, decoded_predicate, decoded_object))
+    original_triples = set(
+        zip(
+            original["subject"].to_pandas().tolist(),
+            original["predicate"].to_pandas().tolist(),
+            original["object"].to_pandas().tolist(),
+        )
+    )
+    assert decoded_triples == original_triples, (
+        f"decoded triples differ from original; "
+        f"missing={original_triples - decoded_triples}, "
+        f"unexpected={decoded_triples - original_triples}"
+    )
+    # Row count preserved (no row loss from broadcast merges).
+    assert len(encoded) == len(original)
+
+
 def test_cudf_to_torch_tensor():
     cudf_df = _make_cudf_df()
     tensor = cudf_to_torch_tensor(cudf_df, "word")
