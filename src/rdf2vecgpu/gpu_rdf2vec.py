@@ -778,7 +778,9 @@ class GPU_RDF2Vec:
             try:
                 walks_parquet = f"{walk_dir}/walks"
                 logger.info(f"Checkpointing walk sequences to {walks_parquet}")
-                if hasattr(walk_sequences, "to_parquet"):
+                # discriminate dask_cudf vs cudf via `.persist` — both have `to_parquet`
+                # (the same latent bug exists in _fit_via_gensim; Plan 1 should fix both)
+                if hasattr(walk_sequences, "persist"):
                     walk_sequences = walk_sequences.persist()
                     dask_wait(walk_sequences)
                     walk_sequences.to_parquet(walks_parquet, write_index=False)
