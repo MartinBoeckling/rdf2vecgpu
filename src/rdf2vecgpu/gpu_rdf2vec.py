@@ -7,7 +7,7 @@ import dask
 from lightning.pytorch.tuner import Tuner
 from .helper.functions import _generate_vocab, cudf_to_torch_tensor
 from .embedders.word2vec import SkipGram, CBOW
-from .embedders.word2vec_loader import SkipGramDataModule, CBOWDataModule, ParquetSkipGramDataModule
+from .embedders.word2vec_loader import SkipGramDataModule, CBOWDataModule, ParquetSkipGramDataModule, WalkSequenceDataModule
 from .reader.kg_file_reader import KGFileReader
 from .corpus.walk_corpus import SingleGPUWalkCorpus, MultiGPUWalkCorpus
 from .logger import build_tracker
@@ -615,6 +615,19 @@ class GPU_RDF2Vec:
             )
             self._fit_via_gensim(walk_sequences)
             return
+        # [spike] pytorch backend, skip-gram, random walks → the new walk-sequence
+        # path (sparse embeddings + SGD + on-GPU pair expansion). CBOW / bfs fall
+        # through to the legacy pre-expand-to-pairs path below.
+        if (
+            self.config.backend == "pytorch"
+            and self.config.embedding_model == "skipgram"
+            and self.config.walk_strategy == "random"
+        ):
+            walk_sequences = self.walk_generation_sequences(
+                edge_df=edge_df, walk_vertices=walk_vertices
+            )
+            self._fit_via_pytorch_sequences(walk_sequences)
+            return
         walk_corpus = self.walk_generation(
             edge_df=edge_df,
             walk_vertices=walk_vertices,
@@ -747,6 +760,88 @@ class GPU_RDF2Vec:
                         "backend": "gensim",
                     }
                 )
+            finally:
+                shutil.rmtree(walk_dir, ignore_errors=True)
+
+    def _fit_via_pytorch_sequences(self, walk_sequences) -> None:
+        """[spike] Train PyTorch skip-gram from walks-as-sequences: checkpoint the
+        sequences to a temp parquet dir, tear down dask if multi-GPU, then train
+        via WalkSequenceDataModule + SkipGram (sparse Embedding + SGD + on-GPU pair
+        expansion). Hard-wired use_sparse/lr_decay/min_lr/window — no config flags
+        yet (that's Plan 1's clean implementation)."""
+        import tempfile, shutil, os
+        from dask.distributed import wait as dask_wait
+
+        n_gpus = max(1, torch.cuda.device_count())
+        with self.tracker.stage("Word2Vec_Training"):
+            walk_dir = tempfile.mkdtemp(prefix="rdf2vec_pt_walks_")
+            try:
+                walks_parquet = f"{walk_dir}/walks"
+                logger.info(f"Checkpointing walk sequences to {walks_parquet}")
+                if hasattr(walk_sequences, "to_parquet"):
+                    walk_sequences = walk_sequences.persist()
+                    dask_wait(walk_sequences)
+                    walk_sequences.to_parquet(walks_parquet, write_index=False)
+                else:
+                    os.makedirs(walks_parquet, exist_ok=True)
+                    walk_sequences.to_parquet(f"{walks_parquet}/part.0.parquet", index=False)
+                if self.config.multi_gpu:
+                    try:
+                        import cugraph.dask.comms.comms as Comms
+                        if Comms.is_initialized():
+                            Comms.destroy()
+                    except Exception:
+                        pass
+                    if self.client is not None:
+                        self.client.close()
+                        self.client = None
+                    logger.info("Dask cluster shut down; starting PyTorch training")
+                # word2idx may be dask_cudf in multi-GPU mode → materialise for vocab size
+                if hasattr(self.word2idx, "compute"):
+                    self.word2idx = self.word2idx.compute()
+                if self.config.reproducible:
+                    L.seed_everything(self.config.random_state, workers=True)
+                model = SkipGram(
+                    vocab_size=self.word2idx.shape[0],
+                    embedding_dim=self.config.vector_size,
+                    neg_samples=self.config.negative_samples,
+                    learning_rate=self.config.learning_rate,
+                    use_sparse=True,
+                    epochs=self.config.epochs,
+                    min_learning_rate=0.0001,
+                    lr_decay="linear",
+                    window=self.config.window_size,
+                )
+                datamodule = WalkSequenceDataModule(
+                    walks_parquet,
+                    batch_size=self.config.batch_size or 20_000,
+                    num_workers=self.config.cpu_count,
+                )
+                self.tracker.log_pytorch()
+                trainer = L.Trainer(
+                    max_epochs=self.config.epochs,
+                    log_every_n_steps=50,
+                    accelerator="gpu",
+                    precision=32,
+                    devices=n_gpus,
+                    strategy="ddp" if n_gpus > 1 else "auto",
+                    num_nodes=self.config.num_nodes,
+                    enable_checkpointing=False,
+                    enable_progress_bar=False,
+                )
+                trainer.fit(model, datamodule)
+                self.tracker.log_model_pytorch(model, artifact_path="word2vec_model")
+                self.word2vec_model = model
+                self.tracker.log_params({
+                    "vector_size": self.config.vector_size,
+                    "window_size": self.config.window_size,
+                    "epochs": self.config.epochs,
+                    "negative_samples": self.config.negative_samples,
+                    "embedding_model": "skipgram",
+                    "learning_rate": self.config.learning_rate,
+                    "backend": "pytorch",
+                    "corpus": "walk_sequences_onfly_gpu",
+                })
             finally:
                 shutil.rmtree(walk_dir, ignore_errors=True)
 
@@ -936,7 +1031,7 @@ class GPU_RDF2Vec:
         import cupy as cp
 
         model_embeddings = (
-            self.word2vec_model.in_embeddings.weight.detach().cuda()
+            self.word2vec_model.get_embeddings().detach().cuda()
         )
         # Convert via CuPy to avoid cudf from_dlpack column-major requirement
         cp_arr = cp.from_dlpack(model_embeddings)

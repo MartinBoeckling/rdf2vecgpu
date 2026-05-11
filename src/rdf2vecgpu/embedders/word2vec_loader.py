@@ -1,5 +1,15 @@
+import glob
 import lightning as L
-from torch.utils.data import DataLoader, Dataset, RandomSampler, BatchSampler
+import numpy as np
+import pyarrow.parquet as pq
+from torch.utils.data import (
+    DataLoader,
+    Dataset,
+    RandomSampler,
+    BatchSampler,
+    IterableDataset,
+    get_worker_info,
+)
 import torch
 
 
@@ -308,4 +318,96 @@ class OrderAwareCBOWDataModule(L.LightningDataModule):
             collate_fn=_collate,
             num_workers=0,
             pin_memory=False,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Walk-sequence streaming (PyTorch backend's on-GPU pair-expansion corpus path)
+# --------------------------------------------------------------------------- #
+def _flat_list_array_to_2d(col):
+    """A pyarrow list<int> column where every row has the same length →
+    a contiguous (n_rows, row_len) int32 numpy array — no per-row Python
+    (uses the flat .values + .offsets, not to_pylist())."""
+    arr = col.combine_chunks() if hasattr(col, "combine_chunks") else col
+    n = len(arr)
+    if n == 0:
+        return np.empty((0, 0), dtype=np.int32)
+    offsets = arr.offsets.to_numpy(zero_copy_only=False)
+    row_len = int(offsets[1] - offsets[0])
+    if not np.all(np.diff(offsets) == row_len):
+        return np.asarray(arr.to_pylist(), dtype=np.int32)  # ragged — defensive fallback
+    flat = arr.values.to_numpy(zero_copy_only=False).astype(np.int32, copy=False)
+    return flat.reshape(n, row_len)
+
+
+class _WalkSeqIterable(IterableDataset):
+    """Streams a walks-as-sequences parquet directory; yields (vertices, predicates)
+    numpy int32 arrays of shape (n, depth+1) / (n, depth) per parquet row-batch.
+    Files are sharded across DataLoader workers (DDP-rank sharding is done by the
+    caller, by trimming `.files`)."""
+
+    def __init__(self, walks_dir, batch_size=20_000):
+        super().__init__()
+        files = sorted(set(
+            glob.glob(f"{walks_dir}/*.parquet")
+            + glob.glob(f"{walks_dir}/**/*.parquet", recursive=True)
+        ))
+        if not files:
+            raise FileNotFoundError(f"no parquet under {walks_dir}")
+        self.files = files
+        self.batch_size = batch_size
+
+    def __iter__(self):
+        wi = get_worker_info()
+        n_w, w_id = (wi.num_workers, wi.id) if wi else (1, 0)
+        my = [f for k, f in enumerate(self.files) if k % n_w == w_id]
+        for f in my:
+            pf = pq.ParquetFile(f)
+            for b in pf.iter_batches(columns=["vertices", "predicates"], batch_size=self.batch_size):
+                v = _flat_list_array_to_2d(b.column("vertices"))
+                p = _flat_list_array_to_2d(b.column("predicates"))
+                if v.shape[0] == 0:
+                    continue
+                yield v, p
+
+
+def _walkseq_collate(item):
+    v, p = item  # already a (vertices_np, predicates_np) tuple from _WalkSeqIterable
+    return torch.from_numpy(v), torch.from_numpy(p)
+
+
+class WalkSequenceDataModule(L.LightningDataModule):
+    """Feeds (vertices, predicates) int32 batches from a walks-as-sequences parquet
+    dir. `num_workers` overlaps parquet read+decode with the GPU step; in DDP the
+    file list is sharded per rank in setup()."""
+
+    def __init__(self, walks_dir, *, batch_size, num_workers=0):
+        super().__init__()
+        self.walks_dir = walks_dir
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self._iterable = None
+
+    def setup(self, stage=None):
+        ds = _WalkSeqIterable(self.walks_dir, batch_size=self.batch_size)
+        if self.trainer is not None and self.trainer.world_size > 1:
+            rank, ws = self.trainer.global_rank, self.trainer.world_size
+            ds.files = [f for i, f in enumerate(ds.files) if i % ws == rank]
+            if not ds.files:
+                raise RuntimeError(
+                    f"DDP rank {rank}/{ws}: no walk-parquet files assigned "
+                    f"(fewer files than ranks?)"
+                )
+        self._iterable = ds
+
+    def train_dataloader(self):
+        if self._iterable is None:
+            self.setup()
+        return DataLoader(
+            self._iterable,
+            batch_size=None,                 # the iterable yields already-batched items
+            collate_fn=_walkseq_collate,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            persistent_workers=False,
         )

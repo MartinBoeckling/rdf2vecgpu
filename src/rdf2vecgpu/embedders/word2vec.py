@@ -12,12 +12,21 @@ class SkipGram(L.LightningModule):
         vocab_size,
         embedding_dim,
         neg_samples,
-        learning_rate=0.003,
-        use_sparse=False,
+        learning_rate=0.025,
+        use_sparse=True,
+        epochs=5,
+        min_learning_rate=0.0001,
+        lr_decay="linear",       # "linear" | "none"
+        window=5,                # for the on-GPU walk-sequence pair expansion
     ):
         super().__init__()
+        self.save_hyperparameters()
         self.vocab_size = vocab_size
         self.learning_rate = learning_rate
+        self.epochs = epochs
+        self.min_learning_rate = min_learning_rate
+        self.lr_decay = lr_decay
+        self.window = window
 
         self.in_embeddings = nn.Embedding(vocab_size, embedding_dim, sparse=use_sparse)
         self.output_embeddings = nn.Embedding(
@@ -32,6 +41,13 @@ class SkipGram(L.LightningModule):
         self.neg_samples = neg_samples
         self.loss_fn = nn.BCEWithLogitsLoss(reduction="none")
         self.use_sparse = use_sparse
+        # window-shift skip-gram pair templates, keyed by interleaved-walk length;
+        # built lazily on the right device.
+        self._pair_templates = {}
+
+    def get_embeddings(self):
+        """Entity-level embedding table used downstream (the input/syn0 table)."""
+        return self.in_embeddings.weight.data
 
     def forward(self, center, context, negative):
         center_embed = self.in_embeddings(center)  # (batch, embed)
@@ -51,8 +67,67 @@ class SkipGram(L.LightningModule):
 
         return torch.mean(pos_loss + neg_loss)
 
+    def _pair_template_for(self, L, device):
+        """(ii, jj) long tensors on `device` of all (i, j) with 0 < |i-j| <= window,
+        0 <= i, j < L. Cached per (L, device)."""
+        cached = self._pair_templates.get(L)
+        if cached is not None and cached[0].device == device:
+            return cached
+        w = self.window
+        ii, jj = [], []
+        for i in range(L):
+            for j in range(max(0, i - w), min(L, i + w + 1)):
+                if j != i:
+                    ii.append(i)
+                    jj.append(j)
+        t = (torch.as_tensor(ii, dtype=torch.long, device=device),
+             torch.as_tensor(jj, dtype=torch.long, device=device))
+        self._pair_templates[L] = t
+        return t
+
+    def _expand_skipgram(self, vertices, predicates):
+        """vertices: (n, depth+1) int (cuGraph `-1` sentinels pad short walks);
+        predicates: (n, depth) int (cuGraph pads with 0). Returns flat 1-D long
+        tensors (center, context) of all valid skip-gram pairs."""
+        n, depth_p1 = vertices.shape
+        Lint = 2 * depth_p1 - 1
+        device = vertices.device
+        seq = vertices.new_full((n, Lint), -1)
+        seq[:, 0::2] = vertices
+        seq[:, 1::2] = predicates
+        seq = seq.long()
+        is_sent = vertices.eq(-1)
+        first_sent = torch.where(
+            is_sent.any(dim=1),
+            is_sent.long().argmax(dim=1),
+            torch.full((n,), depth_p1, device=device, dtype=torch.long),
+        )
+        valid_len = (2 * first_sent - 1).clamp(min=0)          # (n,)
+        ii, jj = self._pair_template_for(Lint, device)         # (P,)
+        center = seq[:, ii].reshape(-1)
+        context = seq[:, jj].reshape(-1)
+        keep = (
+            (ii.unsqueeze(0) < valid_len.unsqueeze(1))
+            & (jj.unsqueeze(0) < valid_len.unsqueeze(1))
+        ).reshape(-1)
+        return center[keep], context[keep]
+
+    def _training_step_sequences(self, vertices, predicates):
+        center, context = self._expand_skipgram(vertices, predicates)
+        if center.numel() == 0:
+            return torch.zeros((), device=center.device, requires_grad=True)
+        negative = torch.randint(
+            0, self.vocab_size, (center.size(0), self.neg_samples), device=center.device
+        )
+        loss = self(center, context, negative)
+        self.log("train_loss", loss, prog_bar=True)
+        return loss
+
     def training_step(self, batch, batch_idx):
-        center, context = batch
+        a, b = batch
+        if a.dim() == 2:                       # (vertices, predicates) — walk-sequence path
+            return self._training_step_sequences(a, b)
+        center, context = a, b                 # legacy (center, context) pair path
         negative = torch.randint(
             0, self.vocab_size, (center.size(0), self.neg_samples), device=self.device
         )
@@ -61,8 +136,17 @@ class SkipGram(L.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        opt_function = torch.optim.SparseAdam if self.use_sparse else torch.optim.Adam
-        return opt_function(self.parameters(), lr=self.learning_rate)
+        # classic word2vec: plain SGD + linear LR decay (matches gensim's alpha
+        # schedule); SGD also has zero adaptive state ⇒ optimiser is O(touched rows)
+        # not O(vocab) when use_sparse=True. (SparseAdam available if a caller sets it.)
+        opt = torch.optim.SGD(self.parameters(), lr=self.learning_rate)
+        if self.lr_decay != "linear" or self.epochs <= 1:
+            return opt
+        end_factor = max(self.min_learning_rate / self.learning_rate, 1e-12)
+        scheduler = torch.optim.lr_scheduler.LinearLR(
+            opt, start_factor=1.0, end_factor=end_factor, total_iters=self.epochs - 1
+        )
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
 
 
 class CBOW(L.LightningModule):
