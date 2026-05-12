@@ -48,13 +48,32 @@ class RDF2VecConfig(BaseModel):
     learning_rate : float, default 0.025
         Learning rate used by the optimizer.
 
+    min_learning_rate : float, default 0.0001
+        Floor of the linear LR decay for the PyTorch skip-gram path.
+
+    lr_decay : {"linear", "none"}, default "linear"
+        LR schedule for the PyTorch skip-gram path. "linear" decays
+        ``learning_rate`` → ``min_learning_rate`` over the run (gensim's
+        alpha schedule); "none" keeps it constant.
+
+    pair_batch_size : int, default 16384
+        PyTorch skip-gram (walk-sequence path): number of skip-gram pairs per
+        SGD step. Small values stabilise training on RDF2Vec walk corpora
+        (a few predicate tokens dominate the token frequency); the default
+        16384 is a good GPU-efficient compromise.
+
+    accumulate_grad_batches : int, default 1
+        Thin pass-through to PyTorch Lightning's gradient accumulation.
+        Increasing it enlarges the effective batch and is generally NOT
+        recommended for skip-gram (see ``pair_batch_size``).
+
     epochs : int, default 5
         Number of training epochs.
 
     batch_size : int or None, default None
         Explicit batch size; if None, Lightning's tuner may pick one.
 
-    tune_batch_size : bool, default True
+    tune_batch_size : bool, default False
         Whether to use PyTorch Lightning’s automatic batch size tuning.
 
     random_state : int, default 42
@@ -106,7 +125,20 @@ class RDF2VecConfig(BaseModel):
     window_size: int = Field(default=5, gt=1)
     min_count: int = Field(default=1, ge=0)
     negative_samples: int = Field(default=5, ge=0)
-    learning_rate: float = Field(default=0.0001, gt=0)
+    learning_rate: float = Field(default=0.025, gt=0)
+    # PyTorch backend (skip-gram, walk-sequence path) — convergence / optimiser.
+    # pair_batch_size is the meaningful convergence knob: one SGD step per ~this
+    # many skip-gram pairs (small → no hot predicate token is over-aggregated;
+    # large → GPU-efficient). lr decays linearly learning_rate → min_learning_rate
+    # over the run (classic word2vec / gensim's alpha schedule).
+    min_learning_rate: float = Field(default=0.0001, ge=0)
+    lr_decay: Literal["linear", "none"] = "linear"
+    pair_batch_size: int = Field(default=16384, gt=0)
+    # Thin pass-through to lightning.Trainer(accumulate_grad_batches=...). Note:
+    # *increasing* this enlarges the effective batch (accumulate_grad_batches *
+    # pair_batch_size pairs/step), which is generally counter-productive for
+    # skip-gram — the small effective batch is what makes it converge stably.
+    accumulate_grad_batches: int = Field(default=1, ge=1)
     backend: Literal["pytorch", "gensim"] = "pytorch"
     # library settings
     random_state: int = Field(default=42, ge=0)
@@ -114,7 +146,7 @@ class RDF2VecConfig(BaseModel):
     multi_gpu: bool = False
     generate_artifact: bool = False
     cpu_count: int = Field(default=4, gt=0)
-    tune_batch_size: bool = True
+    tune_batch_size: bool = False
     num_nodes: int = Field(default=1, gt=0)
     tracker: Literal["mlflow", "wandb", "none"] = "none"
     tracker_kwargs: Optional[dict] = None

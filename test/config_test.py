@@ -68,3 +68,29 @@ def test_config_reject_invalid_tracker():
     assert "mlflow" in msg
     assert "wandb" in msg
     assert "none" in msg
+
+
+def test_pytorch_convergence_config_defaults():
+    c = RDF2VecConfig()
+    assert c.pair_batch_size == 16384
+    assert c.accumulate_grad_batches == 1
+    assert c.min_learning_rate == 0.0001
+    assert c.lr_decay == "linear"
+    # reconciled classic-word2vec defaults
+    assert c.learning_rate == 0.025
+    assert c.tune_batch_size is False
+
+
+def test_pytorch_convergence_config_overrides_and_validation():
+    c = RDF2VecConfig(pair_batch_size=4096, accumulate_grad_batches=2,
+                      min_learning_rate=0.0, lr_decay="none", learning_rate=0.01,
+                      tune_batch_size=True)
+    assert c.pair_batch_size == 4096 and c.accumulate_grad_batches == 2
+    assert c.min_learning_rate == 0.0 and c.lr_decay == "none"
+    assert c.learning_rate == 0.01 and c.tune_batch_size is True
+    with pytest.raises(ValueError):
+        RDF2VecConfig(pair_batch_size=0)
+    with pytest.raises(ValueError):
+        RDF2VecConfig(accumulate_grad_batches=0)
+    with pytest.raises(ValueError):
+        RDF2VecConfig(lr_decay="exponential")
