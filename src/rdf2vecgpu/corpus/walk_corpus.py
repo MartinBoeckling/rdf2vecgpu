@@ -535,14 +535,14 @@ class MultiGPUWalkCorpus:
         dask_wait([walks_s, edge_attrs_s])
 
         # Combine the two aligned series partition-wise; each partition emits
-        # one row per walk. The meta must declare *list* columns — newer cudf
-        # reports list columns as `list`, not `object`, so a `dtype="object"`
-        # meta trips dask's check_meta ("Found: list / Expected: object").
-        # Derive the exact meta by running _walks_to_lists on a minimal
-        # stride-aligned dummy (walk_length is known from the cuGraph output).
-        _v0 = cudf.Series(cp.zeros(walk_length + 1, dtype="int32"))
-        _p0 = cudf.Series(cp.zeros(walk_length, dtype="int32"))
-        meta = _walks_to_lists(_v0, _p0, walk_length).iloc[:0]
+        # one row per walk. The meta must match the partitions *exactly*,
+        # including the list columns' leaf dtype — newer cudf reports list
+        # columns as `list` (not `object`) and dask's check_meta compares the
+        # full dtype, so a hand-built meta with the wrong leaf type still trips
+        # it ("Found: list / Expected: list"). Derive the meta by actually
+        # computing the first partition (cheap — `walks_s`/`edge_attrs_s` are
+        # already persisted, so this is just the reshape+to-list for one
+        # partition, not a re-walk).
         walks_delayed = walks_s.to_delayed()
         edges_delayed = edge_attrs_s.to_delayed()
         if len(walks_delayed) != len(edges_delayed):
@@ -554,6 +554,7 @@ class MultiGPUWalkCorpus:
             dask.delayed(_walks_to_lists)(walks_delayed[i], edges_delayed[i], walk_length)
             for i in range(len(walks_delayed))
         ]
+        meta = dask.compute(parts[0])[0].iloc[:0]
         sequences = dcudf.from_delayed(parts, meta=meta)
         sequences = sequences.persist()
         dask_wait(sequences)
