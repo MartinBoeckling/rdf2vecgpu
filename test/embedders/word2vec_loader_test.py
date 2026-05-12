@@ -22,3 +22,55 @@ def test_walks_per_pair_batch():
     assert walks_per_pair_batch(16384, 4, 5) == 273
     # never returns 0 even if pair_batch_size < pairs_per_walk.
     assert walks_per_pair_batch(10, 4, 5) == 1
+
+
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+
+
+@pytest.fixture
+def walk_seq_dir(tmp_path):
+    """One parquet 'part' file: 1000 walks, walk_depth=3 ⇒ vertices len 4,
+    predicates len 3. Walk indices encode their row number so we can check
+    re-slicing preserves order."""
+    d = tmp_path / "walks"
+    d.mkdir()
+    n = 1000
+    vs = (np.arange(n, dtype=np.int32)[:, None] * 10 + np.arange(4, dtype=np.int32)[None, :])
+    ps = (np.arange(n, dtype=np.int32)[:, None] * 10 + np.arange(3, dtype=np.int32)[None, :] + 100000)
+    tbl = pa.table({
+        "vertices": pa.array(list(vs), type=pa.list_(pa.int32())),
+        "predicates": pa.array(list(ps), type=pa.list_(pa.int32())),
+    })
+    pq.write_table(tbl, d / "part.0.parquet")
+    return str(d)
+
+
+def test_walkseq_iterable_reslices_in_order(walk_seq_dir):
+    from rdf2vecgpu.embedders.word2vec_loader import _WalkSeqIterable
+    it = _WalkSeqIterable(walk_seq_dir, emit_batch_size=128, read_chunk_size=256)
+    batches = list(iter(it))
+    # 1000 rows / 128 → 8 batches (sizes 128*7 + 104), regardless of the 256 read chunk.
+    assert [b[0].shape[0] for b in batches] == [128, 128, 128, 128, 128, 128, 128, 104]
+    v_all = np.concatenate([b[0] for b in batches], axis=0)
+    p_all = np.concatenate([b[1] for b in batches], axis=0)
+    assert v_all.dtype == np.int32 and p_all.dtype == np.int32
+    assert v_all.shape == (1000, 4) and p_all.shape == (1000, 3)
+    # rows came back in file order
+    np.testing.assert_array_equal(v_all[:, 0], np.arange(1000, dtype=np.int32) * 10)
+    np.testing.assert_array_equal(p_all[:, 0], np.arange(1000, dtype=np.int32) * 10 + 100000)
+
+
+def test_walk_sequence_datamodule_small_batches(walk_seq_dir):
+    import torch
+    from rdf2vecgpu.embedders.word2vec_loader import WalkSequenceDataModule
+    dm = WalkSequenceDataModule(walk_seq_dir, batch_size=128, num_workers=0, read_chunk_size=256)
+    batches = list(dm.train_dataloader())
+    assert len(batches) == 8
+    v, p = batches[0]
+    assert isinstance(v, torch.Tensor) and v.dtype == torch.int32
+    assert v.shape == (128, 4) and p.shape == (128, 3)
+    v_last, _ = batches[-1]
+    assert v_last.shape[0] == 104

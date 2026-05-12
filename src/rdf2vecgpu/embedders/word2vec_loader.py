@@ -367,12 +367,14 @@ def _flat_list_array_to_2d(col):
 
 
 class _WalkSeqIterable(IterableDataset):
-    """Streams a walks-as-sequences parquet directory; yields (vertices, predicates)
-    numpy int32 arrays of shape (n, depth+1) / (n, depth) per parquet row-batch.
+    """Streams a walks-as-sequences parquet directory. Reads each file in large
+    `read_chunk_size`-row PyArrow batches (cheap), decodes them vectorised, then
+    re-slices into `emit_batch_size`-row sub-batches and yields each as
+    (vertices, predicates) numpy int32 arrays of shape (n, depth+1) / (n, depth).
     Files are sharded across DataLoader workers (DDP-rank sharding is done by the
     caller, by trimming `.files`)."""
 
-    def __init__(self, walks_dir, batch_size=20_000):
+    def __init__(self, walks_dir, *, emit_batch_size, read_chunk_size=65_536):
         super().__init__()
         files = sorted(set(
             glob.glob(f"{walks_dir}/*.parquet")
@@ -381,20 +383,24 @@ class _WalkSeqIterable(IterableDataset):
         if not files:
             raise FileNotFoundError(f"no parquet under {walks_dir}")
         self.files = files
-        self.batch_size = batch_size
+        self.emit_batch_size = int(emit_batch_size)
+        self.read_chunk_size = int(read_chunk_size)
 
     def __iter__(self):
         wi = get_worker_info()
         n_w, w_id = (wi.num_workers, wi.id) if wi else (1, 0)
         my = [f for k, f in enumerate(self.files) if k % n_w == w_id]
+        eb = self.emit_batch_size
         for f in my:
             pf = pq.ParquetFile(f)
-            for b in pf.iter_batches(columns=["vertices", "predicates"], batch_size=self.batch_size):
+            for b in pf.iter_batches(columns=["vertices", "predicates"], batch_size=self.read_chunk_size):
                 v = _flat_list_array_to_2d(b.column("vertices"))
                 p = _flat_list_array_to_2d(b.column("predicates"))
-                if v.shape[0] == 0:
+                n = v.shape[0]
+                if n == 0:
                     continue
-                yield v, p
+                for s in range(0, n, eb):
+                    yield v[s:s + eb], p[s:s + eb]
 
 
 def _walkseq_collate(item):
@@ -407,15 +413,20 @@ class WalkSequenceDataModule(L.LightningDataModule):
     dir. `num_workers` overlaps parquet read+decode with the GPU step; in DDP the
     file list is sharded per rank in setup()."""
 
-    def __init__(self, walks_dir, *, batch_size, num_workers=0):
+    def __init__(self, walks_dir, *, batch_size, num_workers=0, read_chunk_size=65_536):
         super().__init__()
         self.walks_dir = walks_dir
-        self.batch_size = batch_size
+        self.batch_size = batch_size            # walks per yielded training batch
         self.num_workers = num_workers
+        self.read_chunk_size = read_chunk_size
         self._iterable = None
 
     def setup(self, stage=None):
-        ds = _WalkSeqIterable(self.walks_dir, batch_size=self.batch_size)
+        ds = _WalkSeqIterable(
+            self.walks_dir,
+            emit_batch_size=self.batch_size,
+            read_chunk_size=self.read_chunk_size,
+        )
         if self.trainer is not None and self.trainer.world_size > 1:
             rank, ws = self.trainer.global_rank, self.trainer.world_size
             ds.files = [f for i, f in enumerate(ds.files) if i % ws == rank]
