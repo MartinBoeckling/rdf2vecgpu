@@ -772,7 +772,14 @@ class GPU_RDF2Vec:
         import tempfile, shutil, os
         from dask.distributed import wait as dask_wait
 
-        n_gpus = max(1, torch.cuda.device_count())
+        # [spike] Single-GPU training even when the (now-torn-down) dask cluster
+        # used several GPUs for walk-gen. Lightning's SLURM DDP launcher requires
+        # --ntasks-per-node to match `devices`, which doesn't hold for a 1-task
+        # SLURM job with --gres=gpu:N; and the SkipGram model (sparse Embedding,
+        # ~vocab×dim) fits one 48 GB GPU comfortably. Multi-GPU DDP for this
+        # path is a Plan-1 concern (would need an srun --ntasks-per-node=N
+        # bootstrap or DataParallel).
+        n_gpus = 1
         with self.tracker.stage("Word2Vec_Training"):
             walk_dir = tempfile.mkdtemp(prefix="rdf2vec_pt_walks_")
             try:
