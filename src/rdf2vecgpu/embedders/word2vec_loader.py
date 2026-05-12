@@ -374,7 +374,8 @@ class _WalkSeqIterable(IterableDataset):
     Files are sharded across DataLoader workers (DDP-rank sharding is done by the
     caller, by trimming `.files`)."""
 
-    def __init__(self, walks_dir, *, emit_batch_size, read_chunk_size=65_536):
+    def __init__(self, walks_dir, *, emit_batch_size, read_chunk_size=262_144,
+                 shuffle=True, seed=0):
         super().__init__()
         files = sorted(set(
             glob.glob(f"{walks_dir}/*.parquet")
@@ -385,20 +386,43 @@ class _WalkSeqIterable(IterableDataset):
         self.files = files
         self.emit_batch_size = int(emit_batch_size)
         self.read_chunk_size = int(read_chunk_size)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        # epoch counter so successive epochs (Lightning re-iterates the dataloader)
+        # get a different shuffle. Bumped in __iter__.
+        self._epoch = -1
 
     def __iter__(self):
         wi = get_worker_info()
         n_w, w_id = (wi.num_workers, wi.id) if wi else (1, 0)
         my = [f for k, f in enumerate(self.files) if k % n_w == w_id]
         eb = self.emit_batch_size
-        for f in my:
+        self._epoch += 1
+        for f_idx, f in enumerate(my):
             pf = pq.ParquetFile(f)
-            for b in pf.iter_batches(columns=["vertices", "predicates"], batch_size=self.read_chunk_size):
+            for c_idx, b in enumerate(
+                pf.iter_batches(columns=["vertices", "predicates"], batch_size=self.read_chunk_size)
+            ):
                 v = _flat_list_array_to_2d(b.column("vertices"))
                 p = _flat_list_array_to_2d(b.column("predicates"))
                 n = v.shape[0]
                 if n == 0:
                     continue
+                if self.shuffle:
+                    # cuGraph emits the ~walk_number walks of each start vertex
+                    # consecutively; without this shuffle a vertex's walks clump
+                    # into one or two batches (over-aggregating its gradient /
+                    # hitting the grad clip, then absent the rest of the epoch).
+                    # Shuffling within the (large) read chunk spreads each
+                    # vertex's walks across ~read_chunk_size/emit_batch_size
+                    # batches. Seed mixes file index, chunk index, worker id and
+                    # epoch so it's deterministic-per-run but varies across.
+                    rng = np.random.default_rng(
+                        (self.seed, self._epoch, w_id, f_idx, c_idx)
+                    )
+                    perm = rng.permutation(n)
+                    v = v[perm]
+                    p = p[perm]
                 for s in range(0, n, eb):
                     yield v[s:s + eb], p[s:s + eb]
 
@@ -413,12 +437,15 @@ class WalkSequenceDataModule(L.LightningDataModule):
     dir. `num_workers` overlaps parquet read+decode with the GPU step; in DDP the
     file list is sharded per rank in setup()."""
 
-    def __init__(self, walks_dir, *, batch_size, num_workers=0, read_chunk_size=65_536):
+    def __init__(self, walks_dir, *, batch_size, num_workers=0, read_chunk_size=262_144,
+                 shuffle=True, seed=0):
         super().__init__()
         self.walks_dir = walks_dir
         self.batch_size = batch_size            # walks per yielded training batch
         self.num_workers = num_workers
         self.read_chunk_size = read_chunk_size
+        self.shuffle = shuffle
+        self.seed = seed
         self._iterable = None
 
     def setup(self, stage=None):
@@ -426,6 +453,8 @@ class WalkSequenceDataModule(L.LightningDataModule):
             self.walks_dir,
             emit_batch_size=self.batch_size,
             read_chunk_size=self.read_chunk_size,
+            shuffle=self.shuffle,
+            seed=self.seed,
         )
         if self.trainer is not None and self.trainer.world_size > 1:
             rank, ws = self.trainer.global_rank, self.trainer.world_size

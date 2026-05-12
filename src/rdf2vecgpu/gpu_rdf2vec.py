@@ -843,6 +843,8 @@ class GPU_RDF2Vec:
                     walks_parquet,
                     batch_size=walks_per_batch,
                     num_workers=self.config.cpu_count,
+                    shuffle=True,
+                    seed=self.config.random_state,
                 )
                 self.tracker.log_pytorch()
                 trainer = L.Trainer(
