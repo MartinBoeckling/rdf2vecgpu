@@ -16,6 +16,31 @@ from loguru import logger
 from .config import RDF2VecConfig
 
 
+def _token_counts_from_walk_parquet(walks_parquet: str, vocab_size: int):
+    """Count token occurrences over a walk-sequences parquet dir → numpy int64
+    array of length ``vocab_size`` (token id → count). Used to build the
+    subsampling keep-probabilities and the f^0.75 unigram negative distribution
+    for the PyTorch skip-gram path. Streams the parquet with pyarrow on CPU (the
+    dask cluster is already torn down by the time we train), summing a bincount of
+    the ``vertices`` and ``predicates`` list columns; ``-1`` (cuGraph walk
+    sentinels) are skipped, the ``0`` predicate padding on short walks is left in
+    (a tiny over-count of token 0, immaterial for sampling weights)."""
+    import glob
+    import numpy as np
+    import pyarrow.parquet as pq
+
+    counts = np.zeros(vocab_size, dtype=np.int64)
+    files = sorted(glob.glob(f"{walks_parquet}/*.parquet")) or [walks_parquet]
+    for fp in files:
+        tbl = pq.read_table(fp, columns=["vertices", "predicates"])
+        for col in ("vertices", "predicates"):
+            flat = tbl.column(col).combine_chunks().flatten().to_numpy(zero_copy_only=False)
+            flat = flat[flat >= 0]
+            if flat.size:
+                counts += np.bincount(flat, minlength=vocab_size)[:vocab_size]
+    return counts
+
+
 class GPU_RDF2Vec:
     def __init__(
         self,
@@ -818,11 +843,25 @@ class GPU_RDF2Vec:
                     self.config.pair_batch_size, self.config.walk_depth, self.config.window_size
                 )
                 steps_per_epoch = max(1, -(-n_walks // walks_per_batch))   # ceil
+
+                # Token-frequency table for subsampling / f^0.75 negatives (only
+                # when actually requested — it's a CPU pass over the walk parquet).
+                token_counts = None
+                if self.config.sample > 0 or self.config.negative_sampling == "unigram":
+                    logger.info("Counting walk-corpus token frequencies (for subsampling / unigram negatives)...")
+                    token_counts = _token_counts_from_walk_parquet(walks_parquet, self.word2idx.shape[0])
+                    logger.info(f"  token counts: total={int(token_counts.sum()):,} | "
+                                f"nonzero={int((token_counts > 0).sum()):,}/{token_counts.shape[0]:,} | "
+                                f"max={int(token_counts.max()):,}")
+
                 logger.info(
                     f"PyTorch skip-gram: {n_walks:,} walks | walks/batch={walks_per_batch} "
                     f"(~{self.config.pair_batch_size} pairs/step) | steps/epoch≈{steps_per_epoch} | "
-                    f"epochs={self.config.epochs} | lr {self.config.learning_rate}→{self.config.min_learning_rate} "
-                    f"({self.config.lr_decay}) | accumulate_grad_batches={self.config.accumulate_grad_batches} | grad_clip_value={self.config.grad_clip_value}"
+                    f"epochs={self.config.epochs} | optimizer={self.config.optimizer} | "
+                    f"lr {self.config.learning_rate}→{self.config.min_learning_rate} ({self.config.lr_decay}) | "
+                    f"accumulate_grad_batches={self.config.accumulate_grad_batches} | "
+                    f"grad_clip={self.config.grad_clip_value}/{self.config.grad_clip_mode} | "
+                    f"sample={self.config.sample} | negative_sampling={self.config.negative_sampling}"
                 )
 
                 model = SkipGram(
@@ -838,6 +877,11 @@ class GPU_RDF2Vec:
                     accumulate_grad_batches=self.config.accumulate_grad_batches,
                     steps_per_epoch=steps_per_epoch,
                     grad_clip_value=self.config.grad_clip_value,
+                    optimizer=self.config.optimizer,
+                    grad_clip_mode=self.config.grad_clip_mode,
+                    sample=self.config.sample,
+                    negative_sampling=self.config.negative_sampling,
+                    token_counts=token_counts,
                 )
                 datamodule = WalkSequenceDataModule(
                     walks_parquet,
@@ -868,12 +912,16 @@ class GPU_RDF2Vec:
                     "epochs": self.config.epochs,
                     "negative_samples": self.config.negative_samples,
                     "embedding_model": "skipgram",
+                    "optimizer": self.config.optimizer,
                     "learning_rate": self.config.learning_rate,
                     "min_learning_rate": self.config.min_learning_rate,
                     "lr_decay": self.config.lr_decay,
                     "pair_batch_size": self.config.pair_batch_size,
                     "accumulate_grad_batches": self.config.accumulate_grad_batches,
                     "grad_clip_value": self.config.grad_clip_value,
+                    "grad_clip_mode": self.config.grad_clip_mode,
+                    "sample": self.config.sample,
+                    "negative_sampling": self.config.negative_sampling,
                     "backend": "pytorch",
                     "corpus": "walk_sequences_onfly_gpu",
                 })

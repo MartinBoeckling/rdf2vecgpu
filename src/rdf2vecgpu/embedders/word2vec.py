@@ -20,10 +20,16 @@ class SkipGram(L.LightningModule):
         window=5,                     # for the on-GPU walk-sequence pair expansion
         accumulate_grad_batches=1,    # mirrors lightning.Trainer's setting
         steps_per_epoch=None,         # training batches/epoch; drives the LR decay length
-        grad_clip_value=0.1,          # per-element grad clamp |grad| ≤ this; 0 disables
+        grad_clip_value=0.1,          # grad clamp magnitude (see grad_clip_mode); 0 disables
+        optimizer="sgd",              # "sgd" | "sparseadam"
+        grad_clip_mode="element",     # "element": |grad|≤v per component; "row": ‖grad_row‖₂≤v
+        sample=0.0,                   # frequent-token subsampling threshold (gensim's `sample`); 0 disables
+        negative_sampling="uniform",  # "uniform" | "unigram" (classic f^0.75)
+        token_counts=None,            # 1-D array/tensor of corpus token counts, len == vocab_size;
+                                      # required when sample>0 or negative_sampling=="unigram"
     ):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["token_counts"])
         self.vocab_size = vocab_size
         self.learning_rate = learning_rate
         self.epochs = epochs
@@ -33,6 +39,24 @@ class SkipGram(L.LightningModule):
         self.accumulate_grad_batches = max(1, int(accumulate_grad_batches))
         self.steps_per_epoch = steps_per_epoch
         self.grad_clip_value = grad_clip_value
+        self.optimizer_name = optimizer
+        self.grad_clip_mode = grad_clip_mode
+        self.sample = float(sample)
+        self.negative_sampling = negative_sampling
+        # Token counts → lazily-built device tensors (built on first use, on the
+        # batch's device): `_p_keep` (subsampling keep-probability per token) and
+        # `_neg_cdf` (normalised cumulative f^0.75 weights for unigram negatives).
+        if token_counts is not None:
+            self._token_counts = torch.as_tensor(np.asarray(token_counts), dtype=torch.double).cpu()
+            if self._token_counts.numel() != vocab_size:
+                raise ValueError(
+                    f"token_counts length {self._token_counts.numel()} != vocab_size {vocab_size}")
+        else:
+            self._token_counts = None
+            if self.sample > 0 or self.negative_sampling == "unigram":
+                raise ValueError("sample>0 / negative_sampling='unigram' require token_counts")
+        self._p_keep = None
+        self._neg_cdf = None
 
         self.in_embeddings = nn.Embedding(vocab_size, embedding_dim, sparse=use_sparse)
         self.output_embeddings = nn.Embedding(
@@ -54,6 +78,35 @@ class SkipGram(L.LightningModule):
     def get_embeddings(self):
         """Entity-level embedding table used downstream (the input/syn0 table)."""
         return self.in_embeddings.weight.data
+
+    # ── frequent-token subsampling + unigram^0.75 negatives (built lazily on the
+    #    batch's device from `token_counts`) ────────────────────────────────────
+    def _get_p_keep(self, device):
+        """Per-token keep-probability for gensim-style subsampling: for token w
+        with corpus frequency z = count(w)/total, p_keep = (sqrt(z/sample) + 1) *
+        sample/z, clamped to ≤ 1 (rare tokens, z < sample, are always kept)."""
+        if self._p_keep is None or self._p_keep.device != device:
+            c = self._token_counts.to(device)
+            z = (c / c.sum().clamp(min=1.0)).clamp(min=1e-30)
+            p = (torch.sqrt(z / self.sample) + 1.0) * (self.sample / z)
+            self._p_keep = p.clamp(max=1.0).to(torch.float32)
+        return self._p_keep
+
+    def _get_neg_weights(self, device):
+        """Unnormalised f^0.75 unigram weights over the vocab (torch.multinomial
+        normalises). Tokens absent from the corpus get weight 0."""
+        if self._neg_cdf is None or self._neg_cdf.device != device:
+            self._neg_cdf = self._token_counts.to(device).clamp(min=0).pow(0.75).to(torch.float32)
+        return self._neg_cdf
+
+    def _sample_negatives(self, n_rows, device):
+        """(n_rows, neg_samples) negative token ids — uniform, or f^0.75 unigram."""
+        if self.negative_sampling == "unigram":
+            w = self._get_neg_weights(device)
+            return torch.multinomial(
+                w, n_rows * self.neg_samples, replacement=True
+            ).view(n_rows, self.neg_samples)
+        return torch.randint(0, self.vocab_size, (n_rows, self.neg_samples), device=device)
 
     def forward(self, center, context, negative):
         center_embed = self.in_embeddings(center)  # (batch, embed)
@@ -122,16 +175,23 @@ class SkipGram(L.LightningModule):
         keep = (
             (ii.unsqueeze(0) < valid_len.unsqueeze(1))
             & (jj.unsqueeze(0) < valid_len.unsqueeze(1))
-        ).reshape(-1)
+        )                                                       # (n, P)
+        if self.sample > 0:
+            # Frequent-token subsampling: independently drop each token *occurrence*
+            # in the walk with prob 1 - p_keep(token), then drop every skip-gram
+            # pair that touches a dropped occurrence. (No window-shift — the
+            # standard vectorised approximation; still thins the hot predicates.)
+            p_keep = self._get_p_keep(device)                   # (vocab,)
+            keep_tok = torch.rand((n, Lint), device=device) < p_keep[seq.clamp(min=0)]  # (n, Lint)
+            keep = keep & keep_tok[:, ii] & keep_tok[:, jj]
+        keep = keep.reshape(-1)
         return center[keep], context[keep]
 
     def _training_step_sequences(self, vertices, predicates):
         center, context = self._expand_skipgram(vertices, predicates)
         if center.numel() == 0:
             return torch.zeros((), device=center.device, requires_grad=True)
-        negative = torch.randint(
-            0, self.vocab_size, (center.size(0), self.neg_samples), device=center.device
-        )
+        negative = self._sample_negatives(center.size(0), center.device)
         loss = self(center, context, negative)
         self.log("train_loss", loss, prog_bar=True)
         return loss
@@ -141,9 +201,7 @@ class SkipGram(L.LightningModule):
         if a.dim() == 2:                       # (vertices, predicates) — walk-sequence path
             return self._training_step_sequences(a, b)
         center, context = a, b                 # legacy (center, context) pair path
-        negative = torch.randint(
-            0, self.vocab_size, (center.size(0), self.neg_samples), device=self.device
-        )
+        negative = self._sample_negatives(center.size(0), self.device)
         loss = self(center, context, negative)
         self.log("train_loss", loss, prog_bar=True)
         return loss
@@ -151,9 +209,18 @@ class SkipGram(L.LightningModule):
     def configure_optimizers(self):
         # Classic word2vec: plain SGD + linear LR decay (gensim's alpha schedule).
         # SGD also has zero adaptive state ⇒ the optimiser is O(touched rows) not
-        # O(vocab) when use_sparse=True. Decay per optimizer step when we know how
-        # many steps a run is (steps_per_epoch); otherwise per epoch.
-        opt = torch.optim.SGD(self.parameters(), lr=self.learning_rate)
+        # O(vocab) when use_sparse=True. `optimizer="sparseadam"` swaps in
+        # torch.optim.SparseAdam (adaptive per-parameter step sizes; requires all
+        # params to produce sparse grads — true when use_sparse=True; O(vocab)
+        # moment state, single-GPU only). The LR-decay schedule below applies to
+        # either optimizer (for SparseAdam it's a mild warmdown — a small start LR
+        # like 1e-3–5e-3 is what you'd pass via `learning_rate`).
+        if self.optimizer_name == "sparseadam" and self.use_sparse:
+            opt = torch.optim.SparseAdam(self.parameters(), lr=self.learning_rate)
+        elif self.optimizer_name == "sparseadam":
+            opt = torch.optim.Adam(self.parameters(), lr=self.learning_rate)   # dense fallback
+        else:
+            opt = torch.optim.SGD(self.parameters(), lr=self.learning_rate)
         if self.lr_decay != "linear" or self.epochs <= 1:
             return opt
         end_factor = max(self.min_learning_rate / self.learning_rate, 1e-12)
@@ -172,29 +239,45 @@ class SkipGram(L.LightningModule):
         return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "epoch"}}
 
     def on_after_backward(self):
-        # Per-element gradient clipping for the two embedding tables: with the
-        # `sum`-over-the-batch loss, a hot predicate token (RDF2Vec walk corpora
-        # have a few predicates that appear in a large fraction of every batch's
-        # pairs) accumulates a huge summed gradient → its SGD step ≫ init
-        # magnitude → fp32 overflow. Clamping each gradient element to
-        # [-grad_clip_value, +grad_clip_value] bounds a single step's per-component
-        # move at lr*grad_clip_value, killing the runaway while leaving the long
-        # tail of rarely-touched rows (small gradients) essentially unclipped.
+        # Gradient clipping for the two embedding tables. With the `sum`-over-the-
+        # batch loss, a hot predicate token (RDF2Vec walk corpora have a few
+        # predicates that appear in a large fraction of every batch's pairs)
+        # accumulates a huge summed gradient → its SGD step ≫ init magnitude →
+        # fp32 overflow. Two modes (config `grad_clip_mode`):
+        #   "element": clamp each gradient component to [-c, +c] — bounds a single
+        #     step's per-component move at lr*c; the long tail of rarely-touched
+        #     rows (small gradients) is essentially unclipped.
+        #   "row":     rescale each touched row's gradient so ‖row‖₂ ≤ c — a
+        #     geometry-aware cap on how far a row drifts per step that keeps the
+        #     gradient *direction* intact (element clamping distorts it toward the
+        #     box corners). For sparse grads this acts on the coalesced per-row
+        #     sums; rows with ‖·‖ ≤ c are left untouched.
         # Lightning's built-in `gradient_clip_val` uses `.clamp_`, which doesn't
         # support sparse tensors — hence this hook on the coalesced sparse grad.
         c = self.grad_clip_value
         if not c:
             return
+        row_mode = self.grad_clip_mode == "row"
         for emb in (self.in_embeddings, self.output_embeddings):
             g = emb.weight.grad
             if g is None:
                 continue
             if g.is_sparse:
-                g = g.coalesce()              # sum duplicate-index contributions, THEN clamp the per-row sum
-                g._values().clamp_(-c, c)
+                g = g.coalesce()              # sum duplicate-index contributions, THEN clip the per-row sum
+                v = g._values()
+                if row_mode:
+                    # v: (nnz_rows, dim) — one summed gradient row per touched token.
+                    norms = v.norm(dim=1, keepdim=True)
+                    v.mul_((c / norms.clamp(min=1e-12)).clamp(max=1.0))
+                else:
+                    v.clamp_(-c, c)
                 emb.weight.grad = g
             else:
-                g.clamp_(-c, c)
+                if row_mode:
+                    norms = g.norm(dim=1, keepdim=True)
+                    g.mul_((c / norms.clamp(min=1e-12)).clamp(max=1.0))
+                else:
+                    g.clamp_(-c, c)
 
 
 class CBOW(L.LightningModule):

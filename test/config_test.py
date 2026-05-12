@@ -94,3 +94,28 @@ def test_pytorch_convergence_config_overrides_and_validation():
         RDF2VecConfig(accumulate_grad_batches=0)
     with pytest.raises(ValueError):
         RDF2VecConfig(lr_decay="exponential")
+
+
+def test_pytorch_quality_knob_config_defaults():
+    c = RDF2VecConfig()
+    assert c.optimizer == "sgd"
+    assert c.sample == 0.0
+    assert c.negative_sampling == "uniform"
+    assert c.grad_clip_value == 0.1
+    assert c.grad_clip_mode == "element"
+
+
+def test_pytorch_quality_knob_config_overrides_and_validation():
+    c = RDF2VecConfig(optimizer="sparseadam", sample=1e-3, negative_sampling="unigram",
+                      grad_clip_value=0.5, grad_clip_mode="row", learning_rate=0.0025)
+    assert c.optimizer == "sparseadam" and c.sample == 1e-3
+    assert c.negative_sampling == "unigram"
+    assert c.grad_clip_value == 0.5 and c.grad_clip_mode == "row"
+    with pytest.raises(ValueError):
+        RDF2VecConfig(optimizer="adamw")
+    with pytest.raises(ValueError):
+        RDF2VecConfig(negative_sampling="zipf")
+    with pytest.raises(ValueError):
+        RDF2VecConfig(grad_clip_mode="global")
+    with pytest.raises(ValueError):
+        RDF2VecConfig(sample=-1.0)
