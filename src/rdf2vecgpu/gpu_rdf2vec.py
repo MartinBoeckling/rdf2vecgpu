@@ -822,7 +822,7 @@ class GPU_RDF2Vec:
                     f"PyTorch skip-gram: {n_walks:,} walks | walks/batch={walks_per_batch} "
                     f"(~{self.config.pair_batch_size} pairs/step) | steps/epoch≈{steps_per_epoch} | "
                     f"epochs={self.config.epochs} | lr {self.config.learning_rate}→{self.config.min_learning_rate} "
-                    f"({self.config.lr_decay}) | accumulate_grad_batches={self.config.accumulate_grad_batches}"
+                    f"({self.config.lr_decay}) | accumulate_grad_batches={self.config.accumulate_grad_batches} | grad_clip_value={self.config.grad_clip_value}"
                 )
 
                 model = SkipGram(
@@ -837,6 +837,7 @@ class GPU_RDF2Vec:
                     window=self.config.window_size,
                     accumulate_grad_batches=self.config.accumulate_grad_batches,
                     steps_per_epoch=steps_per_epoch,
+                    grad_clip_value=self.config.grad_clip_value,
                 )
                 datamodule = WalkSequenceDataModule(
                     walks_parquet,
@@ -870,6 +871,7 @@ class GPU_RDF2Vec:
                     "lr_decay": self.config.lr_decay,
                     "pair_batch_size": self.config.pair_batch_size,
                     "accumulate_grad_batches": self.config.accumulate_grad_batches,
+                    "grad_clip_value": self.config.grad_clip_value,
                     "backend": "pytorch",
                     "corpus": "walk_sequences_onfly_gpu",
                 })

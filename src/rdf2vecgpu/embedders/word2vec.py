@@ -20,6 +20,7 @@ class SkipGram(L.LightningModule):
         window=5,                     # for the on-GPU walk-sequence pair expansion
         accumulate_grad_batches=1,    # mirrors lightning.Trainer's setting
         steps_per_epoch=None,         # training batches/epoch; drives the LR decay length
+        grad_clip_value=0.1,          # per-element grad clamp |grad| ≤ this; 0 disables
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -31,6 +32,7 @@ class SkipGram(L.LightningModule):
         self.window = window
         self.accumulate_grad_batches = max(1, int(accumulate_grad_batches))
         self.steps_per_epoch = steps_per_epoch
+        self.grad_clip_value = grad_clip_value
 
         self.in_embeddings = nn.Embedding(vocab_size, embedding_dim, sparse=use_sparse)
         self.output_embeddings = nn.Embedding(
@@ -168,6 +170,31 @@ class SkipGram(L.LightningModule):
             opt, start_factor=1.0, end_factor=end_factor, total_iters=max(1, self.epochs - 1)
         )
         return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "epoch"}}
+
+    def on_after_backward(self):
+        # Per-element gradient clipping for the two embedding tables: with the
+        # `sum`-over-the-batch loss, a hot predicate token (RDF2Vec walk corpora
+        # have a few predicates that appear in a large fraction of every batch's
+        # pairs) accumulates a huge summed gradient → its SGD step ≫ init
+        # magnitude → fp32 overflow. Clamping each gradient element to
+        # [-grad_clip_value, +grad_clip_value] bounds a single step's per-component
+        # move at lr*grad_clip_value, killing the runaway while leaving the long
+        # tail of rarely-touched rows (small gradients) essentially unclipped.
+        # Lightning's built-in `gradient_clip_val` uses `.clamp_`, which doesn't
+        # support sparse tensors — hence this hook on the coalesced sparse grad.
+        c = self.grad_clip_value
+        if not c:
+            return
+        for emb in (self.in_embeddings, self.output_embeddings):
+            g = emb.weight.grad
+            if g is None:
+                continue
+            if g.is_sparse:
+                g = g.coalesce()              # sum duplicate-index contributions, THEN clamp the per-row sum
+                g._values().clamp_(-c, c)
+                emb.weight.grad = g
+            else:
+                g.clamp_(-c, c)
 
 
 class CBOW(L.LightningModule):

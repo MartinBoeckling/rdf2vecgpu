@@ -62,6 +62,15 @@ class RDF2VecConfig(BaseModel):
         (a few predicate tokens dominate the token frequency); the default
         16384 is a good GPU-efficient compromise.
 
+    grad_clip_value : float, default 0.1
+        PyTorch skip-gram (walk-sequence path): each gradient element of the
+        embedding tables is clamped to ``[-grad_clip_value, +grad_clip_value]``
+        after backward (caps a single SGD step's per-component move at
+        ``learning_rate * grad_clip_value``). This is what keeps training stable
+        on RDF2Vec walk corpora, where a few predicate tokens appear in a large
+        fraction of every batch's skip-gram pairs and the summed gradient on
+        those rows would otherwise blow up. ``0`` disables clipping.
+
     accumulate_grad_batches : int, default 1
         Thin pass-through to PyTorch Lightning's gradient accumulation.
         Increasing it enlarges the effective batch and is generally NOT
@@ -134,6 +143,7 @@ class RDF2VecConfig(BaseModel):
     min_learning_rate: float = Field(default=0.0001, ge=0)
     lr_decay: Literal["linear", "none"] = "linear"
     pair_batch_size: int = Field(default=16384, gt=0)
+    grad_clip_value: float = Field(default=0.1, ge=0)   # per-element gradient clamp |grad| ≤ this; 0 disables.
     # Thin pass-through to lightning.Trainer(accumulate_grad_batches=...). Note:
     # *increasing* this enlarges the effective batch (accumulate_grad_batches *
     # pair_batch_size pairs/step), which is generally counter-productive for

@@ -77,3 +77,28 @@ def test_skipgram_learns_clustered_cooccurrence():
     inter = sim[:10, 10:].mean()
     assert torch.isfinite(emb).all()
     assert intra.item() > inter.item() + 0.1, (intra.item(), inter.item())
+
+
+def test_skipgram_on_after_backward_clips_sparse_grad():
+    m = SkipGram(vocab_size=10, embedding_dim=4, neg_samples=2, grad_clip_value=0.1,
+                 use_sparse=True)
+    # craft a sparse COO grad for in_embeddings: row 1 appears TWICE (so the
+    # coalesced sum is 0.6 → must clamp to 0.1); row 3 appears once with 0.05
+    # (< 0.1 → must be left alone). output_embeddings.grad stays None (hook skips it).
+    idx = torch.tensor([[1, 1, 3]])
+    val = torch.tensor([[0.3, 0.3, 0.3, 0.3],
+                        [0.3, 0.3, 0.3, 0.3],
+                        [0.05, 0.05, 0.05, 0.05]])
+    m.in_embeddings.weight.grad = torch.sparse_coo_tensor(idx, val, size=(10, 4))
+    m.output_embeddings.weight.grad = None
+    m.on_after_backward()
+    dense = m.in_embeddings.weight.grad.coalesce().to_dense()
+    assert torch.allclose(dense[1], torch.full((4,), 0.1)), dense[1]   # 0.3+0.3=0.6 → clamped
+    assert torch.allclose(dense[3], torch.full((4,), 0.05)), dense[3]  # 0.05 → untouched
+    # disabled when grad_clip_value == 0
+    m2 = SkipGram(vocab_size=10, embedding_dim=4, neg_samples=2, grad_clip_value=0.0,
+                  use_sparse=True)
+    m2.in_embeddings.weight.grad = torch.sparse_coo_tensor(idx, val, size=(10, 4))
+    m2.output_embeddings.weight.grad = None
+    m2.on_after_backward()
+    assert torch.allclose(m2.in_embeddings.weight.grad.coalesce().to_dense()[1], torch.full((4,), 0.6))
