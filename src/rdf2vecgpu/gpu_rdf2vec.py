@@ -7,7 +7,7 @@ import dask
 from lightning.pytorch.tuner import Tuner
 from .helper.functions import _generate_vocab, cudf_to_torch_tensor
 from .embedders.word2vec import SkipGram, CBOW
-from .embedders.word2vec_loader import SkipGramDataModule, CBOWDataModule, ParquetSkipGramDataModule, WalkSequenceDataModule
+from .embedders.word2vec_loader import SkipGramDataModule, CBOWDataModule, ParquetSkipGramDataModule, WalkSequenceDataModule, walks_per_pair_batch
 from .reader.kg_file_reader import KGFileReader
 from .corpus.walk_corpus import SingleGPUWalkCorpus, MultiGPUWalkCorpus
 from .logger import build_tracker
@@ -764,34 +764,36 @@ class GPU_RDF2Vec:
                 shutil.rmtree(walk_dir, ignore_errors=True)
 
     def _fit_via_pytorch_sequences(self, walk_sequences) -> None:
-        """[spike] Train PyTorch skip-gram from walks-as-sequences: checkpoint the
+        """Train PyTorch skip-gram from walks-as-sequences: checkpoint the
         sequences to a temp parquet dir, tear down dask if multi-GPU, then train
-        via WalkSequenceDataModule + SkipGram (sparse Embedding + SGD + on-GPU pair
-        expansion). Hard-wired use_sparse/lr_decay/min_lr/window — no config flags
-        yet (that's Plan 1's clean implementation)."""
+        single-GPU via WalkSequenceDataModule + SkipGram. The DataModule yields
+        small walk-row batches sized to ~``config.pair_batch_size`` skip-gram
+        pairs each (so no hot predicate token is over-aggregated), and SkipGram
+        uses SGD + a linear LR decay (``config.learning_rate`` →
+        ``config.min_learning_rate``) stepped per optimizer step — classic
+        word2vec / gensim's alpha schedule."""
         import tempfile, shutil, os
         from dask.distributed import wait as dask_wait
 
-        # [spike] Single-GPU training even when the (now-torn-down) dask cluster
-        # used several GPUs for walk-gen. Lightning's SLURM DDP launcher requires
-        # --ntasks-per-node to match `devices`, which doesn't hold for a 1-task
-        # SLURM job with --gres=gpu:N; and the SkipGram model (sparse Embedding,
-        # ~vocab×dim) fits one 48 GB GPU comfortably. Multi-GPU DDP for this
-        # path is a Plan-1 concern (would need an srun --ntasks-per-node=N
-        # bootstrap or DataParallel).
+        # Single-GPU training even when the (now-torn-down) dask cluster used
+        # several GPUs for walk-gen: Lightning's SLURM DDP launcher needs
+        # --ntasks-per-node == devices, which doesn't hold for a 1-task SLURM
+        # job with --gres=gpu:N; and the SkipGram (sparse Embedding, ~vocab×dim)
+        # fits one 48 GB GPU. Multi-GPU DDP for this path is a follow-up.
         n_gpus = 1
         with self.tracker.stage("Word2Vec_Training"):
             walk_dir = tempfile.mkdtemp(prefix="rdf2vec_pt_walks_")
             try:
                 walks_parquet = f"{walk_dir}/walks"
                 logger.info(f"Checkpointing walk sequences to {walks_parquet}")
-                # discriminate dask_cudf vs cudf via `.persist` — both have `to_parquet`
-                # (the same latent bug exists in _fit_via_gensim; Plan 1 should fix both)
+                # discriminate dask_cudf vs cudf via `.persist` — both have `to_parquet`.
                 if hasattr(walk_sequences, "persist"):
                     walk_sequences = walk_sequences.persist()
                     dask_wait(walk_sequences)
+                    n_walks = int(len(walk_sequences))
                     walk_sequences.to_parquet(walks_parquet, write_index=False)
                 else:
+                    n_walks = int(len(walk_sequences))
                     os.makedirs(walks_parquet, exist_ok=True)
                     walk_sequences.to_parquet(f"{walks_parquet}/part.0.parquet", index=False)
                 if self.config.multi_gpu:
@@ -810,6 +812,19 @@ class GPU_RDF2Vec:
                     self.word2idx = self.word2idx.compute()
                 if self.config.reproducible:
                     L.seed_everything(self.config.random_state, workers=True)
+
+                # Size walk-row batches so each ≈ pair_batch_size skip-gram pairs.
+                walks_per_batch = walks_per_pair_batch(
+                    self.config.pair_batch_size, self.config.walk_depth, self.config.window_size
+                )
+                steps_per_epoch = max(1, -(-n_walks // walks_per_batch))   # ceil
+                logger.info(
+                    f"PyTorch skip-gram: {n_walks:,} walks | walks/batch={walks_per_batch} "
+                    f"(~{self.config.pair_batch_size} pairs/step) | steps/epoch≈{steps_per_epoch} | "
+                    f"epochs={self.config.epochs} | lr {self.config.learning_rate}→{self.config.min_learning_rate} "
+                    f"({self.config.lr_decay}) | accumulate_grad_batches={self.config.accumulate_grad_batches}"
+                )
+
                 model = SkipGram(
                     vocab_size=self.word2idx.shape[0],
                     embedding_dim=self.config.vector_size,
@@ -817,24 +832,27 @@ class GPU_RDF2Vec:
                     learning_rate=self.config.learning_rate,
                     use_sparse=True,
                     epochs=self.config.epochs,
-                    min_learning_rate=0.0001,
-                    lr_decay="linear",
+                    min_learning_rate=self.config.min_learning_rate,
+                    lr_decay=self.config.lr_decay,
                     window=self.config.window_size,
+                    accumulate_grad_batches=self.config.accumulate_grad_batches,
+                    steps_per_epoch=steps_per_epoch,
                 )
                 datamodule = WalkSequenceDataModule(
                     walks_parquet,
-                    batch_size=self.config.batch_size or 20_000,
+                    batch_size=walks_per_batch,
                     num_workers=self.config.cpu_count,
                 )
                 self.tracker.log_pytorch()
                 trainer = L.Trainer(
                     max_epochs=self.config.epochs,
-                    log_every_n_steps=50,
+                    log_every_n_steps=200,
                     accelerator="gpu",
                     precision=32,
                     devices=n_gpus,
                     strategy="ddp" if n_gpus > 1 else "auto",
                     num_nodes=self.config.num_nodes,
+                    accumulate_grad_batches=self.config.accumulate_grad_batches,
                     enable_checkpointing=False,
                     enable_progress_bar=False,
                 )
@@ -848,6 +866,10 @@ class GPU_RDF2Vec:
                     "negative_samples": self.config.negative_samples,
                     "embedding_model": "skipgram",
                     "learning_rate": self.config.learning_rate,
+                    "min_learning_rate": self.config.min_learning_rate,
+                    "lr_decay": self.config.lr_decay,
+                    "pair_batch_size": self.config.pair_batch_size,
+                    "accumulate_grad_batches": self.config.accumulate_grad_batches,
                     "backend": "pytorch",
                     "corpus": "walk_sequences_onfly_gpu",
                 })
