@@ -535,13 +535,14 @@ class MultiGPUWalkCorpus:
         dask_wait([walks_s, edge_attrs_s])
 
         # Combine the two aligned series partition-wise; each partition emits
-        # one row per walk.
-        meta = cudf.DataFrame(
-            {
-                "vertices": cudf.Series([], dtype="object"),
-                "predicates": cudf.Series([], dtype="object"),
-            }
-        )
+        # one row per walk. The meta must declare *list* columns — newer cudf
+        # reports list columns as `list`, not `object`, so a `dtype="object"`
+        # meta trips dask's check_meta ("Found: list / Expected: object").
+        # Derive the exact meta by running _walks_to_lists on a minimal
+        # stride-aligned dummy (walk_length is known from the cuGraph output).
+        _v0 = cudf.Series(cp.zeros(walk_length + 1, dtype="int32"))
+        _p0 = cudf.Series(cp.zeros(walk_length, dtype="int32"))
+        meta = _walks_to_lists(_v0, _p0, walk_length).iloc[:0]
         walks_delayed = walks_s.to_delayed()
         edges_delayed = edge_attrs_s.to_delayed()
         if len(walks_delayed) != len(edges_delayed):
