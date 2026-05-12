@@ -16,8 +16,10 @@ class SkipGram(L.LightningModule):
         use_sparse=True,
         epochs=5,
         min_learning_rate=0.0001,
-        lr_decay="linear",       # "linear" | "none"
-        window=5,                # for the on-GPU walk-sequence pair expansion
+        lr_decay="linear",            # "linear" | "none"
+        window=5,                     # for the on-GPU walk-sequence pair expansion
+        accumulate_grad_batches=1,    # mirrors lightning.Trainer's setting
+        steps_per_epoch=None,         # training batches/epoch; drives the LR decay length
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -27,6 +29,8 @@ class SkipGram(L.LightningModule):
         self.min_learning_rate = min_learning_rate
         self.lr_decay = lr_decay
         self.window = window
+        self.accumulate_grad_batches = max(1, int(accumulate_grad_batches))
+        self.steps_per_epoch = steps_per_epoch
 
         self.in_embeddings = nn.Embedding(vocab_size, embedding_dim, sparse=use_sparse)
         self.output_embeddings = nn.Embedding(
@@ -143,17 +147,27 @@ class SkipGram(L.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        # classic word2vec: plain SGD + linear LR decay (matches gensim's alpha
-        # schedule); SGD also has zero adaptive state ⇒ optimiser is O(touched rows)
-        # not O(vocab) when use_sparse=True. (SparseAdam available if a caller sets it.)
+        # Classic word2vec: plain SGD + linear LR decay (gensim's alpha schedule).
+        # SGD also has zero adaptive state ⇒ the optimiser is O(touched rows) not
+        # O(vocab) when use_sparse=True. Decay per optimizer step when we know how
+        # many steps a run is (steps_per_epoch); otherwise per epoch.
         opt = torch.optim.SGD(self.parameters(), lr=self.learning_rate)
         if self.lr_decay != "linear" or self.epochs <= 1:
             return opt
         end_factor = max(self.min_learning_rate / self.learning_rate, 1e-12)
-        scheduler = torch.optim.lr_scheduler.LinearLR(
-            opt, start_factor=1.0, end_factor=end_factor, total_iters=self.epochs - 1
+        if self.steps_per_epoch is not None:
+            opt_steps_per_epoch = -(-int(self.steps_per_epoch) // self.accumulate_grad_batches)  # ceil
+            opt_steps_per_epoch = max(1, opt_steps_per_epoch)
+            # last opt-step fires at min_lr (LinearLR clamps after total_iters), matching gensim's alpha clamp
+            total_iters = max(1, self.epochs * opt_steps_per_epoch - 1)
+            sched = torch.optim.lr_scheduler.LinearLR(
+                opt, start_factor=1.0, end_factor=end_factor, total_iters=total_iters
+            )
+            return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
+        sched = torch.optim.lr_scheduler.LinearLR(
+            opt, start_factor=1.0, end_factor=end_factor, total_iters=max(1, self.epochs - 1)
         )
-        return {"optimizer": opt, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "epoch"}}
 
 
 class CBOW(L.LightningModule):
