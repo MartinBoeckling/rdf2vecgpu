@@ -48,3 +48,32 @@ def test_skipgram_configure_optimizers_fallbacks():
     m3 = SkipGram(vocab_size=10, embedding_dim=4, neg_samples=2, epochs=1, lr_decay="linear",
                   steps_per_epoch=100)
     assert isinstance(m3.configure_optimizers(), torch.optim.SGD)
+
+
+def test_skipgram_learns_clustered_cooccurrence():
+    import lightning as L
+    from torch.utils.data import TensorDataset, DataLoader
+
+    L.seed_everything(0, workers=True)
+    g = torch.Generator().manual_seed(0)
+    n_pairs = 8000
+    centers = torch.randint(0, 20, (n_pairs,), generator=g)
+    cluster = centers // 10                                   # 0 for tokens 0..9, 1 for 10..19
+    context = (cluster * 10 + torch.randint(0, 10, (n_pairs,), generator=g)).long()
+    dl = DataLoader(TensorDataset(centers.long(), context), batch_size=64, shuffle=True,
+                    generator=torch.Generator().manual_seed(0))
+
+    epochs = 15
+    model = SkipGram(vocab_size=20, embedding_dim=8, neg_samples=3, learning_rate=0.1,
+                     epochs=epochs, min_learning_rate=1e-3, lr_decay="linear", window=2,
+                     steps_per_epoch=(n_pairs + 63) // 64)
+    trainer = L.Trainer(max_epochs=epochs, accelerator="cpu", logger=False,
+                        enable_checkpointing=False, enable_progress_bar=False)
+    trainer.fit(model, dl)
+
+    emb = torch.nn.functional.normalize(model.get_embeddings(), dim=1)
+    sim = emb @ emb.t()
+    intra = ((sim[:10, :10].sum() + sim[10:, 10:].sum()) - 20.0) / (2 * 90)   # exclude diagonal
+    inter = sim[:10, 10:].mean()
+    assert torch.isfinite(emb).all()
+    assert intra.item() > inter.item() + 0.1, (intra.item(), inter.item())
