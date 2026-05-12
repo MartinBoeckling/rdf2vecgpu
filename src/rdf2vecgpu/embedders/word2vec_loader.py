@@ -324,6 +324,32 @@ class OrderAwareCBOWDataModule(L.LightningDataModule):
 # --------------------------------------------------------------------------- #
 # Walk-sequence streaming (PyTorch backend's on-GPU pair-expansion corpus path)
 # --------------------------------------------------------------------------- #
+
+
+def skipgram_pairs_per_walk(walk_depth: int, window: int) -> int:
+    """Ordered (center, context) skip-gram pairs a *full-length* walk of depth
+    ``walk_depth`` produces with context window ``window``. The walk is the
+    interleaved vertices+predicates sequence of length ``L = 2 * walk_depth + 1``;
+    a pair ``(i, j)`` is produced for every ``0 <= i, j < L`` with
+    ``0 < |i - j| <= window``. (cuGraph-truncated short walks produce fewer
+    pairs — this is the upper bound.)"""
+    L = 2 * walk_depth + 1
+    total = 0
+    for i in range(L):
+        lo = max(0, i - window)
+        hi = min(L - 1, i + window)
+        total += (hi - lo + 1) - 1  # in-window positions, minus i itself
+    return total
+
+
+def walks_per_pair_batch(pair_batch_size: int, walk_depth: int, window: int) -> int:
+    """How many walk rows to put in one yielded training batch so that, after
+    on-GPU pair expansion, the batch holds about ``pair_batch_size`` skip-gram
+    pairs. Floors the division (so the realised batch is <= target) and never
+    returns 0."""
+    return max(1, pair_batch_size // skipgram_pairs_per_walk(walk_depth, window))
+
+
 def _flat_list_array_to_2d(col):
     """A pyarrow list<int> column where every row has the same length →
     a contiguous (n_rows, row_len) int32 numpy array — no per-row Python
