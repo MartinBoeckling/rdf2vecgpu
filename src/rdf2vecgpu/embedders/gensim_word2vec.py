@@ -212,6 +212,7 @@ def train_gensim_word2vec(
     random_state: int = 42,
     batch_size: int = 20_000,
     int_tokens: bool = True,
+    sample: float = 0.0,
 ):
     """Fit a gensim `Word2Vec` model on a walks-parquet directory.
 
@@ -238,6 +239,14 @@ def train_gensim_word2vec(
         ~20 GB RAM on Wikidata-scale corpora at the cost of one post-training
         join with `word2idx_df` to recover URI-keyed embeddings (handled in
         `gpu_rdf2vec._fit_via_gensim`).
+    sample : float, default 0.0
+        gensim's frequent-word subsampling threshold. Default **0** (disabled) —
+        unlike gensim's own default of 1e-3. For an RDF2Vec walk corpus the
+        predicate tokens dominate (a handful of distinct predicates, one between
+        every pair of vertices in every walk), so 1e-3 would drop the bulk of
+        their occurrences — a different objective from jRDF2Vec / the PyTorch
+        on-the-fly pair path (neither subsamples) and from the convention for
+        KG-token word2vec. Pass a positive value to re-enable it.
     """
     _require_gensim()
     sg = 1 if embedding_model == "skipgram" else 0
@@ -258,6 +267,7 @@ def train_gensim_word2vec(
         workers=workers,
         epochs=epochs,
         alpha=learning_rate,
+        sample=sample,
         seed=random_state,
     )
     return model
