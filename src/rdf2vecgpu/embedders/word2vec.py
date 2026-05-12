@@ -65,7 +65,14 @@ class SkipGram(L.LightningModule):
         neg_targets = torch.zeros_like(neg_score)
         neg_loss = self.loss_fn(neg_score, neg_targets).sum(dim=1)
 
-        return torch.mean(pos_loss + neg_loss)
+        # SUM over the batch of pairs, not mean: with `WalkSequenceDataModule`
+        # batching ~20k walks → ~1M (center, context) pairs/step, `torch.mean`
+        # divides every row's gradient by ~1M, so the effective per-pair SGD step
+        # becomes lr·(few/1M)·grad ≈ 1e-10 vs an init magnitude ~1/dim — the
+        # embeddings never move (loss flat at 0.693·(1+neg); spike's first DBpedia
+        # run came out ≈ random init). With `sum`, `lr` (0.025, decaying linearly)
+        # is the per-pair learning rate, matching classic word2vec / gensim.
+        return torch.sum(pos_loss + neg_loss)
 
     def _pair_template_for(self, L, device):
         """(ii, jj) long tensors on `device` of all (i, j) with 0 < |i-j| <= window,
