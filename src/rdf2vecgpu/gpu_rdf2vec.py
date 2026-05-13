@@ -35,6 +35,13 @@ def _token_counts_from_walk_parquet(walks_parquet: str, vocab_size: int):
         tbl = pq.read_table(fp, columns=["vertices", "predicates"])
         for col in ("vertices", "predicates"):
             flat = tbl.column(col).combine_chunks().flatten().to_numpy(zero_copy_only=False)
+            # pyarrow.to_numpy(zero_copy_only=False) on a list-flattened column may
+            # return float64 (with NaN for nulls) instead of the underlying int type
+            # when the chunked array has any null-handling. bincount requires ints
+            # and chokes on NaN — drop NaNs first, then coerce to int64.
+            if np.issubdtype(flat.dtype, np.floating):
+                flat = flat[~np.isnan(flat)]
+            flat = flat.astype(np.int64, copy=False)
             flat = flat[flat >= 0]
             if flat.size:
                 counts += np.bincount(flat, minlength=vocab_size)[:vocab_size]
