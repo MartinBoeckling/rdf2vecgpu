@@ -1134,18 +1134,23 @@ class GPU_RDF2Vec:
         transform emits zeros for them via `kv_to_token_aligned_matrix`'s
         default-zero fill) and makes `run_geval.py`'s all-zero-drop rule
         kick in downstream. See spec
-        `docs/superpowers/specs/2026-05-14-rdf2vecgpu-coverage-report-fix-design.md` §7.5.
+        `docs/superpowers/specs/2026-05-14-rdf2vecgpu-coverage-report-fix-design.md`
+        (Components §3 — "`transform` zeros un-walked rows"); RESULTS.md §7.5 is the
+        corresponding empirical results section.
         """
         import cupy as cp
 
         model_embeddings = (
             self.word2vec_model.get_embeddings().detach().cuda()
         )
-        # Convert via CuPy to avoid cudf from_dlpack column-major requirement
-        cp_arr = cp.from_dlpack(model_embeddings)
+        # Convert via CuPy to avoid cudf from_dlpack column-major requirement;
+        # .copy() gives us an owned buffer — cp.from_dlpack is zero-copy and
+        # would otherwise share GPU memory with the live model weights.
+        cp_arr = cp.from_dlpack(model_embeddings).copy()
         if self._walked_mask is not None:
-            # Zero un-walked rows (spec §7.5). cp.asarray keeps the operation
-            # on-GPU; mask is small (vocab_size bool ≈ 5 MB for 5 M tokens).
+            # Stay on-GPU: convert numpy bool mask to cupy, then zero in place
+            # on the OWNED copy (we copied above so the live model weights are
+            # not mutated — preserves transform()'s "pure transformation" contract).
             unwalked_idx = cp.asarray(~self._walked_mask)
             cp_arr[unwalked_idx] = 0.0
         model_embeddings_df = cudf.DataFrame(
