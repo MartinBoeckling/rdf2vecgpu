@@ -192,6 +192,7 @@ class GPU_RDF2Vec:
         self._validate_environment()
         # Initialize the cugraph graph
         self.knowledge_graph = MultiGraph(directed=True)
+        self._walked_mask = None  # set during fit; consumed by transform (spec §7.5)
         self.word2vec_model = None
         self.word2idx = None
         self.tracker = build_tracker(
@@ -851,15 +852,22 @@ class GPU_RDF2Vec:
                 )
                 steps_per_epoch = max(1, -(-n_walks // walks_per_batch))   # ceil
 
-                # Token-frequency table for subsampling / f^0.75 negatives (only
-                # when actually requested — it's a CPU pass over the walk parquet).
-                token_counts = None
-                if self.config.sample > 0 or self.config.negative_sampling == "unigram":
-                    logger.info("Counting walk-corpus token frequencies (for subsampling / unigram negatives)...")
-                    token_counts = _token_counts_from_walk_parquet(walks_parquet, self.word2idx.shape[0])
-                    logger.info(f"  token counts: total={int(token_counts.sum()):,} | "
-                                f"nonzero={int((token_counts > 0).sum()):,}/{token_counts.shape[0]:,} | "
-                                f"max={int(token_counts.max()):,}")
+                # Token-frequency table — always built. Two consumers:
+                # (1) subsampling / f^0.75 negatives, when enabled;
+                # (2) walked_mask for the coverage-report fix (spec §7.5) —
+                #     transform zeros un-walked rows so rdf2vecgpu_pytorch's
+                #     coverage report matches rdf2vecgpu_gensim's behaviour.
+                # Cost: one CPU pass over the walk parquet (~15 s on the full
+                # DBpedia subset; ~3 h training elsewhere → negligible).
+                logger.info("Counting walk-corpus token frequencies (for subsampling / unigram negatives / coverage mask)...")
+                token_counts = _token_counts_from_walk_parquet(walks_parquet, self.word2idx.shape[0])
+                logger.info(f"  token counts: total={int(token_counts.sum()):,} | "
+                            f"nonzero={int((token_counts > 0).sum()):,}/{token_counts.shape[0]:,} | "
+                            f"max={int(token_counts.max()):,}")
+                # walked_mask: True iff this token appeared as a vertex or predicate
+                # in at least one walk. Stored for transform() to zero un-walked rows.
+                self._walked_mask = (token_counts > 0)
+                logger.info(f"  walked_mask: {int(self._walked_mask.sum()):,}/{self._walked_mask.shape[0]:,} tokens touched by walks")
 
                 logger.info(
                     f"PyTorch skip-gram: {n_walks:,} walks | walks/batch={walks_per_batch} "
