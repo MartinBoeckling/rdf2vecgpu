@@ -5,7 +5,8 @@ from rdf2vecgpu.embedders.word2vec import SkipGram
 def test_skipgram_new_kwargs_accepted_and_stored():
     m = SkipGram(vocab_size=10, embedding_dim=4, neg_samples=2, learning_rate=0.025,
                  epochs=3, min_learning_rate=0.001, lr_decay="linear", window=5,
-                 accumulate_grad_batches=2, steps_per_epoch=50)
+                 accumulate_grad_batches=2, steps_per_epoch=50,
+                 sample=0.0, negative_sampling="uniform")
     assert m.epochs == 3 and m.window == 5
     assert m.accumulate_grad_batches == 2 and m.steps_per_epoch == 50
     assert m.in_embeddings.sparse is True and m.output_embeddings.sparse is True
@@ -15,7 +16,8 @@ def test_skipgram_new_kwargs_accepted_and_stored():
 def test_skipgram_configure_optimizers_per_step_lineardecay():
     m = SkipGram(vocab_size=10, embedding_dim=4, neg_samples=2, learning_rate=0.025,
                  epochs=4, min_learning_rate=0.0001, lr_decay="linear",
-                 accumulate_grad_batches=1, steps_per_epoch=25)
+                 accumulate_grad_batches=1, steps_per_epoch=25,
+                 sample=0.0, negative_sampling="uniform")
     out = m.configure_optimizers()
     assert isinstance(out, dict) and isinstance(out["optimizer"], torch.optim.SGD)
     assert out["optimizer"].param_groups[0]["lr"] == 0.025
@@ -29,7 +31,8 @@ def test_skipgram_configure_optimizers_per_step_lineardecay():
     # accumulate_grad_batches divides the optimizer-step count per epoch
     m2 = SkipGram(vocab_size=10, embedding_dim=4, neg_samples=2, learning_rate=0.025,
                   epochs=4, min_learning_rate=0.0001, lr_decay="linear",
-                  accumulate_grad_batches=5, steps_per_epoch=23)
+                  accumulate_grad_batches=5, steps_per_epoch=23,
+                  sample=0.0, negative_sampling="uniform")
     s2 = m2.configure_optimizers()["lr_scheduler"]["scheduler"]
     assert s2.total_iters == 4 * ((23 + 5 - 1) // 5) - 1         # ceil(23/5) = 5 → 4*5-1 = 19
 
@@ -37,16 +40,18 @@ def test_skipgram_configure_optimizers_per_step_lineardecay():
 def test_skipgram_configure_optimizers_fallbacks():
     # steps_per_epoch unknown → epoch-interval LinearLR
     m = SkipGram(vocab_size=10, embedding_dim=4, neg_samples=2, epochs=4,
-                 lr_decay="linear", steps_per_epoch=None)
+                 lr_decay="linear", steps_per_epoch=None,
+                 sample=0.0, negative_sampling="uniform")
     out = m.configure_optimizers()
     assert out["lr_scheduler"]["interval"] == "epoch"
     assert out["lr_scheduler"]["scheduler"].total_iters == 3
     # lr_decay="none" → plain SGD, no scheduler
-    m2 = SkipGram(vocab_size=10, embedding_dim=4, neg_samples=2, epochs=4, lr_decay="none")
+    m2 = SkipGram(vocab_size=10, embedding_dim=4, neg_samples=2, epochs=4, lr_decay="none",
+                  sample=0.0, negative_sampling="uniform")
     assert isinstance(m2.configure_optimizers(), torch.optim.SGD)
     # epochs <= 1 → plain SGD, no scheduler
     m3 = SkipGram(vocab_size=10, embedding_dim=4, neg_samples=2, epochs=1, lr_decay="linear",
-                  steps_per_epoch=100)
+                  steps_per_epoch=100, sample=0.0, negative_sampling="uniform")
     assert isinstance(m3.configure_optimizers(), torch.optim.SGD)
 
 
@@ -66,7 +71,8 @@ def test_skipgram_learns_clustered_cooccurrence():
     epochs = 15
     model = SkipGram(vocab_size=20, embedding_dim=8, neg_samples=3, learning_rate=0.1,
                      epochs=epochs, min_learning_rate=1e-3, lr_decay="linear", window=2,
-                     steps_per_epoch=(n_pairs + 63) // 64)
+                     steps_per_epoch=(n_pairs + 63) // 64,
+                     sample=0.0, negative_sampling="uniform")
     trainer = L.Trainer(max_epochs=epochs, accelerator="cpu", logger=False,
                         enable_checkpointing=False, enable_progress_bar=False)
     trainer.fit(model, dl)
@@ -81,7 +87,7 @@ def test_skipgram_learns_clustered_cooccurrence():
 
 def test_skipgram_on_after_backward_clips_sparse_grad():
     m = SkipGram(vocab_size=10, embedding_dim=4, neg_samples=2, grad_clip_value=0.1,
-                 use_sparse=True)
+                 use_sparse=True, sample=0.0, negative_sampling="uniform")
     # craft a sparse COO grad for in_embeddings: row 1 appears TWICE (so the
     # coalesced sum is 0.6 → must clamp to 0.1); row 3 appears once with 0.05
     # (< 0.1 → must be left alone). output_embeddings.grad stays None (hook skips it).
@@ -97,7 +103,7 @@ def test_skipgram_on_after_backward_clips_sparse_grad():
     assert torch.allclose(dense[3], torch.full((4,), 0.05)), dense[3]  # 0.05 → untouched
     # disabled when grad_clip_value == 0
     m2 = SkipGram(vocab_size=10, embedding_dim=4, neg_samples=2, grad_clip_value=0.0,
-                  use_sparse=True)
+                  use_sparse=True, sample=0.0, negative_sampling="uniform")
     m2.in_embeddings.weight.grad = torch.sparse_coo_tensor(idx, val, size=(10, 4))
     m2.output_embeddings.weight.grad = None
     m2.on_after_backward()
@@ -109,24 +115,26 @@ def test_skipgram_on_after_backward_clips_sparse_grad():
 def test_skipgram_optimizer_sparseadam():
     m = SkipGram(vocab_size=10, embedding_dim=4, neg_samples=2, learning_rate=0.0025,
                  use_sparse=True, epochs=4, lr_decay="linear", steps_per_epoch=25,
-                 optimizer="sparseadam")
+                 optimizer="sparseadam", sample=0.0, negative_sampling="uniform")
     out = m.configure_optimizers()
     assert isinstance(out, dict) and isinstance(out["optimizer"], torch.optim.SparseAdam)
     assert out["optimizer"].param_groups[0]["lr"] == 0.0025
     assert isinstance(out["lr_scheduler"]["scheduler"], torch.optim.lr_scheduler.LinearLR)
     # default is still SGD
     m2 = SkipGram(vocab_size=10, embedding_dim=4, neg_samples=2, epochs=4, lr_decay="linear",
-                  steps_per_epoch=25)
+                  steps_per_epoch=25, sample=0.0, negative_sampling="uniform")
     assert isinstance(m2.configure_optimizers()["optimizer"], torch.optim.SGD)
     # sparseadam + non-sparse embeddings → dense Adam fallback (SparseAdam can't take dense grads)
     m3 = SkipGram(vocab_size=10, embedding_dim=4, neg_samples=2, epochs=1, use_sparse=False,
-                  optimizer="sparseadam", lr_decay="none")
+                  optimizer="sparseadam", lr_decay="none",
+                  sample=0.0, negative_sampling="uniform")
     assert isinstance(m3.configure_optimizers(), torch.optim.Adam)
 
 
 def test_skipgram_on_after_backward_row_clip():
     m = SkipGram(vocab_size=10, embedding_dim=4, neg_samples=2, grad_clip_value=0.1,
-                 grad_clip_mode="row", use_sparse=True)
+                 grad_clip_mode="row", use_sparse=True,
+                 sample=0.0, negative_sampling="uniform")
     # row 1 twice (coalesced sum 0.6·1⃗ → ‖·‖₂ = 1.2 ≫ 0.1 → rescale to 0.1);
     # row 3 once with ‖·‖₂ = 0.05·2 = 0.1 exactly → boundary, must not blow up;
     # row 7 once with ‖·‖₂ = 0.01·2 = 0.02 < 0.1 → untouched.
@@ -145,7 +153,8 @@ def test_skipgram_on_after_backward_row_clip():
     assert torch.allclose(dense[7], val[3])                              # below threshold → untouched
     # dense path too
     md = SkipGram(vocab_size=4, embedding_dim=3, neg_samples=1, grad_clip_value=0.5,
-                  grad_clip_mode="row", use_sparse=False)
+                  grad_clip_mode="row", use_sparse=False,
+                  sample=0.0, negative_sampling="uniform")
     md.in_embeddings.weight.grad = torch.tensor([[3.0, 4.0, 0.0],       # ‖·‖=5 → scale to 0.5
                                                  [0.1, 0.0, 0.0],       # ‖·‖=0.1 → keep
                                                  [0.0, 0.0, 0.0],
@@ -182,7 +191,8 @@ def test_skipgram_unigram_negatives_follow_f075():
     assert (negs == 0).float().mean().item() > 0.95
     assert negs.min().item() >= 0 and negs.max().item() < 5
     # uniform default spreads across the vocab
-    mu = SkipGram(vocab_size=5, embedding_dim=4, neg_samples=4)
+    mu = SkipGram(vocab_size=5, embedding_dim=4, neg_samples=4,
+                  sample=0.0, negative_sampling="uniform")
     negs_u = mu._sample_negatives(2000, torch.device("cpu"))
     assert (negs_u == 0).float().mean().item() < 0.5
 

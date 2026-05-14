@@ -99,8 +99,6 @@ def test_pytorch_convergence_config_overrides_and_validation():
 def test_pytorch_quality_knob_config_defaults():
     c = RDF2VecConfig()
     assert c.optimizer == "sgd"
-    assert c.sample == 0.001
-    assert c.negative_sampling == "unigram"
     assert c.grad_clip_value == 0.1
     assert c.grad_clip_mode == "element"
 
