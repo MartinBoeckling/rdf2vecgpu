@@ -58,7 +58,7 @@ class RDF2VecConfig(BaseModel):
         hot predicate tokens and lift the rarely-touched tail; costs O(vocab)
         moment state and is single-GPU only (no DDP).
 
-    sample : float, default 0.0
+    sample : float, default 0.001
         PyTorch skip-gram (walk-sequence path): frequent-token subsampling
         threshold (gensim's ``sample``; ``0`` disables; ``1e-3`` is the classic
         word2vec value). When set, each token *occurrence* in a walk is kept with
@@ -68,7 +68,7 @@ class RDF2VecConfig(BaseModel):
         GPU by masking out skip-gram pairs that touch a subsampled-out occurrence
         (no window-shift), which still achieves the main effect.
 
-    negative_sampling : {"uniform", "unigram"}, default "uniform"
+    negative_sampling : {"uniform", "unigram"}, default "unigram"
         PyTorch skip-gram (walk-sequence path) negative-sample distribution.
         ``"uniform"`` draws negatives uniformly over the vocab. ``"unigram"`` uses
         the classic word2vec ``f^0.75`` unigram distribution (built from the walk
@@ -177,8 +177,8 @@ class RDF2VecConfig(BaseModel):
     # large → GPU-efficient). lr decays linearly learning_rate → min_learning_rate
     # over the run (classic word2vec / gensim's alpha schedule).
     optimizer: Literal["sgd", "sparseadam"] = "sgd"
-    sample: float = Field(default=0.0, ge=0)            # frequent-token subsampling (gensim's `sample`); 0 disables.
-    negative_sampling: Literal["uniform", "unigram"] = "uniform"   # "unigram" = classic f^0.75 negatives.
+    sample: float = Field(default=0.001, ge=0)          # frequent-token subsampling (gensim's `sample`); 0 disables. Default 1e-3 = gensim's classic recipe (overnight-sweep §7.4 sub_f075 validation).
+    negative_sampling: Literal["uniform", "unigram"] = "unigram"   # "unigram" = classic f^0.75 negatives (overnight-sweep §7.4 sub_f075 validation; "uniform" is opt-in).
     min_learning_rate: float = Field(default=0.0001, ge=0)
     lr_decay: Literal["linear", "none"] = "linear"
     pair_batch_size: int = Field(default=16384, gt=0)

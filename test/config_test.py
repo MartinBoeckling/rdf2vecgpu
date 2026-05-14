@@ -99,8 +99,8 @@ def test_pytorch_convergence_config_overrides_and_validation():
 def test_pytorch_quality_knob_config_defaults():
     c = RDF2VecConfig()
     assert c.optimizer == "sgd"
-    assert c.sample == 0.0
-    assert c.negative_sampling == "uniform"
+    assert c.sample == 0.001
+    assert c.negative_sampling == "unigram"
     assert c.grad_clip_value == 0.1
     assert c.grad_clip_mode == "element"
 
@@ -119,3 +119,14 @@ def test_pytorch_quality_knob_config_overrides_and_validation():
         RDF2VecConfig(grad_clip_mode="global")
     with pytest.raises(ValueError):
         RDF2VecConfig(sample=-1.0)
+
+
+def test_word2vec_config_default_sample_and_negative_sampling():
+    """Spec §7.4 sub_f075 defaults: sample=1e-3 + f^0.75 unigram negatives
+    are now the new defaults (overnight-sweep validated as a clean class +
+    regression win that never hurts training)."""
+    c = RDF2VecConfig()
+    assert c.sample == 0.001, f"expected sample=0.001, got {c.sample}"
+    assert c.negative_sampling == "unigram", (
+        f"expected negative_sampling='unigram', got {c.negative_sampling!r}"
+    )
