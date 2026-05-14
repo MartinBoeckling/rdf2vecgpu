@@ -23,8 +23,8 @@ class SkipGram(L.LightningModule):
         grad_clip_value=0.1,          # grad clamp magnitude (see grad_clip_mode); 0 disables
         optimizer="sgd",              # "sgd" | "sparseadam"
         grad_clip_mode="element",     # "element": |grad|≤v per component; "row": ‖grad_row‖₂≤v
-        sample=0.0,                   # frequent-token subsampling threshold (gensim's `sample`); 0 disables
-        negative_sampling="uniform",  # "uniform" | "unigram" (classic f^0.75)
+        sample=0.001,                 # frequent-token subsampling threshold (gensim's `sample`); 0 disables. Default 1e-3 = gensim's classic recipe (spec §7.4).
+        negative_sampling="unigram",  # "uniform" | "unigram" (classic f^0.75; default per spec §7.4).
         token_counts=None,            # 1-D array/tensor of corpus token counts, len == vocab_size;
                                       # required when sample>0 or negative_sampling=="unigram"
     ):

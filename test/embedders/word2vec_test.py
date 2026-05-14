@@ -218,3 +218,18 @@ def test_skipgram_subsampling_thins_hot_token_pairs():
     n_keep_pairs_off = int(((c_off != 0) & (x_off != 0)).sum())
     n_keep_pairs_on = int(((c_on != 0) & (x_on != 0)).sum())
     assert n_keep_pairs_on == n_keep_pairs_off, (n_keep_pairs_on, n_keep_pairs_off)
+
+
+def test_skipgram_default_sample_and_negative_sampling_match_config():
+    """SkipGram's __init__ defaults must mirror RDF2VecConfig (spec §7.4)."""
+    import numpy as np
+    import torch
+    from src.rdf2vecgpu.embedders.word2vec import SkipGram
+
+    # Defaults now require token_counts; passing minimal counts here.
+    counts = np.array([1, 1, 1, 1, 1, 1, 1, 1, 1, 1], dtype=np.int64)
+    m = SkipGram(vocab_size=10, embedding_dim=4, neg_samples=2, token_counts=counts)
+    assert m.sample == 0.001, f"expected sample=0.001, got {m.sample}"
+    assert m.negative_sampling == "unigram", (
+        f"expected negative_sampling='unigram', got {m.negative_sampling!r}"
+    )
