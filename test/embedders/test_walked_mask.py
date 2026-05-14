@@ -52,3 +52,62 @@ def test_walked_mask_attribute_is_initialised_to_none():
         "_walked_mask must be initialised to None in GpuRdf2Vec.__init__ "
         "(spec §7.5 backward-compat — legacy/unfitted instances skip masking)"
     )
+
+
+class _StubWord2VecModel:
+    """Mock for self.word2vec_model.get_embeddings() — returns a fixed tensor."""
+    def __init__(self, embeddings):
+        self._E = embeddings
+    def get_embeddings(self):
+        return self._E
+
+
+def _make_rdf2vec_stub(vocab_size, dim, walked_mask=None):
+    """Build a minimally populated GpuRdf2Vec instance bypassing __init__'s
+    GPU-dependent initialisation. Only what transform's pytorch branch needs."""
+    import cudf
+    import torch
+    from src.rdf2vecgpu.gpu_rdf2vec import GpuRdf2Vec
+
+    inst = GpuRdf2Vec.__new__(GpuRdf2Vec)
+    # Minimal config carrier — _extract_embeddings_pytorch only reads
+    # self.config.backend (already branched) and self.config.generate_artifact.
+    inst.config = type("C", (), {"backend": "pytorch", "generate_artifact": False})()
+    inst.word2idx = cudf.DataFrame({
+        "token": list(range(vocab_size)),
+        "word":  [f"w{i}" for i in range(vocab_size)],
+    })
+    embeddings = torch.ones(vocab_size, dim, dtype=torch.float32) * 0.5  # all 0.5
+    inst.word2vec_model = _StubWord2VecModel(embeddings)
+    inst._walked_mask = walked_mask
+    inst.tracker = type("T", (), {"stage": lambda self, name: __import__("contextlib").nullcontext()})()
+    return inst
+
+
+@pytest.mark.gpu
+def test_extract_embeddings_pytorch_zeros_unwalked_rows():
+    """transform → pytorch branch zeros rows where walked_mask is False."""
+    import numpy as np
+    vocab_size, dim = 6, 4
+    mask = np.array([True, False, True, False, True, False])
+    inst = _make_rdf2vec_stub(vocab_size, dim, walked_mask=mask)
+    df = inst._extract_embeddings_pytorch().to_pandas()
+
+    embedding_cols = [c for c in df.columns if c.startswith("embedding_")]
+    arr = df[embedding_cols].to_numpy()
+    # Walked rows: all 0.5; un-walked rows: all 0.0
+    assert np.allclose(arr[mask], 0.5)
+    assert np.allclose(arr[~mask], 0.0)
+
+
+@pytest.mark.gpu
+def test_extract_embeddings_pytorch_legacy_no_mask_unchanged():
+    """`_walked_mask is None` → no zeroing (legacy / unfitted behaviour)."""
+    import numpy as np
+    vocab_size, dim = 6, 4
+    inst = _make_rdf2vec_stub(vocab_size, dim, walked_mask=None)
+    df = inst._extract_embeddings_pytorch().to_pandas()
+
+    embedding_cols = [c for c in df.columns if c.startswith("embedding_")]
+    arr = df[embedding_cols].to_numpy()
+    assert np.allclose(arr, 0.5), "no mask → no zeroing"

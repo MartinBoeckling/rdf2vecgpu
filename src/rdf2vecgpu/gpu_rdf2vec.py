@@ -1125,7 +1125,17 @@ class GPU_RDF2Vec:
 
     def _extract_embeddings_pytorch(self) -> cudf.DataFrame:
         """Pull `[token, word, embedding_0..n]` cudf DataFrame from the
-        PyTorch trainer's in-embeddings weight matrix."""
+        PyTorch trainer's in-embeddings weight matrix.
+
+        When `self._walked_mask` is set (i.e. the model was fit on this
+        instance — the normal path), rows for tokens that never appeared in
+        any walk are zeroed before emission. This matches gensim's
+        behaviour (gensim drops un-walked tokens via min_count → its
+        transform emits zeros for them via `kv_to_token_aligned_matrix`'s
+        default-zero fill) and makes `run_geval.py`'s all-zero-drop rule
+        kick in downstream. See spec
+        `docs/superpowers/specs/2026-05-14-rdf2vecgpu-coverage-report-fix-design.md` §7.5.
+        """
         import cupy as cp
 
         model_embeddings = (
@@ -1133,6 +1143,11 @@ class GPU_RDF2Vec:
         )
         # Convert via CuPy to avoid cudf from_dlpack column-major requirement
         cp_arr = cp.from_dlpack(model_embeddings)
+        if self._walked_mask is not None:
+            # Zero un-walked rows (spec §7.5). cp.asarray keeps the operation
+            # on-GPU; mask is small (vocab_size bool ≈ 5 MB for 5 M tokens).
+            unwalked_idx = cp.asarray(~self._walked_mask)
+            cp_arr[unwalked_idx] = 0.0
         model_embeddings_df = cudf.DataFrame(
             {str(i): cp_arr[:, i] for i in range(cp_arr.shape[1])}
         )
