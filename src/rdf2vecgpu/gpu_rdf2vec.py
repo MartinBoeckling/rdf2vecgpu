@@ -743,6 +743,15 @@ class GPU_RDF2Vec:
                         f"{walks_parquet}/part.0.parquet", index=False
                     )
 
+                # Build walked_mask before tearing down dask / training: identical
+                # logic to the pytorch path, used here for the transform-time sanity
+                # assertion. See spec Components §3.
+                logger.info("Counting walk-corpus token frequencies for coverage mask...")
+                _vocab = self.word2idx.compute().shape[0] if hasattr(self.word2idx, "compute") else self.word2idx.shape[0]
+                _counts = _token_counts_from_walk_parquet(walks_parquet, _vocab)
+                self._walked_mask = (_counts > 0)
+                logger.info(f"  walked_mask: {int(self._walked_mask.sum()):,}/{self._walked_mask.shape[0]:,} tokens touched by walks")
+
                 # Free GPU resources before CPU-side gensim training. Mirrors
                 # the multi-GPU pytorch path's teardown so the gensim workers
                 # have full host RAM.
@@ -1187,6 +1196,28 @@ class GPU_RDF2Vec:
                 f"word2idx ({vectors.shape[0]:,}); "
                 f"{vectors.shape[0] - len(kv.index_to_key):,} tokens were "
                 f"filtered by min_count and will appear as zero embeddings."
+            )
+        # Sanity: every token gensim's KV emits must be in walked_mask. This
+        # catches a code regression where the bitmask logic and gensim's
+        # corpus-vocab logic diverge — they should be the same set (gensim's
+        # min_count drops tokens with corpus count < min_count; walked_mask
+        # drops tokens with corpus count == 0). See spec Components §3.
+        if self._walked_mask is not None:
+            import numpy as np
+            emitted_keys = set(kv.index_to_key)
+            # Map keys back to token ids via word2idx (token id == row index).
+            w2i = self.word2idx
+            if hasattr(w2i, "compute"):
+                w2i = w2i.compute()
+            word_col = w2i["word"].to_pandas() if hasattr(w2i["word"], "to_pandas") else w2i["word"]
+            token_col = w2i["token"].to_pandas() if hasattr(w2i["token"], "to_pandas") else w2i["token"]
+            word_to_token = dict(zip(word_col, token_col))
+            emitted_ids = {word_to_token[k] for k in emitted_keys if k in word_to_token}
+            walked_ids = set(np.flatnonzero(self._walked_mask).tolist())
+            stray = emitted_ids - walked_ids
+            assert not stray, (
+                f"gensim emitted {len(stray)} token id(s) not in walked_mask: "
+                f"{sorted(stray)[:10]}... — vocab/walk-parquet mismatch (spec Components §3)"
             )
         cp_arr = cp.asarray(vectors)
         model_embeddings_df = cudf.DataFrame(

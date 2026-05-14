@@ -111,3 +111,35 @@ def test_extract_embeddings_pytorch_legacy_no_mask_unchanged():
     embedding_cols = [c for c in df.columns if c.startswith("embedding_")]
     arr = df[embedding_cols].to_numpy()
     assert np.allclose(arr, 0.5), "no mask → no zeroing"
+
+
+def test_gensim_assertion_catches_mismatch(monkeypatch):
+    """The gensim transform sanity check fires when KV emits a token not in walked_mask."""
+    import numpy as np
+    import pandas as pd
+    import importlib
+    rdf_mod = importlib.import_module("src.rdf2vecgpu.gpu_rdf2vec")
+    GPU_RDF2Vec = rdf_mod.GPU_RDF2Vec
+
+    inst = GPU_RDF2Vec.__new__(GPU_RDF2Vec)
+    inst.config = type("C", (), {"backend": "gensim", "generate_artifact": False, "vector_size": 4})()
+    # Use a plain pandas DataFrame so no GPU is needed for the assertion path.
+    inst.word2idx = pd.DataFrame({
+        "token": [0, 1, 2, 3, 4],
+        "word":  [f"w{i}" for i in range(5)],
+    })
+    # Mock gensim KV with index_to_key = ["w0", "w2", "w4"] — token ids 0, 2, 4.
+    class _StubKV:
+        vector_size = 4
+        index_to_key = ["w0", "w2", "w4"]
+        def get_vector(self, key):
+            return np.full(4, 0.5, dtype=np.float32)
+        def __getitem__(self, key):
+            return np.full(4, 0.5, dtype=np.float32)
+    inst.word2vec_model = type("M", (), {"wv": _StubKV()})()
+    # walked_mask says only tokens {0, 4} are walked → gensim KV emits token 2 too
+    # → mismatch → expect AssertionError containing "walked_mask".
+    inst._walked_mask = np.array([True, False, False, False, True])
+    inst.tracker = type("T", (), {"stage": lambda self, name: __import__("contextlib").nullcontext()})()
+    with pytest.raises(AssertionError, match=r"walked_mask"):
+        inst._extract_embeddings_gensim()
