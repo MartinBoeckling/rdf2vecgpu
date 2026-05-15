@@ -160,6 +160,7 @@ class GPU_RDF2Vec:
         self._validate_environment()
         # Initialize the cugraph graph
         self.knowledge_graph = MultiGraph(directed=True)
+        self._walk_source_vertices = None  # set during fit (construct_graph); spec 2026-05-15 §1
         self.word2vec_model = None
         self.word2idx = None
         self.tracker = build_tracker(
@@ -445,6 +446,42 @@ class GPU_RDF2Vec:
         encoded_kg_data, word2idx = self.generate_vocab(kg_data)
         self.construct_graph(encoded_kg_data)
         return encoded_kg_data
+
+    def _resolve_walk_vertices(self, walk_vertices):
+        """Resolve the walk start-vertex set, routing around cuGraph .nodes().
+
+        cuGraph's MG `.nodes()` on a `renumber=False` graph empirically returns
+        only a fraction of the source-vertex set (~25% on the DBpedia subset);
+        instead we stash the actual `kg_data["subject"].unique()` during
+        `construct_graph` and consume it here. Callers can still override by
+        passing `walk_vertices` explicitly. Spec 2026-05-15 §1, §2.
+
+        Parameters
+        ----------
+        walk_vertices : cudf.Series, dcudf.Series, or None
+            If None, returns ``self._walk_source_vertices``. If provided,
+            returned unchanged (caller-supplied override).
+
+        Returns
+        -------
+        cudf.Series or dcudf.Series
+            The start-vertex set — int token IDs, one row per (vertex, walk)
+            pair *after* the caller's downstream `.repeat(walk_number)`.
+
+        Raises
+        ------
+        RuntimeError
+            If `walk_vertices` is None *and* the instance is un-fitted
+            (`self._walk_source_vertices is None`).
+        """
+        if walk_vertices is not None:
+            return walk_vertices
+        if self._walk_source_vertices is None:
+            raise RuntimeError(
+                "call fit() first, or pass walk_vertices explicitly — "
+                "_walk_source_vertices is unset (instance not yet fitted)"
+            )
+        return self._walk_source_vertices
 
     def walk_generation(
         self, edge_df: cudf.DataFrame, walk_vertices: cudf.Series = None
