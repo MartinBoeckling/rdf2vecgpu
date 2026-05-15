@@ -817,6 +817,10 @@ class GPU_RDF2Vec:
         import tempfile, shutil, os
         from dask.distributed import wait as dask_wait
 
+        # TF32 on Tensor Cores for the embedding inner-products (spec 2026-05-15 D6).
+        # "high" is the recommended Lightning setting; quality unchanged for skip-gram.
+        torch.set_float32_matmul_precision(self.config.matmul_precision)
+
         # Single-GPU training even when the (now-torn-down) dask cluster used
         # several GPUs for walk-gen: Lightning's SLURM DDP launcher needs
         # --ntasks-per-node == devices, which doesn't hold for a 1-task SLURM

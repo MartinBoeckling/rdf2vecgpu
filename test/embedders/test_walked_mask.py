@@ -143,3 +143,37 @@ def test_gensim_assertion_catches_mismatch(monkeypatch):
     inst.tracker = type("T", (), {"stage": lambda self, name: __import__("contextlib").nullcontext()})()
     with pytest.raises(AssertionError, match=r"walked_mask"):
         inst._extract_embeddings_gensim()
+
+
+def test_pytorch_fit_sets_matmul_precision(monkeypatch):
+    """Spec 2026-05-15 D6: _fit_via_pytorch_sequences applies matmul precision."""
+    import torch
+    from unittest.mock import MagicMock, patch
+    from rdf2vecgpu.config import RDF2VecConfig
+    from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    captured = {}
+    real_set = torch.set_float32_matmul_precision
+    def spy(v):
+        captured["value"] = v
+        real_set(v)
+    monkeypatch.setattr(torch, "set_float32_matmul_precision", spy)
+
+    # Bypass __init__ — call only the method, force early exit via empty walks
+    inst = GPU_RDF2Vec.__new__(GPU_RDF2Vec)
+    inst.config = RDF2VecConfig(multi_gpu=False, matmul_precision="medium")
+    inst.tracker = MagicMock()
+    inst.tracker.stage = MagicMock(return_value=MagicMock(
+        __enter__=lambda s: None, __exit__=lambda *a: None
+    ))
+    inst.word2idx = MagicMock()
+    inst.client = None
+    # Skip the rest of the method by raising inside walk_sequences handling
+    bad_walks = MagicMock()
+    bad_walks.persist = MagicMock(side_effect=RuntimeError("synthetic — short-circuit"))
+    bad_walks.__len__ = MagicMock(return_value=0)
+
+    with pytest.raises(RuntimeError, match="synthetic"):
+        inst._fit_via_pytorch_sequences(bad_walks)
+
+    assert captured.get("value") == "medium"
