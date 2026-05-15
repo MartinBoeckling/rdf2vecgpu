@@ -371,9 +371,24 @@ class GPU_RDF2Vec:
             # only a fraction of the source set (~25% on the DBpedia subset).
             # Compute from the encoded edge df directly while it's in scope —
             # int token IDs, same dtype cuGraph wants. Spec 2026-05-15 §1, D2.
+            #
+            # MG materialisation (2026-05-15, walk_coverage_v1 SLURM 246120
+            # diagnostic): dask_cudf.Series.unique() returns a 32-partition
+            # series with partition-local uniques + significant inter-partition
+            # overlap. When that partition-local layout is repeated via
+            # map_partitions and handed to cugraph.dask.uniform_random_walks,
+            # cuGraph apparently walks only the subset whose edges live on the
+            # local worker (observed: 22% of expected walks). Materialise to a
+            # single cudf.Series so the downstream walk-gen branch (the cudf
+            # path, not the dask_cudf map_partitions path) handles it — that
+            # path passes a coherent set through cuGraph and works correctly
+            # (verified single-GPU sliver 246119: 99.79% walked vs MG 45.08%).
             self._walk_source_vertices = kg_data["subject"].unique()
+            if hasattr(self._walk_source_vertices, "compute"):
+                self._walk_source_vertices = self._walk_source_vertices.compute()
             logger.info(
-                f"walk-source vertices stashed: type={type(self._walk_source_vertices).__name__}"
+                f"walk-source vertices stashed: type={type(self._walk_source_vertices).__name__} "
+                f"shape={self._walk_source_vertices.shape}"
             )
             if self.config.tracker != "none":
                 degree_df = self.knowledge_graph.degree()
