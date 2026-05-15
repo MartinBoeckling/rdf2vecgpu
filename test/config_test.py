@@ -72,7 +72,9 @@ def test_config_reject_invalid_tracker():
 
 def test_pytorch_convergence_config_defaults():
     c = RDF2VecConfig()
-    assert c.pair_batch_size == 16384
+    # 32768 = walk-coverage rewrite default (spec 2026-05-15); raised from 16384 for
+    # Lightning per-step overhead, convergence preconditions unchanged.
+    assert c.pair_batch_size == 32768
     assert c.accumulate_grad_batches == 1
     assert c.min_learning_rate == 0.0001
     assert c.lr_decay == "linear"

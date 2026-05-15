@@ -84,11 +84,11 @@ class RDF2VecConfig(BaseModel):
         ``learning_rate`` → ``min_learning_rate`` over the run (gensim's
         alpha schedule); "none" keeps it constant.
 
-    pair_batch_size : int, default 16384
+    pair_batch_size : int, default 32768
         PyTorch skip-gram (walk-sequence path): number of skip-gram pairs per
         SGD step. Small values stabilise training on RDF2Vec walk corpora
         (a few predicate tokens dominate the token frequency); the default
-        16384 is a good GPU-efficient compromise.
+        32768 is a good GPU-efficient compromise.
 
     grad_clip_value : float, default 0.1
         PyTorch skip-gram (walk-sequence path): the gradient clamp magnitude
@@ -181,7 +181,7 @@ class RDF2VecConfig(BaseModel):
     negative_sampling: Literal["uniform", "unigram"] = "unigram"   # "unigram" = classic f^0.75 negatives (overnight-sweep §7.4 sub_f075 validation; "uniform" is opt-in).
     min_learning_rate: float = Field(default=0.0001, ge=0)
     lr_decay: Literal["linear", "none"] = "linear"
-    pair_batch_size: int = Field(default=16384, gt=0)
+    pair_batch_size: int = Field(default=32768, gt=0)
     grad_clip_value: float = Field(default=0.1, ge=0)   # gradient clamp magnitude (see grad_clip_mode); 0 disables.
     grad_clip_mode: Literal["element", "row"] = "element"   # "element": |grad|≤v per component; "row": ‖grad_row‖₂≤v.
     # Thin pass-through to lightning.Trainer(accumulate_grad_batches=...). Note:
