@@ -416,12 +416,16 @@ class MultiGPUWalkCorpus:
         """Multi-GPU random-walk corpus builder (Skip-Gram / CBOW)."""
 
         edge_ddf = _ensure_dask_frame(edge_df)
-        if isinstance(walk_vertices, dcudf.Series):
-            start_vertices = walk_vertices
+        # cuGraph MG uniform/biased_random_walks expects start_vertices as a
+        # cudf.Series (NOT dask_cudf) — it internally calls dask_cudf.from_cudf
+        # to distribute. Passing dask_cudf.Series in confuses the distribution
+        # and silently walks only ~1/n_workers of starts. Materialise to
+        # cudf.Series. See cugraph/dask/sampling/uniform_random_walks.py:108-132
+        # and rdf2vecgpu spec 2026-05-15 walk-coverage rewrite diagnostic.
+        if hasattr(walk_vertices, "compute"):
+            start_vertices = walk_vertices.compute()
         else:
-            start_vertices = _ensure_dask_frame(
-                cudf.DataFrame({"v": walk_vertices})
-            )["v"]
+            start_vertices = walk_vertices
 
         walk_fn = dask_biased_random_walks if self.walk_weighted else dask_uniform_random_walks
         walk_label = "biased" if self.walk_weighted else "uniform"
@@ -508,12 +512,14 @@ class MultiGPUWalkCorpus:
         list columns; mirrors the parquet schema produced by `tools/walk_gen.py`,
         which is what `embedders.gensim_word2vec.WalkCorpus` consumes.
         """
-        if isinstance(walk_vertices, dcudf.Series):
-            start_vertices = walk_vertices
+        # cuGraph MG uniform/biased_random_walks expects start_vertices as a
+        # cudf.Series (NOT dask_cudf) — see random_walk method above for the
+        # full diagnostic. Materialise to cudf.Series; cuGraph distributes
+        # internally via dask_cudf.from_cudf.
+        if hasattr(walk_vertices, "compute"):
+            start_vertices = walk_vertices.compute()
         else:
-            start_vertices = _ensure_dask_frame(
-                cudf.DataFrame({"v": walk_vertices})
-            )["v"]
+            start_vertices = walk_vertices
 
         walk_fn = dask_biased_random_walks if self.walk_weighted else dask_uniform_random_walks
         walk_label = "biased" if self.walk_weighted else "uniform"
