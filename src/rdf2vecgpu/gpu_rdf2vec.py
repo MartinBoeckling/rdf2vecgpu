@@ -366,6 +366,15 @@ class GPU_RDF2Vec:
                 self.knowledge_graph.from_cudf_edgelist(
                     kg_data, **edge_kwargs
                 )
+            # Stash the actual source-vertex set for walk-gen. cuGraph's
+            # `.nodes()` on this MG / renumber=False config empirically returns
+            # only a fraction of the source set (~25% on the DBpedia subset).
+            # Compute from the encoded edge df directly while it's in scope —
+            # int token IDs, same dtype cuGraph wants. Spec 2026-05-15 §1, D2.
+            self._walk_source_vertices = kg_data["subject"].unique()
+            logger.info(
+                f"walk-source vertices stashed: type={type(self._walk_source_vertices).__name__}"
+            )
             if self.config.tracker != "none":
                 degree_df = self.knowledge_graph.degree()
                 degree_col = degree_df["degree"]
