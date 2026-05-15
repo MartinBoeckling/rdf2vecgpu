@@ -369,26 +369,29 @@ class GPU_RDF2Vec:
             # Stash the actual source-vertex set for walk-gen. cuGraph's
             # `.nodes()` on this MG / renumber=False config empirically returns
             # only a fraction of the source set (~25% on the DBpedia subset).
-            # Compute from the encoded edge df directly while it's in scope —
-            # int token IDs, same dtype cuGraph wants. Spec 2026-05-15 §1, D2.
+            # Compute from the encoded edge df directly. Spec 2026-05-15 §1, D2.
             #
-            # MG materialisation (2026-05-15, walk_coverage_v1 SLURM 246120
-            # diagnostic): dask_cudf.Series.unique() returns a 32-partition
-            # series with partition-local uniques + significant inter-partition
-            # overlap. When that partition-local layout is repeated via
-            # map_partitions and handed to cugraph.dask.uniform_random_walks,
-            # cuGraph apparently walks only the subset whose edges live on the
-            # local worker (observed: 22% of expected walks). Materialise to a
-            # single cudf.Series so the downstream walk-gen branch (the cudf
-            # path, not the dask_cudf map_partitions path) handles it — that
-            # path passes a coherent set through cuGraph and works correctly
-            # (verified single-GPU sliver 246119: 99.79% walked vs MG 45.08%).
-            self._walk_source_vertices = kg_data["subject"].unique()
-            if hasattr(self._walk_source_vertices, "compute"):
-                self._walk_source_vertices = self._walk_source_vertices.compute()
+            # MG dedup choice (2026-05-15 diagnostic loop):
+            #   1. `.unique()` returns a multi-partition series with PARTITION-
+            #      LOCAL uniques + inter-partition overlap → cuGraph silently
+            #      walks only 22% of starts (SLURM 246120: walked_mask 45%).
+            #   2. `.unique().compute()` gives a single cudf.Series of 4.19M;
+            #      `_ensure_dask_frame` then puts the whole `.repeat(N)`-ed
+            #      series on ONE worker → 4.68 GiB graph payload + 419M-element
+            #      cudf.Series, OOMs the worker (SLURM 246159: 95% memory
+            #      exceeded → worker restart loop).
+            #   3. `drop_duplicates()` (this branch) does a global shuffle +
+            #      dedup, returning a multi-partition dask_cudf.Series with
+            #      DISJOINT partitions — same pattern cuGraph's own internal
+            #      `.nodes()` uses (`concat([src,dst]).drop_duplicates()`).
+            #      cuGraph MG walk-gen handles this layout correctly without
+            #      cross-partition dropping or single-worker concentration.
+            self._walk_source_vertices = (
+                kg_data[["subject"]].drop_duplicates()["subject"]
+            )
             logger.info(
                 f"walk-source vertices stashed: type={type(self._walk_source_vertices).__name__} "
-                f"shape={self._walk_source_vertices.shape}"
+                f"(via drop_duplicates; cuGraph-friendly partitioning)"
             )
             if self.config.tracker != "none":
                 degree_df = self.knowledge_graph.degree()
