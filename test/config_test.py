@@ -130,3 +130,20 @@ def test_word2vec_config_default_sample_and_negative_sampling():
     assert c.negative_sampling == "unigram", (
         f"expected negative_sampling='unigram', got {c.negative_sampling!r}"
     )
+
+
+def test_matmul_precision_default_is_high():
+    """Spec 2026-05-15 D6: default to TF32 on Tensor Cores."""
+    cfg = RDF2VecConfig()
+    assert cfg.matmul_precision == "high"
+
+
+def test_matmul_precision_accepts_all_literals():
+    for v in ("highest", "high", "medium"):
+        assert RDF2VecConfig(matmul_precision=v).matmul_precision == v
+
+
+def test_matmul_precision_rejects_invalid():
+    import pydantic
+    with pytest.raises(pydantic.ValidationError):
+        RDF2VecConfig(matmul_precision="low")

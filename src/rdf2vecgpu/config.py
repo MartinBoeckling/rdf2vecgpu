@@ -90,6 +90,10 @@ class RDF2VecConfig(BaseModel):
         (a few predicate tokens dominate the token frequency); the default
         32768 is a good GPU-efficient compromise.
 
+    matmul_precision : {"highest", "high", "medium"}, default "high"
+        torch.set_float32_matmul_precision setting; "high" enables TF32 on
+        A100/A6000 Tensor Cores for the embedding inner-products.
+
     grad_clip_value : float, default 0.1
         PyTorch skip-gram (walk-sequence path): the gradient clamp magnitude
         (see ``grad_clip_mode``); caps a single SGD step's move. This is what
@@ -182,6 +186,13 @@ class RDF2VecConfig(BaseModel):
     min_learning_rate: float = Field(default=0.0001, ge=0)
     lr_decay: Literal["linear", "none"] = "linear"
     pair_batch_size: int = Field(default=32768, gt=0)
+    matmul_precision: Literal["highest", "high", "medium"] = "high"
+    # torch.set_float32_matmul_precision value. "high" enables TF32 on
+    # A100/A6000 Tensor Cores for ~15-25% throughput on the embedding
+    # inner-products. Quality unchanged for skip-gram (200-dim dot products
+    # are well within TF32 precision; sparse-scatter SGD updates aren't
+    # affected). "highest" = fp32 (slower); "medium" = bf16 (faster, slight
+    # quality risk). Spec 2026-05-15 D6.
     grad_clip_value: float = Field(default=0.1, ge=0)   # gradient clamp magnitude (see grad_clip_mode); 0 disables.
     grad_clip_mode: Literal["element", "row"] = "element"   # "element": |grad|≤v per component; "row": ‖grad_row‖₂≤v.
     # Thin pass-through to lightning.Trainer(accumulate_grad_batches=...). Note:
