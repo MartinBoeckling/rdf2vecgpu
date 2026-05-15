@@ -1224,6 +1224,13 @@ class GPU_RDF2Vec:
             # not mutated — preserves transform()'s "pure transformation" contract).
             unwalked_idx = cp.asarray(~self._walked_mask)
             cp_arr[unwalked_idx] = 0.0
+        if self.config.normalize_embeddings:
+            # L2-normalize each row; zero rows stay zero (divide by safe_norms=1
+            # for them so 0.0 / 1.0 = 0.0). Mathematically identical to
+            # run_geval.py --l2-normalize. RESULTS §7.1 / §7.3.
+            norms = cp.linalg.norm(cp_arr, axis=1, keepdims=True)
+            safe_norms = cp.where(norms > 0, norms, 1.0)
+            cp_arr = cp_arr / safe_norms
         model_embeddings_df = cudf.DataFrame(
             {str(i): cp_arr[:, i] for i in range(cp_arr.shape[1])}
         )
@@ -1282,6 +1289,12 @@ class GPU_RDF2Vec:
                 f"{sorted(stray)[:10]}... — vocab/walk-parquet mismatch (spec Components §3)"
             )
         cp_arr = cp.asarray(vectors)
+        if self.config.normalize_embeddings:
+            # L2-normalize each row; zero rows (gensim min_count-dropped) stay
+            # zero. Symmetric with the pytorch extract path above.
+            norms = cp.linalg.norm(cp_arr, axis=1, keepdims=True)
+            safe_norms = cp.where(norms > 0, norms, 1.0)
+            cp_arr = cp_arr / safe_norms
         model_embeddings_df = cudf.DataFrame(
             {str(i): cp_arr[:, i] for i in range(cp_arr.shape[1])}
         )

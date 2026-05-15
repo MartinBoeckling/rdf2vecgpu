@@ -147,3 +147,14 @@ def test_matmul_precision_rejects_invalid():
     import pydantic
     with pytest.raises(pydantic.ValidationError):
         RDF2VecConfig(matmul_precision="low")
+
+
+def test_normalize_embeddings_default_is_false():
+    """Spec 2026-05-15 L2-on-transform: default OFF (back-compat); opt-in."""
+    cfg = RDF2VecConfig()
+    assert cfg.normalize_embeddings is False
+
+
+def test_normalize_embeddings_accepts_true():
+    cfg = RDF2VecConfig(normalize_embeddings=True)
+    assert cfg.normalize_embeddings is True

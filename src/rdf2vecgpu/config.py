@@ -195,6 +195,15 @@ class RDF2VecConfig(BaseModel):
     # quality risk). Spec 2026-05-15 D6.
     grad_clip_value: float = Field(default=0.1, ge=0)   # gradient clamp magnitude (see grad_clip_mode); 0 disables.
     grad_clip_mode: Literal["element", "row"] = "element"   # "element": |grad|≤v per component; "row": ‖grad_row‖₂≤v.
+    normalize_embeddings: bool = False
+    # L2-normalize each emitted embedding row at transform time. Off by default
+    # (back-compat). When on: every non-zero row is rescaled to unit L2 norm;
+    # zero rows (un-walked tokens per walked_mask, or gensim min_count-dropped
+    # tokens) stay zero. Mathematically identical to run_geval.py's
+    # `--l2-normalize` flag. RESULTS §7.1 / §7.3 show this fixes the
+    # regression-Cities norm-pathology artifact (Δ ~−48% → ~−6.5% with raw
+    # coverage; ~−6.9% combined with walked-only export). Adopt on export
+    # when serving the trained model to scale-sensitive downstreams.
     # Thin pass-through to lightning.Trainer(accumulate_grad_batches=...). Note:
     # *increasing* this enlarges the effective batch (accumulate_grad_batches *
     # pair_batch_size pairs/step), which is generally counter-productive for
