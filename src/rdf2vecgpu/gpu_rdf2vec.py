@@ -542,8 +542,7 @@ class GPU_RDF2Vec:
                     walk_weighted=self.config.walk_weighted,
                 )
             if self.config.walk_strategy == "random":
-                if walk_vertices is None:
-                    walk_vertices = self.knowledge_graph.nodes()
+                walk_vertices = self._resolve_walk_vertices(walk_vertices)
                 # Repeat each vertex walk_number times for walk start points
                 n = self.config.walk_number
                 if hasattr(walk_vertices, "map_partitions"):
@@ -561,8 +560,7 @@ class GPU_RDF2Vec:
                     min_count=self.config.min_count,
                 )
             elif self.config.walk_strategy == "bfs":
-                if walk_vertices is None:
-                    walk_vertices = self.knowledge_graph.nodes()
+                walk_vertices = self._resolve_walk_vertices(walk_vertices)
                 walk_corpus = walk_instance.bfs_walk(
                     edge_df=edge_df,
                     walk_vertices=walk_vertices,
@@ -618,8 +616,7 @@ class GPU_RDF2Vec:
                     f"only (got {self.config.walk_strategy!r}). bfs+gensim would "
                     f"need a parallel sequences output on bfs_walk."
                 )
-            if walk_vertices is None:
-                walk_vertices = self.knowledge_graph.nodes()
+            walk_vertices = self._resolve_walk_vertices(walk_vertices)
             n = self.config.walk_number
             if hasattr(walk_vertices, "map_partitions"):
                 walk_vertices = walk_vertices.map_partitions(
