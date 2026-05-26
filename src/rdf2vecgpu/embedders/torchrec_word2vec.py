@@ -472,7 +472,243 @@ def _maybe_resume_checkpoint(
     return int(meta["epoch"]), int(meta["global_step"])
 
 
-def train_torchrec_word2vec(model, edge_df, walk_vertices):
-    raise NotImplementedError(
-        "train_torchrec_word2vec is a stub — implemented in Task 11."
+def train_torchrec_word2vec(rdf2vec, edge_df, walk_vertices) -> None:
+    """Top-level training entry point for the torchrec backend.
+
+    Called from :meth:`GPU_RDF2Vec._fit_via_torchrec` once pre-flight
+    checks have passed. ``rdf2vec`` is the :class:`GPU_RDF2Vec`
+    instance, which owns the config, the tracker, and the walk-corpus
+    machinery.
+
+    Implementation notes
+    --------------------
+    * Walks are generated via the multi-GPU walk-sequence path and
+      checkpointed to a temp parquet directory so the (eventually
+      torn-down) dask cluster does not have to stay alive through
+      training.
+    * Vocab build and pair-loader construction live on the rdf2vec
+      instance as helpers (:meth:`_build_vocab_for_walks`,
+      :meth:`_build_walk_pair_loader`) — see ``gpu_rdf2vec.py``.
+    * All embedding parameters are fused via
+      ``apply_optimizer_in_backward``; the standalone optimizer is a
+      ``_NullOptimizer`` whose ``state_dict()`` is empty (DCP still
+      requires *some* optimizer object to round-trip).
+    """
+    import time
+
+    import torch
+    from lightning.fabric import Fabric
+    from torchrec.distributed.model_parallel import DistributedModelParallel
+    from torchrec.optim import apply_optimizer_in_backward
+
+    cfg = rdf2vec.config
+
+    # 1. Walk generation — backend-agnostic; uses existing multi-GPU path.
+    #    `walk_generation_sequences` returns an (eager / dask) cudf frame
+    #    of walks-as-sequences. We checkpoint it to a temp parquet dir so
+    #    the dask cluster can be torn down before model construction and
+    #    the resume path can identity-check vocab+walks against disk
+    #    artefacts. The dir is intentionally *not* cleaned up here —
+    #    DCP-resumed runs need both walks and vocab present on disk for
+    #    `_maybe_resume_checkpoint` to validate identity. Callers that
+    #    don't checkpoint can rely on the OS tempfile cleanup at shutdown.
+    walks_seq = rdf2vec.walk_generation_sequences(
+        edge_df=edge_df, walk_vertices=walk_vertices,
     )
+    walks_path = _materialize_walks_sequences_to_parquet(walks_seq)
+
+    # 2. Vocab build / load — returns the existing word2idx (built upstream
+    #    by load_data()), token-frequency counts from the walks parquet,
+    #    and an on-disk vocab parquet path used to identity-check resumes.
+    vocab_df, token_counts, vocab_path = rdf2vec._build_vocab_for_walks(walks_path)
+    vocab_size = len(vocab_df)
+
+    # 3. Fabric.
+    fabric = Fabric(
+        accelerator="gpu",
+        devices="auto",
+        precision=_fabric_precision_from_config(cfg),
+    )
+    fabric.launch()
+
+    # 4. Build the sharded model + plan + DMP wrap.
+    model = ShardedSkipGramModel(
+        vocab_size=vocab_size, embedding_dim=cfg.vector_size,
+    ).to(fabric.device)
+    plan = _build_sharding_plan(model, world_size=fabric.world_size, device=fabric.device)
+    model = DistributedModelParallel(
+        module=model, device=fabric.device, plan=plan, init_data_parallel=False,
+    )
+
+    # 5. Fused optimizer via apply_optimizer_in_backward — all skip-gram
+    #    params live in sharded embedding tables, so the entire update
+    #    fuses into the backward pass. The standalone optimizer below is
+    #    a no-op stand-in (its state_dict()/load_state_dict() round-trip
+    #    through DCP cleanly even though there's nothing to save).
+    fused_cls, fused_kwargs = _fused_optimizer_from_config(cfg)
+    apply_optimizer_in_backward(
+        fused_cls, model.parameters(), fused_kwargs,
+    )
+    optimizer = _NullOptimizer()
+
+    # 6. Maybe resume.
+    start_epoch, start_step = _maybe_resume_checkpoint(
+        model, optimizer,
+        checkpoint_dir=cfg.checkpoint_dir,
+        overwrite=cfg.checkpoint_overwrite,
+        current_vocab_path=vocab_path,
+    )
+
+    # 7. DataLoader — yields (center, context) long-tensor batches.
+    loader = rdf2vec._build_walk_pair_loader(walks_path, vocab_df)
+    loader = fabric.setup_dataloaders(loader, use_distributed_sampler=False)
+
+    # 8. Training loop.
+    global_step = start_step
+    last_ckpt_time = time.monotonic()
+    token_counts_dev = (
+        token_counts.to(fabric.device) if hasattr(token_counts, "to") else None
+    )
+    for epoch in range(start_epoch, cfg.epochs):
+        for batch in loader:
+            center, context = batch
+            if center.numel() == 0:
+                continue
+            negative = _sample_negatives(
+                n_rows=center.size(0), n_neg=cfg.negative_samples,
+                vocab_size=vocab_size, device=fabric.device,
+                strategy=cfg.negative_sampling, token_counts=token_counts_dev,
+            )
+            loss = model(center, context, negative)
+            fabric.backward(loss)
+            # optimizer step is fused into backward via apply_optimizer_in_backward.
+            rdf2vec.tracker.log(
+                {"train/loss": loss.item(), "epoch": epoch, "step": global_step}
+            )
+            global_step += 1
+
+            # Time-based checkpoint.
+            if cfg.checkpoint_dir and (
+                time.monotonic() - last_ckpt_time
+                >= cfg.checkpoint_interval_minutes * 60
+            ):
+                _save_checkpoint(
+                    model, optimizer,
+                    epoch=epoch, global_step=global_step,
+                    checkpoint_dir=cfg.checkpoint_dir,
+                    keep_last=cfg.checkpoint_keep_last,
+                    vocab_path=vocab_path,
+                    config_snapshot=cfg.model_dump(),
+                )
+                last_ckpt_time = time.monotonic()
+
+        # Epoch-boundary checkpoint.
+        if cfg.checkpoint_dir:
+            _save_checkpoint(
+                model, optimizer,
+                epoch=epoch + 1, global_step=global_step,
+                checkpoint_dir=cfg.checkpoint_dir,
+                keep_last=cfg.checkpoint_keep_last,
+                vocab_path=vocab_path,
+                config_snapshot=cfg.model_dump(),
+            )
+
+    # 9. Stash for transform() — consumed by GPU_RDF2Vec.transform() in Task 12.
+    rdf2vec._torchrec_model = model
+    rdf2vec._torchrec_vocab_df = vocab_df
+
+
+def _fabric_precision_from_config(cfg) -> str:
+    """Map ``cfg.matmul_precision`` → Lightning Fabric ``precision=`` arg."""
+    return {
+        "highest": "32-true",
+        "high":    "32-true",
+        "medium":  "bf16-mixed",
+    }.get(getattr(cfg, "matmul_precision", "high"), "32-true")
+
+
+def _fused_optimizer_from_config(cfg) -> tuple[type, dict]:
+    """Map cfg.optimizer → (torchrec fused optimizer class, kwargs).
+
+    Notes on the torchrec 1.2.0 import paths
+    ----------------------------------------
+    The torchrec 1.2.0 install in this environment re-exports the fused
+    optimizers from ``torchrec.optim.optimizers``; the older import
+    location ``torchrec.optim.fused`` only contains the *base classes*
+    (``FusedOptimizer``, ``EmptyFusedOptimizer``) and does NOT contain
+    ``FusedSGD`` / ``PartialRowWiseAdam``.
+
+    The plan's pseudocode used ``from torchrec.optim.fused import
+    FusedSGD, PartialRowWiseAdam`` — this was speculative; the
+    contract was that we land on classes compatible with
+    ``apply_optimizer_in_backward``. The names below match what is
+    actually exported and have the expected
+    ``__init__(params, lr=...)`` signature.
+    """
+    if cfg.optimizer == "sgd":
+        from torchrec.optim import SGD
+        return SGD, {"lr": cfg.learning_rate}
+    if cfg.optimizer == "sparseadam":
+        from torchrec.optim import PartialRowWiseAdam
+        return PartialRowWiseAdam, {"lr": cfg.learning_rate}
+    raise ValueError(
+        f"backend='torchrec' does not support optimizer={cfg.optimizer!r}"
+    )
+
+
+class _NullOptimizer:
+    """Stand-in optimizer when every parameter is fused via
+    :func:`apply_optimizer_in_backward`.
+
+    Required because :func:`_save_checkpoint` /
+    :func:`_maybe_resume_checkpoint` call ``optimizer.state_dict()`` /
+    ``optimizer.load_state_dict()`` unconditionally and DCP needs some
+    object to round-trip — an empty dict is fine, the fused-in-backward
+    state lives inside the model's sharded buffers.
+    """
+
+    def step(self) -> None:  # noqa: D401 — protocol method
+        pass
+
+    def zero_grad(self) -> None:  # noqa: D401 — protocol method
+        pass
+
+    def state_dict(self) -> dict:
+        return {}
+
+    def load_state_dict(self, sd: dict) -> None:
+        pass
+
+
+def _materialize_walks_sequences_to_parquet(walks_seq) -> str:
+    """Persist the (dask_)cudf walks-sequences frame to a temp parquet
+    directory and return its path.
+
+    Mirrors what :meth:`GPU_RDF2Vec._fit_via_gensim` and
+    :meth:`GPU_RDF2Vec._fit_via_pytorch_sequences` do — re-persist the
+    dask frame defensively (so a future refactor that moves the persist
+    out of the corpus class doesn't silently re-roll the stochastic walk
+    generator on ``to_parquet``) and write each partition as a parquet
+    file. For an in-memory cudf frame, write a single ``part.0.parquet``.
+
+    The temp directory is created via ``tempfile.mkdtemp`` and is NOT
+    cleaned up by this function — callers either rely on OS tempfile
+    cleanup at shutdown, or pass the path through DCP checkpoint
+    metadata (in which case resume needs the path to persist across
+    runs and the user is responsible for the cleanup).
+    """
+    import os
+    import tempfile
+
+    walks_dir = tempfile.mkdtemp(prefix="rdf2vec_torchrec_walks_")
+    walks_parquet = f"{walks_dir}/walks"
+    if hasattr(walks_seq, "persist"):
+        from dask.distributed import wait as dask_wait
+
+        walks_seq = walks_seq.persist()
+        dask_wait(walks_seq)
+        walks_seq.to_parquet(walks_parquet, write_index=False)
+    else:
+        os.makedirs(walks_parquet, exist_ok=True)
+        walks_seq.to_parquet(f"{walks_parquet}/part.0.parquet", index=False)
+    return walks_parquet

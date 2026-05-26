@@ -870,6 +870,207 @@ class GPU_RDF2Vec:
             finally:
                 shutil.rmtree(walk_dir, ignore_errors=True)
 
+    def _build_vocab_for_walks(self, walks_path: str):
+        """Vocab + token-count + on-disk vocab-path for the torchrec backend.
+
+        Contract (see Task 11 plan + Task 13 multi-GPU tests):
+            returns ``(vocab_df, token_counts, vocab_path)`` where:
+              * ``vocab_df`` — cudf.DataFrame with columns
+                ``token_id`` (int64) and ``entity`` (string), one row
+                per vocabulary token. Re-projected from
+                ``self.word2idx`` (which uses ``token`` / ``word``) so
+                the torchrec embedding-extraction code can join on the
+                contract's column names without an extra rename.
+              * ``token_counts`` — torch.LongTensor of shape
+                ``(vocab_size,)`` derived from the on-disk walks
+                parquet via the existing
+                ``_token_counts_from_walk_parquet`` helper. Used by the
+                unigram (f^0.75) negative sampler.
+              * ``vocab_path`` — absolute path to a parquet file
+                containing the vocab. ``_maybe_resume_checkpoint``
+                uses this path string (not its contents) as an
+                identity key so resumed runs can refuse to load a
+                checkpoint that was trained against a different
+                vocabulary.
+
+        The vocabulary itself is built upstream by ``load_data() ->
+        generate_vocab()`` and stashed on ``self.word2idx`` — we do
+        NOT re-tokenise the edge list here. This method only re-projects
+        the existing vocab into the torchrec-friendly column layout and
+        materialises the on-disk identity artefact.
+
+        Implementation note: kept as a thin helper rather than inlined
+        because the vocab_path identity check needs a stable on-disk
+        artefact across resume runs and that plumbing is easier to read
+        as a named method than buried in the Fabric loop.
+        """
+        import tempfile
+
+        # word2idx may still be a dask_cudf in multi-GPU mode — materialise
+        # for the in-memory projection that follows.
+        word2idx = self.word2idx
+        if hasattr(word2idx, "compute"):
+            word2idx = word2idx.compute()
+
+        # Re-project to the (token_id: int64, entity: string) layout the
+        # torchrec backend's helpers expect. Source columns from
+        # _generate_vocab are (token: int32, word: string).
+        vocab_df = cudf.DataFrame({
+            "token_id": word2idx["token"].astype("int64"),
+            "entity":   word2idx["word"],
+        })
+
+        # Token-frequency counts over the walk parquet → torch.LongTensor.
+        # Streams the parquet with pyarrow on CPU (the dask cluster is
+        # already torn down by the time we get here in the
+        # _fit_via_pytorch_sequences sister path; torchrec follows the
+        # same teardown order in walk_generation_sequences → fabric
+        # launch).
+        counts_np = _token_counts_from_walk_parquet(
+            walks_path, vocab_df.shape[0]
+        )
+        token_counts = torch.from_numpy(counts_np).to(torch.long)
+
+        # Stable on-disk vocab identity for DCP resume. Writing to a
+        # tempfile (not persisted across runs by default) is acceptable
+        # in v1 — users wanting resumability across SLURM jobs would
+        # pin checkpoint_dir AND vocab_path themselves; multi-GPU
+        # resume tests in Task 13 only need within-run identity.
+        vocab_dir = tempfile.mkdtemp(prefix="rdf2vec_torchrec_vocab_")
+        vocab_path = f"{vocab_dir}/vocab.parquet"
+        vocab_df.to_parquet(vocab_path, index=False)
+
+        return vocab_df, token_counts, vocab_path
+
+    def _build_walk_pair_loader(self, walks_path: str, vocab_df):
+        """DataLoader yielding ``(center, context)`` long-tensor batches.
+
+        Wraps the existing :class:`WalkSequenceDataModule` (which yields
+        ``(vertices, predicates)`` walk-row batches in int32) with a thin
+        on-GPU pair-expansion stage that materialises the skip-gram pairs
+        each step. The expansion mirrors
+        :meth:`SkipGram._expand_skipgram` (in ``embedders/word2vec.py``),
+        minus the frequent-token subsampling — torchrec's fused optimizer
+        handles row-wise scaling that obviates the simpler subsampling
+        path, and the f^0.75 unigram negatives in
+        :func:`_sample_negatives` already de-bias hot tokens.
+
+        TODO(refactor): there is unavoidable duplication of the windowing
+        templates between this loader and ``SkipGram._expand_skipgram``.
+        Once the torchrec path matures, factor the pair-template builder
+        into ``embedders/word2vec_loader.py`` and share. Keeping it local
+        for now per the Task 11 plan note ("don't rewrite unrelated code").
+        """
+        from torch.utils.data import DataLoader, IterableDataset
+        from .embedders.word2vec_loader import (
+            WalkSequenceDataModule,
+            walks_per_pair_batch,
+        )
+
+        cfg = self.config
+        walks_per_batch = walks_per_pair_batch(
+            cfg.pair_batch_size, cfg.walk_depth, cfg.window_size
+        )
+
+        # The underlying WalkSequenceDataModule shards parquet files
+        # per-DDP-rank via its `setup()` hook. Outside a Lightning Trainer
+        # (which is the torchrec case — Fabric, not Trainer) `setup()`
+        # leaves all files visible to all ranks. Honour any active
+        # distributed init explicitly: read torch.distributed rank/world
+        # size and trim the file list per rank.
+        dm = WalkSequenceDataModule(
+            walks_path,
+            batch_size=walks_per_batch,
+            num_workers=cfg.cpu_count,
+            shuffle=True,
+            seed=cfg.random_state,
+        )
+        # Build the underlying iterable. We bypass `dm.setup(trainer)`
+        # because Fabric doesn't expose a Lightning Trainer; emulate the
+        # rank-shard logic directly using torch.distributed.
+        from .embedders.word2vec_loader import _WalkSeqIterable
+        ds = _WalkSeqIterable(
+            walks_path,
+            emit_batch_size=walks_per_batch,
+            read_chunk_size=262_144,
+            shuffle=True,
+            seed=cfg.random_state,
+        )
+        import torch.distributed as dist
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            rank, ws = dist.get_rank(), dist.get_world_size()
+            ds.files = [f for i, f in enumerate(ds.files) if i % ws == rank]
+            if not ds.files:
+                raise RuntimeError(
+                    f"DDP rank {rank}/{ws}: no walk-parquet files assigned "
+                    f"(fewer files than ranks?)"
+                )
+
+        window = cfg.window_size
+
+        class _PairsFromWalks(IterableDataset):
+            """Expand each (vertices, predicates) walk batch into a flat
+            (center, context) long-tensor pair batch on CPU.
+
+            On-GPU expansion would shave a couple % off the dataloader
+            time, but the CPU path keeps this loader pickleable across
+            DataLoader workers and matches the torchrec contract of
+            "yields (center, context) long tensors".
+            """
+
+            def __init__(self, inner, window):
+                super().__init__()
+                self.inner = inner
+                self.window = int(window)
+
+            def __iter__(self):
+                import numpy as np
+                w = self.window
+                for v_np, p_np in self.inner:
+                    # v_np: (n, depth+1), p_np: (n, depth) — int32 with
+                    # cuGraph's -1 sentinels for short walks.
+                    n, depth_p1 = v_np.shape
+                    Lint = 2 * depth_p1 - 1
+                    seq = np.full((n, Lint), -1, dtype=np.int64)
+                    seq[:, 0::2] = v_np
+                    seq[:, 1::2] = p_np
+                    # Per-row valid length: index of the first -1 in
+                    # vertices, doubled (minus the trailing predicate).
+                    is_sent = v_np == -1
+                    has_sent = is_sent.any(axis=1)
+                    first_sent = np.where(
+                        has_sent, is_sent.argmax(axis=1), depth_p1
+                    )
+                    valid_len = np.clip(2 * first_sent - 1, a_min=0, a_max=Lint)
+                    # Build the (ii, jj) template once per Lint.
+                    ii, jj = [], []
+                    for i in range(Lint):
+                        for j in range(max(0, i - w), min(Lint, i + w + 1)):
+                            if j != i:
+                                ii.append(i)
+                                jj.append(j)
+                    ii_arr = np.asarray(ii, dtype=np.int64)
+                    jj_arr = np.asarray(jj, dtype=np.int64)
+                    center = seq[:, ii_arr]
+                    context = seq[:, jj_arr]
+                    keep = (
+                        (ii_arr[None, :] < valid_len[:, None])
+                        & (jj_arr[None, :] < valid_len[:, None])
+                    )
+                    keep_flat = keep.reshape(-1)
+                    c_flat = center.reshape(-1)[keep_flat]
+                    x_flat = context.reshape(-1)[keep_flat]
+                    yield torch.from_numpy(c_flat).long(), torch.from_numpy(x_flat).long()
+
+        pair_ds = _PairsFromWalks(ds, window=window)
+        return DataLoader(
+            pair_ds,
+            batch_size=None,         # iterable yields already-batched pairs
+            num_workers=cfg.cpu_count,
+            pin_memory=True,
+            persistent_workers=False,
+        )
+
     def _fit_via_torchrec(
         self, edge_df, walk_vertices: cudf.Series | None = None
     ) -> None:
