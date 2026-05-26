@@ -209,7 +209,13 @@ class RDF2VecConfig(BaseModel):
     # pair_batch_size pairs/step), which is generally counter-productive for
     # skip-gram — the small effective batch is what makes it converge stably.
     accumulate_grad_batches: int = Field(default=1, ge=1)
-    backend: Literal["pytorch", "gensim"] = "pytorch"
+    backend: Literal["pytorch", "gensim", "torchrec"] = "pytorch"
+    # Checkpointing — only consumed by backend="torchrec". Ignored by the
+    # "pytorch" and "gensim" backends.
+    checkpoint_dir: str | None = Field(default=None)
+    checkpoint_interval_minutes: int = Field(default=30, ge=1)
+    checkpoint_overwrite: bool = Field(default=False)
+    checkpoint_keep_last: int = Field(default=3, ge=1)
     # library settings
     random_state: int = Field(default=42, ge=0)
     reproducible: bool = False

@@ -158,3 +158,21 @@ def test_normalize_embeddings_default_is_false():
 def test_normalize_embeddings_accepts_true():
     cfg = RDF2VecConfig(normalize_embeddings=True)
     assert cfg.normalize_embeddings is True
+
+
+def test_backend_accepts_torchrec_value():
+    cfg = RDF2VecConfig(backend="torchrec")
+    assert cfg.backend == "torchrec"
+
+
+def test_checkpoint_defaults_match_spec():
+    cfg = RDF2VecConfig()
+    assert cfg.checkpoint_dir is None
+    assert cfg.checkpoint_interval_minutes == 30
+    assert cfg.checkpoint_overwrite is False
+    assert cfg.checkpoint_keep_last == 3
+
+
+def test_checkpoint_dir_accepts_string():
+    cfg = RDF2VecConfig(checkpoint_dir="/tmp/ckpt")
+    assert cfg.checkpoint_dir == "/tmp/ckpt"
