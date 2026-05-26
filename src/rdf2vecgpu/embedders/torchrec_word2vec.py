@@ -51,7 +51,9 @@ def _sample_negatives(
     raise ValueError(f"unknown negative-sampling strategy: {strategy!r}")
 
 
-def _build_sharding_plan(model: nn.Module, world_size: int, device: torch.device):
+def _build_sharding_plan(
+    model: nn.Module, world_size: int, device: torch.device,
+) -> "ShardingPlan":  # noqa: F821 (lazy import — see body)
     """Defer to torchrec's planner; no constraints in v1.
 
     The planner will pick row-wise sharding automatically for tables

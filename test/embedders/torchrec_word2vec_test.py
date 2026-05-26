@@ -241,10 +241,21 @@ def test_build_sharding_plan_returns_plan_with_both_tables():
         device = torch.device("cuda")
         model = ShardedSkipGramModel(vocab_size=1024, embedding_dim=16).to(device)
         plan = _build_sharding_plan(model, world_size=1, device=device)
-        # The plan should reference both tables by name.
-        plan_str = str(plan)
-        assert ShardedSkipGramModel.IN_TABLE_NAME in plan_str
-        assert ShardedSkipGramModel.OUT_TABLE_NAME in plan_str
+        # Walk the plan structure: plan.plan is Dict[module_path,
+        # Dict[table_name, ParameterSharding]]. We don't assert a
+        # specific sharding type (the planner picks based on table
+        # size and topology, and that's intentional in v1), but every
+        # table must appear with a non-empty sharding_type — that's
+        # the contract DistributedModelParallel needs.
+        all_table_names: set[str] = set()
+        for module_plan in plan.plan.values():
+            for table_name, param_sharding in module_plan.items():
+                assert param_sharding.sharding_type, (
+                    f"empty sharding_type for {table_name!r}"
+                )
+                all_table_names.add(table_name)
+        assert ShardedSkipGramModel.IN_TABLE_NAME in all_table_names, all_table_names
+        assert ShardedSkipGramModel.OUT_TABLE_NAME in all_table_names, all_table_names
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
