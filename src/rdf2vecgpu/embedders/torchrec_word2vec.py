@@ -374,6 +374,101 @@ def _save_checkpoint(
         dist.barrier()
 
 
+def _maybe_resume_checkpoint(
+    model,
+    optimizer,
+    checkpoint_dir: str | None,
+    overwrite: bool,
+    current_vocab_path: str,
+) -> tuple[int, int]:
+    """Resume from ``{checkpoint_dir}/latest`` if it exists, else fresh.
+
+    Returns ``(start_epoch, start_step)``. See spec §4.4 for the full
+    decision table.
+
+    RNG caveat: ``cuda_rng_state_all`` covers all *local* CUDA devices on
+    the saving node only, not cross-node state. Resuming on a different
+    ``world_size`` (or a different host) therefore carries small RNG
+    reproducibility caveats — the model/optimizer weights are restored
+    exactly, but the negative-sampling stream may diverge from a no-crash
+    baseline. Accepted for v1.
+    """
+    import shutil
+    from pathlib import Path
+
+    import torch
+    import torch.distributed as dist
+    import torch.distributed.checkpoint as dcp
+
+    if checkpoint_dir is None:
+        return 0, 0
+
+    ckpt_root = Path(checkpoint_dir)
+    rank = dist.get_rank() if dist.is_initialized() else 0
+
+    if overwrite and ckpt_root.exists():
+        if rank == 0:
+            shutil.rmtree(ckpt_root)
+            ckpt_root.mkdir(parents=True, exist_ok=True)
+        if dist.is_initialized():
+            dist.barrier()
+        return 0, 0
+
+    if not ckpt_root.exists():
+        if rank == 0:
+            ckpt_root.mkdir(parents=True, exist_ok=True)
+        if dist.is_initialized():
+            dist.barrier()
+        return 0, 0
+
+    latest = ckpt_root / "latest"
+    if not latest.exists():
+        # Empty dir, or a never-completed save — start fresh in place.
+        return 0, 0
+
+    step_dir = latest.resolve()
+    if not step_dir.is_dir():
+        raise RuntimeError(
+            f"Checkpoint at {step_dir} is missing or corrupt. Pass "
+            "checkpoint_overwrite=True to start fresh, or restore the "
+            "checkpoint contents."
+        )
+
+    # Vocab-mismatch guard.
+    meta = torch.load(ckpt_root / "metadata.pt", weights_only=False)
+    saved_vocab_path = meta["vocab_path"]
+    if saved_vocab_path != current_vocab_path:
+        raise RuntimeError(
+            f"Cannot resume: saved checkpoint was built against vocab at "
+            f"{saved_vocab_path!r}, but current run resolved vocab to "
+            f"{current_vocab_path!r}. Vocab IDs would no longer match. Pass "
+            "checkpoint_overwrite=True to start fresh."
+        )
+
+    # DCP load into the already-instantiated model/optimizer.
+    state_dict = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+    }
+    dcp.load(
+        state_dict=state_dict,
+        storage_reader=dcp.FileSystemReader(str(step_dir)),
+    )
+    model.load_state_dict(state_dict["model"])
+    optimizer.load_state_dict(state_dict["optimizer"])
+
+    # Restore RNG state on the loading rank only — DCP doesn't reshard
+    # RNG and we accept this small reproducibility caveat (documented).
+    if rank == 0:
+        torch.set_rng_state(meta["rng_state"])
+        torch.cuda.set_rng_state_all(meta["cuda_rng_state_all"])
+
+    if dist.is_initialized():
+        dist.barrier()
+
+    return int(meta["epoch"]), int(meta["global_step"])
+
+
 def train_torchrec_word2vec(model, edge_df, walk_vertices):
     raise NotImplementedError(
         "train_torchrec_word2vec is a stub — implemented in Task 11."

@@ -429,3 +429,143 @@ def test_save_checkpoint_recovers_from_stale_latest_tmp(tmp_path):
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
+
+
+@pytest.mark.gpu
+def test_resume_round_trip_restores_weights_and_step(tmp_path):
+    import os, copy, torch, torch.distributed as dist
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    try:
+        from rdf2vecgpu.embedders.torchrec_word2vec import (
+            ShardedSkipGramModel,
+            _save_checkpoint,
+            _maybe_resume_checkpoint,
+        )
+        device = torch.device("cuda")
+
+        # Save
+        m1 = ShardedSkipGramModel(vocab_size=64, embedding_dim=4).to(device)
+        opt1 = torch.optim.SGD(m1.parameters(), lr=0.01)
+        ckpt_dir = tmp_path / "ckpt"
+        _save_checkpoint(
+            m1, opt1, epoch=3, global_step=12345,
+            checkpoint_dir=str(ckpt_dir), keep_last=3,
+            vocab_path="/v", config_snapshot={},
+        )
+        snapshot = copy.deepcopy(m1.state_dict())
+
+        # Resume into a fresh model.
+        m2 = ShardedSkipGramModel(vocab_size=64, embedding_dim=4).to(device)
+        opt2 = torch.optim.SGD(m2.parameters(), lr=0.01)
+        start_epoch, start_step = _maybe_resume_checkpoint(
+            m2, opt2,
+            checkpoint_dir=str(ckpt_dir), overwrite=False, current_vocab_path="/v",
+        )
+        assert start_epoch == 3
+        assert start_step == 12345
+        for k, v in snapshot.items():
+            torch.testing.assert_close(m2.state_dict()[k], v)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.gpu
+def test_resume_missing_dir_returns_fresh(tmp_path):
+    import os, torch, torch.distributed as dist
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    try:
+        from rdf2vecgpu.embedders.torchrec_word2vec import (
+            ShardedSkipGramModel,
+            _maybe_resume_checkpoint,
+        )
+        device = torch.device("cuda")
+        m = ShardedSkipGramModel(vocab_size=64, embedding_dim=4).to(device)
+        opt = torch.optim.SGD(m.parameters(), lr=0.01)
+        start_epoch, start_step = _maybe_resume_checkpoint(
+            m, opt,
+            checkpoint_dir=str(tmp_path / "does_not_exist"),
+            overwrite=False, current_vocab_path="/v",
+        )
+        assert (start_epoch, start_step) == (0, 0)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.gpu
+def test_resume_with_vocab_mismatch_raises(tmp_path):
+    import os, torch, torch.distributed as dist
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    try:
+        from rdf2vecgpu.embedders.torchrec_word2vec import (
+            ShardedSkipGramModel,
+            _save_checkpoint,
+            _maybe_resume_checkpoint,
+        )
+        device = torch.device("cuda")
+        m = ShardedSkipGramModel(vocab_size=64, embedding_dim=4).to(device)
+        opt = torch.optim.SGD(m.parameters(), lr=0.01)
+        ckpt_dir = tmp_path / "ckpt"
+        _save_checkpoint(
+            m, opt, epoch=0, global_step=1,
+            checkpoint_dir=str(ckpt_dir), keep_last=3,
+            vocab_path="/vocab_A.parquet", config_snapshot={},
+        )
+        with pytest.raises(RuntimeError, match="vocab"):
+            _maybe_resume_checkpoint(
+                m, opt,
+                checkpoint_dir=str(ckpt_dir),
+                overwrite=False,
+                current_vocab_path="/vocab_B.parquet",
+            )
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.gpu
+def test_resume_overwrite_wipes_dir_and_returns_fresh(tmp_path):
+    import os, torch, torch.distributed as dist
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    try:
+        from rdf2vecgpu.embedders.torchrec_word2vec import (
+            ShardedSkipGramModel,
+            _save_checkpoint,
+            _maybe_resume_checkpoint,
+        )
+        device = torch.device("cuda")
+        m = ShardedSkipGramModel(vocab_size=64, embedding_dim=4).to(device)
+        opt = torch.optim.SGD(m.parameters(), lr=0.01)
+        ckpt_dir = tmp_path / "ckpt"
+        _save_checkpoint(
+            m, opt, epoch=2, global_step=999,
+            checkpoint_dir=str(ckpt_dir), keep_last=3,
+            vocab_path="/v", config_snapshot={},
+        )
+        start_epoch, start_step = _maybe_resume_checkpoint(
+            m, opt,
+            checkpoint_dir=str(ckpt_dir), overwrite=True, current_vocab_path="/v",
+        )
+        assert (start_epoch, start_step) == (0, 0)
+        # No step_* dirs should remain
+        assert not any(p.name.startswith("step_") for p in ckpt_dir.iterdir())
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
