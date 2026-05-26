@@ -45,8 +45,8 @@ gensim = [
     "pyarrow>=15",
 ]
 torchrec = [
-    "torchrec>=0.6.0",
-    "fbgemm-gpu>=0.6.0",
+    "torchrec>=1.0,<2",
+    "fbgemm-gpu>=1.0,<2",
 ]
 test = [
     "pytest>=9.0.1",
