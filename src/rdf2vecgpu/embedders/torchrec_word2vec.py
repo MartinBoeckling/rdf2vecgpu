@@ -8,13 +8,8 @@ this module can be imported without those extras installed.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
 from torch import nn
-
-if TYPE_CHECKING:
-    pass
 
 
 class ShardedSkipGramModel(nn.Module):
@@ -22,7 +17,7 @@ class ShardedSkipGramModel(nn.Module):
 
     Sharding is applied later by wrapping this module in
     ``torchrec.distributed.DistributedModelParallel`` with a plan from
-    :func:`_build_sharding_plan`. Prior to wrapping, the table parameters
+    `_build_sharding_plan` (Task 7). Prior to wrapping, the table parameters
     live on whichever device the caller placed them.
     """
 

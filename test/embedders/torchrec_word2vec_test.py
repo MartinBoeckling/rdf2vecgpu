@@ -45,12 +45,12 @@ def test_torchrec_backend_without_distributed_init_raises_runtime_error():
 # ───────────────────────────── Layer 2 ────────────────────────────────
 
 
-torchrec = pytest.importorskip("torchrec")
-torch_lib = pytest.importorskip("torch")
+pytest.importorskip("torchrec")
+pytest.importorskip("torch")
 
 
 @pytest.mark.gpu
-def test_sharded_skipgram_model_constructs_in_degenerate_world_size_one(tmp_path):
+def test_sharded_skipgram_model_constructs_in_degenerate_world_size_one():
     """world_size=1 → planner degenerates to table-wise on rank 0.
 
     This test verifies the module wiring without needing a real
@@ -72,9 +72,12 @@ def test_sharded_skipgram_model_constructs_in_degenerate_world_size_one(tmp_path
 
         model = ShardedSkipGramModel(vocab_size=1024, embedding_dim=16)
         sd = model.state_dict()
-        # Both in and out tables present.
-        assert any("in_embeddings" in k for k in sd), sd.keys()
-        assert any("out_embeddings" in k for k in sd), sd.keys()
+        in_key = f"in_collection.embeddings.{ShardedSkipGramModel.IN_TABLE_NAME}.weight"
+        out_key = f"out_collection.embeddings.{ShardedSkipGramModel.OUT_TABLE_NAME}.weight"
+        assert in_key in sd, list(sd.keys())
+        assert out_key in sd, list(sd.keys())
+        assert sd[in_key].shape == (1024, 16)
+        assert sd[out_key].shape == (1024, 16)
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
