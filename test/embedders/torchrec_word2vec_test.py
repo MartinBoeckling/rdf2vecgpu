@@ -685,6 +685,8 @@ def test_torchrec_end_to_end_smoke_world_size_2(torchrun_pg, tmp_path):
         "predicate": rng.integers(0, 20, size=n),
         "object":    rng.integers(500, 1000, size=n),
     })
+    triples_path = tmp_path / "triples.parquet"
+    triples.to_parquet(str(triples_path))
 
     cfg = RDF2VecConfig(
         backend="torchrec",
@@ -697,7 +699,8 @@ def test_torchrec_end_to_end_smoke_world_size_2(torchrun_pg, tmp_path):
         optimizer="sparseadam",
     )
     model = GPU_RDF2Vec(config=cfg)
-    model.fit(edge_df=triples)
+    edges = model.load_data(str(triples_path))
+    model.fit(edges)
     embeddings = model.transform()
 
     # Each rank produces one partition.
@@ -733,6 +736,8 @@ def test_torchrec_vs_pytorch_topk_overlap(torchrun_pg, tmp_path):
         "predicate": rng.integers(0, 10, size=n),
         "object":    rng.integers(200, 400, size=n),
     })
+    triples_path = tmp_path / "triples.parquet"
+    triples.to_parquet(str(triples_path))
 
     common = dict(
         embedding_model="skipgram", walk_strategy="random",
@@ -743,10 +748,14 @@ def test_torchrec_vs_pytorch_topk_overlap(torchrun_pg, tmp_path):
     )
 
     cfg_pt = RDF2VecConfig(backend="pytorch", multi_gpu=False, **common)
-    emb_pt = GPU_RDF2Vec(config=cfg_pt).fit_transform(edge_df=triples).to_pandas()
+    m_pt = GPU_RDF2Vec(config=cfg_pt)
+    edges_pt = m_pt.load_data(str(triples_path))
+    emb_pt = m_pt.fit_transform(edge_df=edges_pt).to_pandas()
 
     cfg_tr = RDF2VecConfig(backend="torchrec", multi_gpu=True, **common)
-    emb_tr = GPU_RDF2Vec(config=cfg_tr).fit_transform(edge_df=triples).compute().to_pandas()
+    m_tr = GPU_RDF2Vec(config=cfg_tr)
+    edges_tr = m_tr.load_data(str(triples_path))
+    emb_tr = m_tr.fit_transform(edge_df=edges_tr).compute().to_pandas()
 
     # Compute top-5 NN overlap per token.
     def topk_neighbours(df: pd.DataFrame, k: int = 5) -> dict[int, set[int]]:
@@ -788,6 +797,8 @@ def test_save_then_reload_preserves_embeddings_bit_equal(torchrun_pg, tmp_path):
         "predicate": rng.integers(0, 5,   size=2000),
         "object":    rng.integers(100, 200, size=2000),
     })
+    triples_path = tmp_path / "triples.parquet"
+    triples.to_parquet(str(triples_path))
 
     ckpt = tmp_path / "ckpt"
     cfg = RDF2VecConfig(
@@ -800,12 +811,14 @@ def test_save_then_reload_preserves_embeddings_bit_equal(torchrun_pg, tmp_path):
 
     # First run: train, capture embeddings.
     m1 = GPU_RDF2Vec(config=cfg)
-    emb1 = m1.fit_transform(edge_df=triples).compute().to_pandas().sort_values("token_id")
+    edges1 = m1.load_data(str(triples_path))
+    emb1 = m1.fit_transform(edge_df=edges1).compute().to_pandas().sort_values("token_id")
 
     # Simulate restart: build a new model with epochs=2 and the same
     # checkpoint_dir → auto-resume from epoch 2 (no further training).
     m2 = GPU_RDF2Vec(config=cfg)
-    m2.fit(edge_df=triples)
+    edges2 = m2.load_data(str(triples_path))
+    m2.fit(edges2)
     emb2 = m2.transform().compute().to_pandas().sort_values("token_id")
 
     np.testing.assert_array_equal(
@@ -829,6 +842,8 @@ def test_overwrite_starts_fresh(torchrun_pg, tmp_path):
         "predicate": rng.integers(0, 5,  size=1000),
         "object":    rng.integers(50, 100, size=1000),
     })
+    triples_path = tmp_path / "triples.parquet"
+    triples.to_parquet(str(triples_path))
 
     ckpt = tmp_path / "ckpt"
 
@@ -838,12 +853,16 @@ def test_overwrite_starts_fresh(torchrun_pg, tmp_path):
         vector_size=8, epochs=1,
         checkpoint_dir=str(ckpt),
     )
-    GPU_RDF2Vec(config=cfg).fit(edge_df=triples)
+    m1 = GPU_RDF2Vec(config=cfg)
+    edges1 = m1.load_data(str(triples_path))
+    m1.fit(edges1)
     # Verify a checkpoint was actually written
     assert (ckpt / "latest").exists()
 
     cfg_ow = cfg.model_copy(update={"checkpoint_overwrite": True})
-    GPU_RDF2Vec(config=cfg_ow).fit(edge_df=triples)
+    m2 = GPU_RDF2Vec(config=cfg_ow)
+    edges2 = m2.load_data(str(triples_path))
+    m2.fit(edges2)
     # After overwrite + fresh fit, exactly one step_* dir again
     step_dirs = [p for p in ckpt.iterdir() if p.name.startswith("step_")]
     assert len(step_dirs) >= 1
@@ -865,6 +884,8 @@ def test_keep_last_prunes_excess_step_dirs(torchrun_pg, tmp_path):
         "predicate": rng.integers(0, 5,   size=5000),
         "object":    rng.integers(100, 200, size=5000),
     })
+    triples_path = tmp_path / "triples.parquet"
+    triples.to_parquet(str(triples_path))
     ckpt = tmp_path / "ckpt"
     cfg = RDF2VecConfig(
         backend="torchrec", embedding_model="skipgram", multi_gpu=True,
@@ -874,6 +895,8 @@ def test_keep_last_prunes_excess_step_dirs(torchrun_pg, tmp_path):
         checkpoint_interval_minutes=1,   # force frequent saves
         checkpoint_keep_last=2,
     )
-    GPU_RDF2Vec(config=cfg).fit(edge_df=triples)
+    model = GPU_RDF2Vec(config=cfg)
+    edges = model.load_data(str(triples_path))
+    model.fit(edges)
     step_dirs = sorted(p.name for p in ckpt.iterdir() if p.name.startswith("step_"))
     assert len(step_dirs) == 2, step_dirs
