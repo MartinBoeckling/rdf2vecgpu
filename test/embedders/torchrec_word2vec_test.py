@@ -40,3 +40,41 @@ def test_torchrec_backend_without_distributed_init_raises_runtime_error():
     model = GPU_RDF2Vec(config=cfg)
     with pytest.raises(RuntimeError, match="torchrun"):
         model.fit(edge_df=None)
+
+
+# ───────────────────────────── Layer 2 ────────────────────────────────
+
+
+torchrec = pytest.importorskip("torchrec")
+torch_lib = pytest.importorskip("torch")
+
+
+@pytest.mark.gpu
+def test_sharded_skipgram_model_constructs_in_degenerate_world_size_one(tmp_path):
+    """world_size=1 → planner degenerates to table-wise on rank 0.
+
+    This test verifies the module wiring without needing a real
+    multi-process launch.
+    """
+    import os
+    import torch
+    import torch.distributed as dist
+
+    # Single-process distributed init on localhost (gloo backend is fine —
+    # we don't need NCCL for module construction).
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+
+    try:
+        from rdf2vecgpu.embedders.torchrec_word2vec import ShardedSkipGramModel
+
+        model = ShardedSkipGramModel(vocab_size=1024, embedding_dim=16)
+        sd = model.state_dict()
+        # Both in and out tables present.
+        assert any("in_embeddings" in k for k in sd), sd.keys()
+        assert any("out_embeddings" in k for k in sd), sd.keys()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
