@@ -931,14 +931,36 @@ class GPU_RDF2Vec:
         )
         token_counts = torch.from_numpy(counts_np).to(torch.long)
 
-        # Stable on-disk vocab identity for DCP resume. Writing to a
-        # tempfile (not persisted across runs by default) is acceptable
-        # in v1 — users wanting resumability across SLURM jobs would
-        # pin checkpoint_dir AND vocab_path themselves; multi-GPU
-        # resume tests in Task 13 only need within-run identity.
-        vocab_dir = tempfile.mkdtemp(prefix="rdf2vec_torchrec_vocab_")
-        vocab_path = f"{vocab_dir}/vocab.parquet"
-        vocab_df.to_parquet(vocab_path, index=False)
+        # Stable on-disk vocab identity for DCP resume. When a
+        # checkpoint_dir is configured, write to
+        # ``{checkpoint_dir}/vocab.parquet`` so the path is
+        # deterministic across ranks AND across resume runs — this is
+        # what ``_maybe_resume_checkpoint``'s vocab-identity guard
+        # compares against. Without it (tempfile.mkdtemp produces a
+        # fresh path every process / every run), resume always
+        # mismatched and the feature was a no-op.
+        # When no checkpoint_dir is set, fall back to a tempdir — the
+        # identity guard is not exercised in that case.
+        # Multi-rank safety: only rank 0 writes the parquet; all ranks
+        # barrier before returning so the file is visible everywhere.
+        from pathlib import Path
+        import torch.distributed as dist
+
+        if self.config.checkpoint_dir is not None:
+            vocab_dir = Path(self.config.checkpoint_dir)
+            vocab_dir.mkdir(parents=True, exist_ok=True)
+            vocab_path = str(vocab_dir / "vocab.parquet")
+        else:
+            vocab_path = str(
+                Path(tempfile.mkdtemp(prefix="rdf2vec_torchrec_vocab_"))
+                / "vocab.parquet"
+            )
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
+            vocab_df.to_parquet(vocab_path, index=False)
+        if dist.is_initialized():
+            dist.barrier()
 
         return vocab_df, token_counts, vocab_path
 
@@ -962,32 +984,19 @@ class GPU_RDF2Vec:
         for now per the Task 11 plan note ("don't rewrite unrelated code").
         """
         from torch.utils.data import DataLoader, IterableDataset
-        from .embedders.word2vec_loader import (
-            WalkSequenceDataModule,
-            walks_per_pair_batch,
-        )
+        from .embedders.word2vec_loader import walks_per_pair_batch
 
         cfg = self.config
         walks_per_batch = walks_per_pair_batch(
             cfg.pair_batch_size, cfg.walk_depth, cfg.window_size
         )
 
-        # The underlying WalkSequenceDataModule shards parquet files
-        # per-DDP-rank via its `setup()` hook. Outside a Lightning Trainer
-        # (which is the torchrec case — Fabric, not Trainer) `setup()`
-        # leaves all files visible to all ranks. Honour any active
-        # distributed init explicitly: read torch.distributed rank/world
-        # size and trim the file list per rank.
-        dm = WalkSequenceDataModule(
-            walks_path,
-            batch_size=walks_per_batch,
-            num_workers=cfg.cpu_count,
-            shuffle=True,
-            seed=cfg.random_state,
-        )
-        # Build the underlying iterable. We bypass `dm.setup(trainer)`
-        # because Fabric doesn't expose a Lightning Trainer; emulate the
-        # rank-shard logic directly using torch.distributed.
+        # WalkSequenceDataModule shards parquet files per-DDP-rank via
+        # its `setup()` hook, but outside a Lightning Trainer (the
+        # torchrec case — Fabric, not Trainer) `setup()` leaves all
+        # files visible to all ranks. Skip the DataModule entirely and
+        # use the underlying iterable directly; emulate the rank-shard
+        # logic via torch.distributed below.
         from .embedders.word2vec_loader import _WalkSeqIterable
         ds = _WalkSeqIterable(
             walks_path,

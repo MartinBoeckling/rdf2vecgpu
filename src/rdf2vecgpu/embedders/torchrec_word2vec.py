@@ -512,10 +512,27 @@ def train_torchrec_word2vec(rdf2vec, edge_df, walk_vertices) -> None:
     #    DCP-resumed runs need both walks and vocab present on disk for
     #    `_maybe_resume_checkpoint` to validate identity. Callers that
     #    don't checkpoint can rely on the OS tempfile cleanup at shutdown.
-    walks_seq = rdf2vec.walk_generation_sequences(
-        edge_df=edge_df, walk_vertices=walk_vertices,
-    )
-    walks_path = _materialize_walks_sequences_to_parquet(walks_seq)
+    #
+    #    Multi-rank correctness: the walk generator is stochastic and
+    #    writes to a tempfile-derived path; if every rank invoked it,
+    #    each rank would (a) re-roll independent walks and (b) write to
+    #    its own path that other ranks cannot read. Wrap with a
+    #    rank-0-only block + broadcast the path so all ranks read a
+    #    single shared walks corpus.
+    import torch.distributed as dist
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if rank == 0:
+        walks_seq = rdf2vec.walk_generation_sequences(
+            edge_df=edge_df, walk_vertices=walk_vertices,
+        )
+        walks_path = _materialize_walks_sequences_to_parquet(walks_seq)
+        path_holder = [walks_path]
+    else:
+        path_holder = [None]
+    if dist.is_initialized():
+        dist.broadcast_object_list(path_holder, src=0)
+        dist.barrier()
+    walks_path = path_holder[0]
 
     # 2. Vocab build / load — returns the existing word2idx (built upstream
     #    by load_data()), token-frequency counts from the walks parquet,
@@ -531,27 +548,37 @@ def train_torchrec_word2vec(rdf2vec, edge_df, walk_vertices) -> None:
     )
     fabric.launch()
 
-    # 4. Build the sharded model + plan + DMP wrap.
+    # 4. Build the sharded model.
     model = ShardedSkipGramModel(
         vocab_size=vocab_size, embedding_dim=cfg.vector_size,
     ).to(fabric.device)
+
+    # 5. Attach fused optimizer via apply_optimizer_in_backward BEFORE
+    #    wrapping in DistributedModelParallel. This is the torchrec
+    #    idiom: DMP detects the optimizer-in-backward marker on the raw
+    #    embedding parameters and produces fused embedding+optimizer
+    #    FBGEMM kernels. Calling apply_optimizer_in_backward on
+    #    DMP-proxy parameters attaches hooks to the wrappers, NOT the
+    #    underlying sharded tables, so the fused state is silently
+    #    dropped.
+    fused_cls, fused_kwargs = _fused_optimizer_from_config(cfg)
+    apply_optimizer_in_backward(
+        fused_cls, model.parameters(), fused_kwargs,
+    )
+    # All skip-gram params live in sharded embedding tables, so the
+    # entire update fuses into backward. The standalone optimizer is a
+    # no-op stand-in whose ``state_dict()`` is empty (DCP still requires
+    # *some* optimizer object to round-trip).
+    optimizer = _NullOptimizer()
+
+    # 6. Build plan + wrap in DMP. The optimizer-in-backward hooks
+    #    attached above survive the DMP wrapping.
     plan = _build_sharding_plan(model, world_size=fabric.world_size, device=fabric.device)
     model = DistributedModelParallel(
         module=model, device=fabric.device, plan=plan, init_data_parallel=False,
     )
 
-    # 5. Fused optimizer via apply_optimizer_in_backward — all skip-gram
-    #    params live in sharded embedding tables, so the entire update
-    #    fuses into the backward pass. The standalone optimizer below is
-    #    a no-op stand-in (its state_dict()/load_state_dict() round-trip
-    #    through DCP cleanly even though there's nothing to save).
-    fused_cls, fused_kwargs = _fused_optimizer_from_config(cfg)
-    apply_optimizer_in_backward(
-        fused_cls, model.parameters(), fused_kwargs,
-    )
-    optimizer = _NullOptimizer()
-
-    # 6. Maybe resume.
+    # 7. Maybe resume.
     start_epoch, start_step = _maybe_resume_checkpoint(
         model, optimizer,
         checkpoint_dir=cfg.checkpoint_dir,
@@ -559,11 +586,16 @@ def train_torchrec_word2vec(rdf2vec, edge_df, walk_vertices) -> None:
         current_vocab_path=vocab_path,
     )
 
-    # 7. DataLoader — yields (center, context) long-tensor batches.
+    # 8. DataLoader — yields (center, context) long-tensor batches.
     loader = rdf2vec._build_walk_pair_loader(walks_path, vocab_df)
     loader = fabric.setup_dataloaders(loader, use_distributed_sampler=False)
 
-    # 8. Training loop.
+    # 9. Training loop. NOTE: do NOT skip empty batches on a single rank
+    #    — peer ranks would still call fabric.backward and the NCCL
+    #    collective would hang waiting for the absent rank. If a rank
+    #    has no work it must still participate in the collective; in
+    #    practice the loader sharding already guarantees every rank
+    #    sees the same batch cadence.
     global_step = start_step
     last_ckpt_time = time.monotonic()
     token_counts_dev = (
@@ -572,8 +604,6 @@ def train_torchrec_word2vec(rdf2vec, edge_df, walk_vertices) -> None:
     for epoch in range(start_epoch, cfg.epochs):
         for batch in loader:
             center, context = batch
-            if center.numel() == 0:
-                continue
             negative = _sample_negatives(
                 n_rows=center.size(0), n_neg=cfg.negative_samples,
                 vocab_size=vocab_size, device=fabric.device,
