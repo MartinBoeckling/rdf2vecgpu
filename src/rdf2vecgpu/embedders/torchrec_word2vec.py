@@ -226,23 +226,35 @@ def _local_row_range(vocab_size: int, world_size: int, rank: int) -> tuple[int, 
 def _get_in_table_local_tensor(model) -> torch.Tensor:
     """Return the rank-local tensor for the in-embedding table.
 
-    Handles both the pre-DMP nn.Module case (`in_collection.embeddings`
-    holds a vanilla nn.Embedding) and the post-DMP sharded case
-    (`local_tensor()` exposes the rank-local slab).
+    Two paths:
+    1. Post-DMP: torchrec wraps the parameter as a ShardedTensor /
+       DTensor exposing ``.local_tensor()`` — return that.
+    2. Pre-DMP or world_size=1 unwrapped: walk
+       ``in_collection.embeddings`` directly and return the
+       ``nn.Embedding.weight.data``.
+
+    The two branches are deliberately separate. If torchrec ships a
+    state_dict that contains the table key but where the value lacks
+    ``local_tensor`` (e.g. a future API change), we fall through to the
+    direct access — never return a full unsliced tensor as if it were a
+    shard.
     """
-    # Post-DMP: torchrec exposes sharded params via a state_dict where
-    # values are ShardedTensor or DTensor with `.local_tensor()`.
+    # Path 1: post-DMP sharded value
     try:
         sd = model.state_dict()
-        for key, val in sd.items():
-            if ShardedSkipGramModel.IN_TABLE_NAME in key and "weight" in key:
-                if hasattr(val, "local_tensor"):
-                    return val.local_tensor()
-                return val
-    except Exception:
-        pass
+    except (AttributeError, RuntimeError):
+        sd = {}
+    for key, val in sd.items():
+        if ShardedSkipGramModel.IN_TABLE_NAME in key and "weight" in key:
+            if hasattr(val, "local_tensor"):
+                return val.local_tensor()
+            # Key matched but no .local_tensor — this is the pre-DMP
+            # case where the state_dict value IS the full nn.Embedding
+            # weight. Fall through to path 2 rather than returning the
+            # full tensor as a "shard".
+            break
 
-    # Fallback: pre-DMP, walk the EmbeddingCollection's underlying table.
+    # Path 2: pre-DMP direct access to nn.Embedding weights
     for table in model.in_collection.embeddings.values():
         return table.weight.data
     raise RuntimeError("could not locate in-embedding table on this rank")

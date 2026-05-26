@@ -263,6 +263,10 @@ def test_build_sharding_plan_returns_plan_with_both_tables():
 
 @pytest.mark.gpu
 def test_extract_embeddings_to_dask_cudf_schema_and_row_count():
+    # NOTE: This exercises the pre-DMP / world_size=1 path of
+    # _get_in_table_local_tensor. The DMP-wrapped path (with
+    # local_tensor()) is covered by the multi-GPU integration tests
+    # in Task 13.
     import os
     import torch
     import torch.distributed as dist
