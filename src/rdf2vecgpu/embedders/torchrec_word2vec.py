@@ -51,6 +51,27 @@ def _sample_negatives(
     raise ValueError(f"unknown negative-sampling strategy: {strategy!r}")
 
 
+def _build_sharding_plan(model: nn.Module, world_size: int, device: torch.device):
+    """Defer to torchrec's planner; no constraints in v1.
+
+    The planner will pick row-wise sharding automatically for tables
+    that are large enough to benefit from it. Smaller tables may end up
+    table-wise on a single rank, which is fine — the user's reason for
+    choosing this backend is the *large* tables.
+    """
+    from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
+    from torchrec.distributed.types import ModuleSharder
+    from torchrec.distributed.embedding import EmbeddingCollectionSharder
+
+    topology = Topology(
+        world_size=world_size,
+        compute_device=device.type,  # "cuda"
+    )
+    planner = EmbeddingShardingPlanner(topology=topology)
+    sharders: list[ModuleSharder] = [EmbeddingCollectionSharder()]
+    return planner.plan(model, sharders=sharders)
+
+
 class ShardedSkipGramModel(nn.Module):
     """Skip-gram with two row-wise sharded embedding tables (in + out).
 

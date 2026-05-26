@@ -221,3 +221,30 @@ def test_sharded_skipgram_forward_loss_closed_form_with_zero_embeddings():
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
+
+
+@pytest.mark.gpu
+def test_build_sharding_plan_returns_plan_with_both_tables():
+    import os
+    import torch
+    import torch.distributed as dist
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    try:
+        from rdf2vecgpu.embedders.torchrec_word2vec import (
+            ShardedSkipGramModel,
+            _build_sharding_plan,
+        )
+        device = torch.device("cuda")
+        model = ShardedSkipGramModel(vocab_size=1024, embedding_dim=16).to(device)
+        plan = _build_sharding_plan(model, world_size=1, device=device)
+        # The plan should reference both tables by name.
+        plan_str = str(plan)
+        assert ShardedSkipGramModel.IN_TABLE_NAME in plan_str
+        assert ShardedSkipGramModel.OUT_TABLE_NAME in plan_str
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
