@@ -569,3 +569,48 @@ def test_resume_overwrite_wipes_dir_and_returns_fresh(tmp_path):
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
+
+
+@pytest.mark.gpu
+def test_resume_with_corrupted_latest_raises(tmp_path):
+    """``latest`` symlink points to a step dir that was deleted out-of-band.
+
+    The resume path must raise ``RuntimeError`` with the documented
+    message rather than silently start fresh — silent fallback could
+    mask a backup-restore problem.
+    """
+    import os, shutil, torch, torch.distributed as dist
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    try:
+        from rdf2vecgpu.embedders.torchrec_word2vec import (
+            ShardedSkipGramModel,
+            _save_checkpoint,
+            _maybe_resume_checkpoint,
+        )
+        device = torch.device("cuda")
+        m = ShardedSkipGramModel(vocab_size=64, embedding_dim=4).to(device)
+        opt = torch.optim.SGD(m.parameters(), lr=0.01)
+        ckpt_dir = tmp_path / "ckpt"
+
+        _save_checkpoint(
+            m, opt, epoch=0, global_step=1,
+            checkpoint_dir=str(ckpt_dir), keep_last=3,
+            vocab_path="/v", config_snapshot={},
+        )
+        # Manually delete the step dir, leaving the `latest` symlink dangling.
+        step_dir = (ckpt_dir / "latest").resolve()
+        shutil.rmtree(step_dir)
+
+        with pytest.raises(RuntimeError, match="missing or corrupt"):
+            _maybe_resume_checkpoint(
+                m, opt,
+                checkpoint_dir=str(ckpt_dir),
+                overwrite=False, current_vocab_path="/v",
+            )
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()

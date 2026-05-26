@@ -422,7 +422,10 @@ def _maybe_resume_checkpoint(
         return 0, 0
 
     latest = ckpt_root / "latest"
-    if not latest.exists():
+    # ``exists()`` follows symlinks, so a dangling ``latest`` symlink would
+    # silently fall through to "start fresh". Check ``is_symlink()`` first
+    # to surface the corrupt-checkpoint case documented in spec §4.4.
+    if not latest.is_symlink() and not latest.exists():
         # Empty dir, or a never-completed save — start fresh in place.
         return 0, 0
 
