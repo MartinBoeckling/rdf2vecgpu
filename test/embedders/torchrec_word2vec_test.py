@@ -81,3 +81,40 @@ def test_sharded_skipgram_model_constructs_in_degenerate_world_size_one():
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
+
+
+def test_sample_negatives_uniform_shape_and_range():
+    import torch
+    from rdf2vecgpu.embedders.torchrec_word2vec import _sample_negatives
+
+    out = _sample_negatives(
+        n_rows=64,
+        n_neg=5,
+        vocab_size=1024,
+        device=torch.device("cpu"),
+        strategy="uniform",
+        token_counts=None,
+    )
+    assert out.shape == (64, 5)
+    assert out.dtype == torch.long
+    assert int(out.min()) >= 0
+    assert int(out.max()) < 1024
+
+
+def test_sample_negatives_unigram_uses_token_counts():
+    import torch
+    from rdf2vecgpu.embedders.torchrec_word2vec import _sample_negatives
+
+    # All probability mass on a single token (idx=7).
+    counts = torch.zeros(1024)
+    counts[7] = 1.0
+    out = _sample_negatives(
+        n_rows=128,
+        n_neg=3,
+        vocab_size=1024,
+        device=torch.device("cpu"),
+        strategy="unigram",
+        token_counts=counts,
+    )
+    # With all mass on idx=7, every drawn negative must be 7.
+    assert torch.all(out == 7)

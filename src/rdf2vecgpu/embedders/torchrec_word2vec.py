@@ -12,6 +12,41 @@ import torch
 from torch import nn
 
 
+def _sample_negatives(
+    n_rows: int,
+    n_neg: int,
+    vocab_size: int,
+    device: torch.device,
+    strategy: str = "unigram",
+    token_counts: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Sample ``(n_rows, n_neg)`` negative token ids.
+
+    Mirrors the f^0.75 unigram sampler used by the existing pytorch
+    backend (see ``embedders/word2vec.py::_sample_negatives``). Returns
+    a flat ``long`` tensor; the caller is responsible for routing
+    through the sharded output embedding.
+    """
+    if strategy == "uniform":
+        return torch.randint(
+            low=0, high=vocab_size, size=(n_rows, n_neg),
+            dtype=torch.long, device=device,
+        )
+
+    if strategy == "unigram":
+        if token_counts is None:
+            raise ValueError("strategy='unigram' requires token_counts")
+        weights = token_counts.to(device=device, dtype=torch.float32).pow(0.75)
+        # torch.multinomial replaces=True is fine for negative sampling
+        # (rare duplicates within a row are negligible at typical
+        # neg_samples ≤ 25 against vocab_size in the millions).
+        return torch.multinomial(
+            weights, num_samples=n_rows * n_neg, replacement=True,
+        ).view(n_rows, n_neg)
+
+    raise ValueError(f"unknown negative-sampling strategy: {strategy!r}")
+
+
 class ShardedSkipGramModel(nn.Module):
     """Skip-gram with two row-wise sharded embedding tables (in + out).
 
