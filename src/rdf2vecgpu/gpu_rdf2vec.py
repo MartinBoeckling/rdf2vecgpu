@@ -166,8 +166,12 @@ class GPU_RDF2Vec:
             config = RDF2VecConfig(**kwargs)
         # Initialize class variables
         self.config = config
-        # Handle client
-        if self.config.multi_gpu:
+        # Handle client.
+        # backend='torchrec' is multi-process via torchrun (not Dask), so the
+        # Dask-client requirement does not apply — torchrec ranks coordinate
+        # through torch.distributed, and the pre-flight check in
+        # _fit_via_torchrec enforces the torchrun launch contract.
+        if self.config.multi_gpu and self.config.backend != "torchrec":
             if client is None:
                 raise ValueError(
                     "multi_gpu=True requires a Dask client. Please create a "
@@ -700,6 +704,9 @@ class GPU_RDF2Vec:
         # backend dispatch: gensim consumes walks-as-sequences via parquet
         # streaming and trains on CPU; pytorch consumes (center, context)
         # skip-gram pairs and trains on GPU via Lightning.
+        if self.config.backend == "torchrec":
+            self._fit_via_torchrec(edge_df, walk_vertices)
+            return
         if self.config.backend == "gensim":
             walk_sequences = self.walk_generation_sequences(
                 edge_df=edge_df, walk_vertices=walk_vertices
@@ -862,6 +869,53 @@ class GPU_RDF2Vec:
                 )
             finally:
                 shutil.rmtree(walk_dir, ignore_errors=True)
+
+    def _fit_via_torchrec(
+        self, edge_df, walk_vertices: cudf.Series | None = None
+    ) -> None:
+        """Train the sharded skip-gram model via torchrec + Fabric + DCP.
+
+        Pre-flight checks run before any walk generation so the user
+        sees configuration errors immediately rather than mid-run.
+        See ``docs/superpowers/specs/2026-05-26-torchrec-sharded-embeddings-design.md``
+        §5 for the full error-handling contract.
+        """
+        # Pre-flight: model coverage
+        if self.config.embedding_model != "skipgram":
+            raise NotImplementedError(
+                f"backend='torchrec' currently supports embedding_model='skipgram' "
+                f"only (got {self.config.embedding_model!r})."
+            )
+
+        # Pre-flight: multi-GPU is mandatory
+        if not self.config.multi_gpu:
+            raise ValueError(
+                "backend='torchrec' requires multi_gpu=True "
+                "(the sharded embedding path is multi-process by construction)."
+            )
+
+        # Pre-flight: imports
+        try:
+            import torchrec  # noqa: F401
+            import fbgemm_gpu  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                "backend='torchrec' requires the torchrec extra. "
+                "Install with: pip install rdf2vecgpu[torchrec]"
+            ) from e
+
+        # Pre-flight: distributed init
+        import torch.distributed as dist
+        if not dist.is_initialized():
+            raise RuntimeError(
+                "backend='torchrec' requires a distributed launch. "
+                "Run via: torchrun --standalone --nproc_per_node=N your_script.py"
+            )
+
+        # Stubbed for later tasks — wiring lives in
+        # rdf2vecgpu.embedders.torchrec_word2vec.train_torchrec_word2vec
+        from rdf2vecgpu.embedders.torchrec_word2vec import train_torchrec_word2vec
+        train_torchrec_word2vec(self, edge_df, walk_vertices)
 
     def _fit_via_pytorch_sequences(self, walk_sequences) -> None:
         """Train PyTorch skip-gram from walks-as-sequences: checkpoint the
