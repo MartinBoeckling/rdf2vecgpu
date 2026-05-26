@@ -376,3 +376,56 @@ def test_save_checkpoint_prunes_old_step_dirs(tmp_path):
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
+
+
+@pytest.mark.gpu
+def test_save_checkpoint_recovers_from_stale_latest_tmp(tmp_path):
+    """A prior crash may leave a stale ``latest.tmp`` symlink. The next
+    save must clean it up rather than crash. Also verifies that two
+    successive saves atomically swap ``latest``.
+    """
+    import os, torch, torch.distributed as dist
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    try:
+        from rdf2vecgpu.embedders.torchrec_word2vec import (
+            ShardedSkipGramModel,
+            _save_checkpoint,
+        )
+        device = torch.device("cuda")
+        model = ShardedSkipGramModel(vocab_size=64, embedding_dim=4).to(device)
+        opt = torch.optim.SGD(model.parameters(), lr=0.01)
+        ckpt_dir = tmp_path / "ckpt"
+        ckpt_dir.mkdir()
+
+        # Simulate stale latest.tmp from a prior crash.
+        stale = ckpt_dir / "latest.tmp"
+        os.symlink("step_doesnotexist", stale)
+        assert stale.is_symlink()
+
+        # First save should clean it up + write a new latest.
+        _save_checkpoint(
+            model, opt, epoch=0, global_step=100,
+            checkpoint_dir=str(ckpt_dir), keep_last=3,
+            vocab_path="/v", config_snapshot={},
+        )
+        latest_after_1 = ckpt_dir / "latest"
+        assert latest_after_1.is_symlink()
+        assert latest_after_1.resolve().name == "step_00000100"
+        assert not stale.exists()  # latest.tmp consumed
+
+        # Second save should atomically swap the symlink to point at the new step.
+        _save_checkpoint(
+            model, opt, epoch=0, global_step=200,
+            checkpoint_dir=str(ckpt_dir), keep_last=3,
+            vocab_path="/v", config_snapshot={},
+        )
+        latest_after_2 = ckpt_dir / "latest"
+        assert latest_after_2.is_symlink()
+        assert latest_after_2.resolve().name == "step_00000200"
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()

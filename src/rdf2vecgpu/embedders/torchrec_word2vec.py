@@ -272,8 +272,13 @@ def _save_checkpoint(
 ) -> None:
     """Write a DCP shard set + rank-0 metadata.pt + update ``latest`` symlink.
 
+    Crash safety: shards are written to ``step_<N>.tmp/`` first; only
+    after all ranks complete the DCP write does rank 0 rename it to
+    ``step_<N>/`` and update the ``latest`` symlink. A crash mid-write
+    leaves a ``.tmp`` directory that the next run's pruning ignores.
+
     Pruning policy: keep the most recent ``keep_last`` ``step_*``
-    directories; everything else is removed.
+    directories (NOT counting ``*.tmp``); everything else is removed.
 
     Layout (see spec §4.4):
         {checkpoint_dir}/
@@ -289,24 +294,47 @@ def _save_checkpoint(
     import torch.distributed as dist
     import torch.distributed.checkpoint as dcp
 
+    assert keep_last >= 1, f"keep_last must be >= 1, got {keep_last!r}"
+
     ckpt_root = Path(checkpoint_dir)
     ckpt_root.mkdir(parents=True, exist_ok=True)
-    step_dir = ckpt_root / f"step_{global_step:08d}"
-    step_dir.mkdir(parents=True, exist_ok=True)
 
-    # DCP save: all ranks participate.
+    final_name = f"step_{global_step:08d}"
+    tmp_dir = ckpt_root / f"{final_name}.tmp"
+    final_dir = ckpt_root / final_name
+
+    # If a stale tmp from a prior crash exists, rank 0 wipes it.
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if rank == 0 and tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    if dist.is_initialized():
+        dist.barrier()
+
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    # DCP save into the .tmp directory: all ranks participate.
     state_dict = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
     }
     dcp.save(
         state_dict=state_dict,
-        storage_writer=dcp.FileSystemWriter(str(step_dir)),
+        storage_writer=dcp.FileSystemWriter(str(tmp_dir)),
     )
 
-    # Rank-0-only: metadata.pt + latest symlink + pruning.
-    rank = dist.get_rank() if dist.is_initialized() else 0
+    # Barrier so every rank has finished writing into .tmp before
+    # rank 0 promotes it to the final name.
+    if dist.is_initialized():
+        dist.barrier()
+
     if rank == 0:
+        # Promote .tmp -> final via rename. If final_dir already exists
+        # (rerunning the same global_step), remove it first.
+        if final_dir.exists():
+            shutil.rmtree(final_dir)
+        os.rename(tmp_dir, final_dir)
+
+        # metadata.pt
         meta = {
             "epoch": epoch,
             "global_step": global_step,
@@ -317,22 +345,31 @@ def _save_checkpoint(
         }
         torch.save(meta, ckpt_root / "metadata.pt")
 
-        # Atomic symlink update via rename.
+        # Atomic symlink update via tmp + os.replace.
         tmp_link = ckpt_root / "latest.tmp"
         if tmp_link.is_symlink() or tmp_link.exists():
             tmp_link.unlink()
-        os.symlink(step_dir.name, tmp_link)         # relative target
+        os.symlink(final_dir.name, tmp_link)        # relative target
         os.replace(tmp_link, ckpt_root / "latest")
 
-        # Prune: keep the most recent `keep_last` step_* directories.
+    # Barrier so all ranks see the promoted final_dir before pruning.
+    if dist.is_initialized():
+        dist.barrier()
+
+    if rank == 0:
+        # Prune: keep the most recent `keep_last` *finalised* step dirs.
+        # We deliberately exclude ``*.tmp`` so a concurrent save in
+        # flight is never pruned.
         step_dirs = sorted(
-            [p for p in ckpt_root.iterdir() if p.is_dir() and p.name.startswith("step_")],
+            [
+                p for p in ckpt_root.iterdir()
+                if p.is_dir() and p.name.startswith("step_") and not p.name.endswith(".tmp")
+            ],
             key=lambda p: p.name,
         )
         for stale in step_dirs[:-keep_last]:
             shutil.rmtree(stale)
 
-    # Barrier so other ranks don't race ahead of rank-0 housekeeping.
     if dist.is_initialized():
         dist.barrier()
 
