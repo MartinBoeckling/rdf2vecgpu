@@ -26,7 +26,7 @@ def test_torchrec_backend_with_cbow_raises_not_implemented():
 def test_torchrec_backend_without_multi_gpu_raises_value_error():
     cfg = RDF2VecConfig(backend="torchrec", embedding_model="skipgram", multi_gpu=False)
     model = GPU_RDF2Vec(config=cfg)
-    with pytest.raises(ValueError, match="multi_gpu=True"):
+    with pytest.raises(ValueError, match=r"sharded embedding path is multi-process"):
         model.fit(edge_df=None)
 
 
