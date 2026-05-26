@@ -168,6 +168,86 @@ class ShardedSkipGramModel(nn.Module):
         return torch.sum(pos_loss + neg_loss)
 
 
+def extract_embeddings_to_dask_cudf(model, vocab_df):
+    """Return embeddings as a ``dask_cudf.DataFrame`` (one partition per rank).
+
+    Reads the *local* shard of the in-embedding table on each rank;
+    joins it shard-locally with the vocab slice for that token-id
+    range; wraps each rank's cudf.DataFrame as a single dask partition.
+    No rank-0 gather.
+
+    The output schema is::
+
+        token_id  int64
+        entity    string
+        "0"       float32
+        "1"       float32
+        ...
+        str(dim-1) float32
+    """
+    import cudf
+    import cupy
+    import dask_cudf
+    import torch.distributed as dist
+
+    # Locate the in-embedding table parameter on this rank.
+    in_param = _get_in_table_local_tensor(model)         # cuda tensor (local_rows, dim)
+    local_rows, dim = in_param.shape
+
+    # Compute the (start, end) row range this rank owns.
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    start, end = _local_row_range(model.vocab_size, world_size, rank)
+    assert end - start == local_rows, (
+        f"local rows {local_rows} ≠ shard size {end - start} on rank {rank}"
+    )
+
+    # Move to a cudf.DataFrame with dim columns labeled "0".."dim-1".
+    cupy_arr = cupy.asarray(in_param.detach())
+    shard_df = cudf.DataFrame({str(d): cupy_arr[:, d] for d in range(dim)})
+    shard_df["token_id"] = cudf.Series(range(start, end), dtype="int64")
+
+    # Shard-local join with the vocab slice for [start, end).
+    vocab_slice = vocab_df[(vocab_df["token_id"] >= start) & (vocab_df["token_id"] < end)]
+    shard_df = shard_df.merge(vocab_slice, on="token_id", how="left")
+
+    # Wrap each rank's cudf as one dask partition.
+    return dask_cudf.from_cudf(shard_df, npartitions=1)
+
+
+def _local_row_range(vocab_size: int, world_size: int, rank: int) -> tuple[int, int]:
+    """Even split with the remainder absorbed by the last rank."""
+    base = vocab_size // world_size
+    start = rank * base
+    end = vocab_size if rank == world_size - 1 else start + base
+    return start, end
+
+
+def _get_in_table_local_tensor(model) -> torch.Tensor:
+    """Return the rank-local tensor for the in-embedding table.
+
+    Handles both the pre-DMP nn.Module case (`in_collection.embeddings`
+    holds a vanilla nn.Embedding) and the post-DMP sharded case
+    (`local_tensor()` exposes the rank-local slab).
+    """
+    # Post-DMP: torchrec exposes sharded params via a state_dict where
+    # values are ShardedTensor or DTensor with `.local_tensor()`.
+    try:
+        sd = model.state_dict()
+        for key, val in sd.items():
+            if ShardedSkipGramModel.IN_TABLE_NAME in key and "weight" in key:
+                if hasattr(val, "local_tensor"):
+                    return val.local_tensor()
+                return val
+    except Exception:
+        pass
+
+    # Fallback: pre-DMP, walk the EmbeddingCollection's underlying table.
+    for table in model.in_collection.embeddings.values():
+        return table.weight.data
+    raise RuntimeError("could not locate in-embedding table on this rank")
+
+
 def train_torchrec_word2vec(model, edge_df, walk_vertices):
     raise NotImplementedError(
         "train_torchrec_word2vec is a stub — implemented in Task 11."

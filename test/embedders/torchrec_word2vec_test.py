@@ -259,3 +259,42 @@ def test_build_sharding_plan_returns_plan_with_both_tables():
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
+
+
+@pytest.mark.gpu
+def test_extract_embeddings_to_dask_cudf_schema_and_row_count():
+    import os
+    import torch
+    import torch.distributed as dist
+    import cudf
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    try:
+        from rdf2vecgpu.embedders.torchrec_word2vec import (
+            ShardedSkipGramModel,
+            extract_embeddings_to_dask_cudf,
+        )
+        device = torch.device("cuda")
+        model = ShardedSkipGramModel(vocab_size=128, embedding_dim=8).to(device)
+
+        # Build a tiny vocab_df mapping token_id -> entity (str).
+        vocab_df = cudf.DataFrame({
+            "token_id": cudf.Series(range(128), dtype="int64"),
+            "entity":   cudf.Series([f"e{i}" for i in range(128)]),
+        })
+
+        out = extract_embeddings_to_dask_cudf(model, vocab_df)
+        out_pdf = out.compute().to_pandas()
+
+        assert len(out_pdf) == 128
+        # Required columns: token_id, entity, and one column per embedding dim
+        assert "token_id" in out_pdf.columns
+        assert "entity" in out_pdf.columns
+        for d in range(8):
+            assert str(d) in out_pdf.columns, f"missing dim column {d}"
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
