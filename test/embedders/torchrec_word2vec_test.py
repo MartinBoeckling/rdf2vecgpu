@@ -177,3 +177,47 @@ def test_sharded_skipgram_forward_returns_finite_loss():
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
+
+
+@pytest.mark.gpu
+def test_sharded_skipgram_forward_loss_closed_form_with_zero_embeddings():
+    """Zero both embedding tables → every score is 0 → loss is the
+    closed-form ``batch * (1 + n_neg) * log(2)`` (with ``.sum()`` reduction).
+
+    This pins the reduction to ``torch.sum``: ``.mean()`` would shrink
+    the result by the batch size and miss the closed form.
+    """
+    import math
+    import os
+    import torch
+    import torch.distributed as dist
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    try:
+        from rdf2vecgpu.embedders.torchrec_word2vec import ShardedSkipGramModel
+
+        device = torch.device("cuda")
+        model = ShardedSkipGramModel(vocab_size=128, embedding_dim=8).to(device)
+
+        # Zero both tables in-place.
+        with torch.no_grad():
+            for p in model.parameters():
+                p.zero_()
+
+        batch = 16
+        n_neg = 4
+        center = torch.randint(0, 128, (batch,), device=device)
+        context = torch.randint(0, 128, (batch,), device=device)
+        negative = torch.randint(0, 128, (batch, n_neg), device=device)
+
+        loss = model(center, context, negative)
+        expected = batch * (1 + n_neg) * math.log(2)
+        assert torch.isclose(loss, torch.tensor(expected, device=device), atol=1e-4), (
+            f"got {loss.item():.6f}, expected {expected:.6f}"
+        )
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()

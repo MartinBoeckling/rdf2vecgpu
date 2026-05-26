@@ -137,7 +137,12 @@ class ShardedSkipGramModel(nn.Module):
 
         pos_loss = -torch.nn.functional.logsigmoid(pos_score)
         neg_loss = -torch.nn.functional.logsigmoid(-neg_score).sum(dim=-1)
-        return (pos_loss + neg_loss).mean()
+        # SUM over the batch of pairs, not mean. See the comment on
+        # Word2VecSkipgram.forward in embedders/word2vec.py for the
+        # full reasoning: at ~1M pairs/step `.mean()` divides every
+        # row's gradient by ~1M and embeddings never move. With `sum`,
+        # `lr` is the per-pair learning rate, matching classic word2vec.
+        return torch.sum(pos_loss + neg_loss)
 
 
 def train_torchrec_word2vec(model, edge_df, walk_vertices):
