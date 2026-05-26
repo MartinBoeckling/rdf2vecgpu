@@ -260,6 +260,83 @@ def _get_in_table_local_tensor(model) -> torch.Tensor:
     raise RuntimeError("could not locate in-embedding table on this rank")
 
 
+def _save_checkpoint(
+    model,
+    optimizer,
+    epoch: int,
+    global_step: int,
+    checkpoint_dir: str,
+    keep_last: int,
+    vocab_path: str,
+    config_snapshot: dict,
+) -> None:
+    """Write a DCP shard set + rank-0 metadata.pt + update ``latest`` symlink.
+
+    Pruning policy: keep the most recent ``keep_last`` ``step_*``
+    directories; everything else is removed.
+
+    Layout (see spec §4.4):
+        {checkpoint_dir}/
+          step_<global_step:08d>/    # DCP shards, written by all ranks
+          metadata.pt                # rank-0 only
+          latest -> step_*
+    """
+    import os
+    import shutil
+    from pathlib import Path
+
+    import torch
+    import torch.distributed as dist
+    import torch.distributed.checkpoint as dcp
+
+    ckpt_root = Path(checkpoint_dir)
+    ckpt_root.mkdir(parents=True, exist_ok=True)
+    step_dir = ckpt_root / f"step_{global_step:08d}"
+    step_dir.mkdir(parents=True, exist_ok=True)
+
+    # DCP save: all ranks participate.
+    state_dict = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+    }
+    dcp.save(
+        state_dict=state_dict,
+        storage_writer=dcp.FileSystemWriter(str(step_dir)),
+    )
+
+    # Rank-0-only: metadata.pt + latest symlink + pruning.
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if rank == 0:
+        meta = {
+            "epoch": epoch,
+            "global_step": global_step,
+            "rng_state": torch.get_rng_state(),
+            "cuda_rng_state_all": torch.cuda.get_rng_state_all(),
+            "vocab_path": vocab_path,
+            "config_snapshot": config_snapshot,
+        }
+        torch.save(meta, ckpt_root / "metadata.pt")
+
+        # Atomic symlink update via rename.
+        tmp_link = ckpt_root / "latest.tmp"
+        if tmp_link.is_symlink() or tmp_link.exists():
+            tmp_link.unlink()
+        os.symlink(step_dir.name, tmp_link)         # relative target
+        os.replace(tmp_link, ckpt_root / "latest")
+
+        # Prune: keep the most recent `keep_last` step_* directories.
+        step_dirs = sorted(
+            [p for p in ckpt_root.iterdir() if p.is_dir() and p.name.startswith("step_")],
+            key=lambda p: p.name,
+        )
+        for stale in step_dirs[:-keep_last]:
+            shutil.rmtree(stale)
+
+    # Barrier so other ranks don't race ahead of rank-0 housekeeping.
+    if dist.is_initialized():
+        dist.barrier()
+
+
 def train_torchrec_word2vec(model, edge_df, walk_vertices):
     raise NotImplementedError(
         "train_torchrec_word2vec is a stub — implemented in Task 11."

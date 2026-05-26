@@ -302,3 +302,77 @@ def test_extract_embeddings_to_dask_cudf_schema_and_row_count():
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
+
+
+@pytest.mark.gpu
+def test_save_checkpoint_writes_step_dir_metadata_and_latest_symlink(tmp_path):
+    import os, torch, torch.distributed as dist
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    try:
+        from rdf2vecgpu.embedders.torchrec_word2vec import (
+            ShardedSkipGramModel,
+            _save_checkpoint,
+        )
+        device = torch.device("cuda")
+        model = ShardedSkipGramModel(vocab_size=64, embedding_dim=4).to(device)
+        opt = torch.optim.SGD(model.parameters(), lr=0.01)
+
+        ckpt_dir = tmp_path / "ckpt"
+        _save_checkpoint(
+            model, opt,
+            epoch=1, global_step=500,
+            checkpoint_dir=str(ckpt_dir),
+            keep_last=3,
+            vocab_path="/data/vocab.parquet",
+            config_snapshot={"backend": "torchrec"},
+        )
+        # step directory created
+        assert (ckpt_dir / "step_00000500").is_dir()
+        # metadata.pt at root, with the right keys
+        assert (ckpt_dir / "metadata.pt").is_file()
+        meta = torch.load(ckpt_dir / "metadata.pt", weights_only=False)
+        assert meta["epoch"] == 1
+        assert meta["global_step"] == 500
+        assert meta["vocab_path"] == "/data/vocab.parquet"
+        # latest symlink resolves to the step directory
+        latest = ckpt_dir / "latest"
+        assert latest.is_symlink()
+        assert latest.resolve() == (ckpt_dir / "step_00000500").resolve()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.gpu
+def test_save_checkpoint_prunes_old_step_dirs(tmp_path):
+    import os, torch, torch.distributed as dist
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    try:
+        from rdf2vecgpu.embedders.torchrec_word2vec import (
+            ShardedSkipGramModel,
+            _save_checkpoint,
+        )
+        device = torch.device("cuda")
+        model = ShardedSkipGramModel(vocab_size=64, embedding_dim=4).to(device)
+        opt = torch.optim.SGD(model.parameters(), lr=0.01)
+        ckpt_dir = tmp_path / "ckpt"
+
+        for step in (100, 200, 300, 400, 500):
+            _save_checkpoint(
+                model, opt, epoch=0, global_step=step,
+                checkpoint_dir=str(ckpt_dir), keep_last=3,
+                vocab_path="/v", config_snapshot={},
+            )
+        kept = sorted(p.name for p in ckpt_dir.iterdir() if p.name.startswith("step_"))
+        assert kept == ["step_00000300", "step_00000400", "step_00000500"]
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
