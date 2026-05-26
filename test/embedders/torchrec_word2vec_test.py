@@ -142,3 +142,38 @@ def test_sample_negatives_unknown_strategy_raises_with_value():
             device=torch.device("cpu"),
             strategy="bogus", token_counts=None,
         )
+
+
+@pytest.mark.gpu
+def test_sharded_skipgram_forward_returns_finite_loss():
+    import os
+    import torch
+    import torch.distributed as dist
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    try:
+        from rdf2vecgpu.embedders.torchrec_word2vec import (
+            ShardedSkipGramModel,
+            _sample_negatives,
+        )
+
+        device = torch.device("cuda")
+        model = ShardedSkipGramModel(vocab_size=1024, embedding_dim=16).to(device)
+
+        batch = 32
+        center = torch.randint(0, 1024, (batch,), device=device)
+        context = torch.randint(0, 1024, (batch,), device=device)
+        negative = _sample_negatives(
+            n_rows=batch, n_neg=5, vocab_size=1024,
+            device=device, strategy="uniform", token_counts=None,
+        )
+
+        loss = model(center, context, negative)
+        assert loss.dim() == 0
+        assert torch.isfinite(loss).item()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()

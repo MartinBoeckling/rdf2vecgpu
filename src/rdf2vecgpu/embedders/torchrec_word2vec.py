@@ -85,6 +85,60 @@ class ShardedSkipGramModel(nn.Module):
         self.in_collection = EmbeddingCollection(tables=[in_cfg])
         self.out_collection = EmbeddingCollection(tables=[out_cfg])
 
+    def forward(
+        self,
+        center: torch.Tensor,   # (B,) long
+        context: torch.Tensor,  # (B,) long
+        negative: torch.Tensor, # (B, neg) long
+    ) -> torch.Tensor:
+        """Skip-gram negative-sampling loss.
+
+        Mirrors :class:`rdf2vecgpu.embedders.word2vec.Word2VecSkipgram.forward`:
+        positive logit = <in[center], out[context]>;
+        negative logits = <in[center], out[neg]>;
+        loss = -log σ(pos) - Σ log σ(-neg_k).
+        """
+        from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+
+        batch_size = center.size(0)
+        n_neg = negative.size(1)
+
+        # Build KJTs for the two collections. Each row contributes one id
+        # for the in-table (center) and (1 + n_neg) ids for the out-table
+        # (one positive context + n_neg negatives).
+        in_kjt = KeyedJaggedTensor.from_lengths_sync(
+            keys=["center"],
+            values=center,
+            lengths=torch.ones(batch_size, dtype=torch.long, device=center.device),
+        )
+        out_values = torch.cat([context.unsqueeze(1), negative], dim=1).reshape(-1)
+        out_lengths = torch.full(
+            (batch_size,), 1 + n_neg, dtype=torch.long, device=center.device,
+        )
+        out_kjt = KeyedJaggedTensor.from_lengths_sync(
+            keys=["context_or_negative"],
+            values=out_values,
+            lengths=out_lengths,
+        )
+
+        in_dict = self.in_collection(in_kjt)
+        out_dict = self.out_collection(out_kjt)
+
+        center_embed = in_dict["center"].values().view(batch_size, self.embedding_dim)
+        out_embed = (
+            out_dict["context_or_negative"].values().view(batch_size, 1 + n_neg, self.embedding_dim)
+        )
+
+        pos_embed = out_embed[:, 0, :]                # (B, dim)
+        neg_embed = out_embed[:, 1:, :]               # (B, neg, dim)
+
+        pos_score = (center_embed * pos_embed).sum(dim=-1)                            # (B,)
+        neg_score = torch.bmm(neg_embed, center_embed.unsqueeze(-1)).squeeze(-1)      # (B, neg)
+
+        pos_loss = -torch.nn.functional.logsigmoid(pos_score)
+        neg_loss = -torch.nn.functional.logsigmoid(-neg_score).sum(dim=-1)
+        return (pos_loss + neg_loss).mean()
+
 
 def train_torchrec_word2vec(model, edge_df, walk_vertices):
     raise NotImplementedError(
