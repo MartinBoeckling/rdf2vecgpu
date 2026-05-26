@@ -44,6 +44,10 @@ gensim = [
     "gensim>=4.3.0",
     "pyarrow>=15",
 ]
+torchrec = [
+    "torchrec>=0.6.0",
+    "fbgemm-gpu>=0.6.0",
+]
 test = [
     "pytest>=9.0.1",
     "pytest-cov>=7.0.0",
@@ -54,4 +58,5 @@ testpaths = ["test"]
 pythonpath = ["."]
 markers = [
     "gpu: tests that require a CUDA-capable GPU (run with `pytest --gpu`)",
+    "multigpu: tests that require WORLD_SIZE>=2; run with `torchrun --standalone --nproc_per_node=2 -m pytest -m multigpu`",
 ]
