@@ -36,7 +36,11 @@ def _sample_negatives(
     if strategy == "unigram":
         if token_counts is None:
             raise ValueError("strategy='unigram' requires token_counts")
-        weights = token_counts.to(device=device, dtype=torch.float32).pow(0.75)
+        weights = (
+            token_counts.to(device=device, dtype=torch.float32)
+            .clamp(min=0)
+            .pow(0.75)
+        )
         # torch.multinomial replaces=True is fine for negative sampling
         # (rare duplicates within a row are negligible at typical
         # neg_samples ≤ 25 against vocab_size in the millions).

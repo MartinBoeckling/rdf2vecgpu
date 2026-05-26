@@ -118,3 +118,27 @@ def test_sample_negatives_unigram_uses_token_counts():
     )
     # With all mass on idx=7, every drawn negative must be 7.
     assert torch.all(out == 7)
+
+
+def test_sample_negatives_unigram_without_token_counts_raises():
+    import torch
+    from rdf2vecgpu.embedders.torchrec_word2vec import _sample_negatives
+
+    with pytest.raises(ValueError, match="token_counts"):
+        _sample_negatives(
+            n_rows=8, n_neg=2, vocab_size=64,
+            device=torch.device("cpu"),
+            strategy="unigram", token_counts=None,
+        )
+
+
+def test_sample_negatives_unknown_strategy_raises_with_value():
+    import torch
+    from rdf2vecgpu.embedders.torchrec_word2vec import _sample_negatives
+
+    with pytest.raises(ValueError, match="bogus"):
+        _sample_negatives(
+            n_rows=8, n_neg=2, vocab_size=64,
+            device=torch.device("cpu"),
+            strategy="bogus", token_counts=None,
+        )
