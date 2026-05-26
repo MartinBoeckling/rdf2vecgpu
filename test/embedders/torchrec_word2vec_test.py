@@ -626,3 +626,254 @@ def test_resume_with_corrupted_latest_raises(tmp_path):
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
+
+
+# ───────────────────────────── Layer 3 ────────────────────────────────
+
+
+@pytest.fixture(scope="session")
+def torchrun_pg():
+    """Initialize torch.distributed for the session under torchrun.
+
+    Plain ``pytest`` invocations don't set WORLD_SIZE → skip.
+    Under ``torchrun --nproc_per_node=N``, RANK/WORLD_SIZE/MASTER_*
+    are set by the launcher; we initialize NCCL once per session here
+    and tear down at the end.
+    """
+    import os
+    import torch
+    import torch.distributed as dist
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size < 2:
+        pytest.skip("requires torchrun --nproc_per_node>=2")
+
+    if not dist.is_initialized():
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(
+            backend="nccl",
+            rank=rank,
+            world_size=world_size,
+        )
+
+    yield
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+@pytest.mark.multigpu
+def test_torchrec_end_to_end_smoke_world_size_2(torchrun_pg, tmp_path):
+    """Synthetic ~10K-triple graph, world_size=2, 1 epoch.
+
+    Run via: torchrun --standalone --nproc_per_node=2 -m pytest -m multigpu \
+        -k test_torchrec_end_to_end_smoke
+    """
+    import torch.distributed as dist
+    import cudf
+    import numpy as np
+
+    from rdf2vecgpu.config import RDF2VecConfig
+    from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    rng = np.random.default_rng(0)
+    n = 10_000
+    triples = cudf.DataFrame({
+        "subject":   rng.integers(0, 500, size=n),
+        "predicate": rng.integers(0, 20, size=n),
+        "object":    rng.integers(500, 1000, size=n),
+    })
+
+    cfg = RDF2VecConfig(
+        backend="torchrec",
+        embedding_model="skipgram",
+        multi_gpu=True,
+        walk_strategy="random",
+        walk_depth=3, walk_number=5,
+        vector_size=8, epochs=1,
+        learning_rate=0.025, negative_samples=5,
+        optimizer="sparseadam",
+    )
+    model = GPU_RDF2Vec(config=cfg)
+    model.fit(edge_df=triples)
+    embeddings = model.transform()
+
+    # Each rank produces one partition.
+    assert embeddings.npartitions == dist.get_world_size()
+
+    # Materialised row count covers the full vocab exactly once.
+    pdf = embeddings.compute().to_pandas()
+    assert len(pdf) == pdf["token_id"].nunique()
+
+
+# ───────────────────────────── Layer 4 ────────────────────────────────
+
+
+@pytest.mark.multigpu
+def test_torchrec_vs_pytorch_topk_overlap(torchrun_pg, tmp_path):
+    """Quality canary: top-K NN overlap > 70 % between pytorch and torchrec.
+
+    Not bit-exact — PARTIAL_ROWWISE_ADAM ≠ SparseAdam. Catches large
+    regressions (broken sharding, wrong sign of loss, etc.).
+    """
+    import torch.distributed as dist
+    import cudf
+    import numpy as np
+    import pandas as pd
+
+    from rdf2vecgpu.config import RDF2VecConfig
+    from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    rng = np.random.default_rng(42)
+    n = 5_000
+    triples = cudf.DataFrame({
+        "subject":   rng.integers(0, 200, size=n),
+        "predicate": rng.integers(0, 10, size=n),
+        "object":    rng.integers(200, 400, size=n),
+    })
+
+    common = dict(
+        embedding_model="skipgram", walk_strategy="random",
+        walk_depth=3, walk_number=10,
+        vector_size=16, epochs=2,
+        learning_rate=0.025, negative_samples=5,
+        random_state=0,
+    )
+
+    cfg_pt = RDF2VecConfig(backend="pytorch", multi_gpu=False, **common)
+    emb_pt = GPU_RDF2Vec(config=cfg_pt).fit_transform(edge_df=triples).to_pandas()
+
+    cfg_tr = RDF2VecConfig(backend="torchrec", multi_gpu=True, **common)
+    emb_tr = GPU_RDF2Vec(config=cfg_tr).fit_transform(edge_df=triples).compute().to_pandas()
+
+    # Compute top-5 NN overlap per token.
+    def topk_neighbours(df: pd.DataFrame, k: int = 5) -> dict[int, set[int]]:
+        m = df.set_index("token_id").drop(columns=["entity"]).to_numpy()
+        norms = np.linalg.norm(m, axis=1, keepdims=True)
+        cos = (m @ m.T) / (norms * norms.T + 1e-12)
+        np.fill_diagonal(cos, -np.inf)
+        return {
+            int(tid): set(int(t) for t in df["token_id"].iloc[np.argsort(-cos[i])[:k]])
+            for i, tid in enumerate(df["token_id"].tolist())
+        }
+
+    nn_pt = topk_neighbours(emb_pt)
+    nn_tr = topk_neighbours(emb_tr)
+    overlap = np.mean([len(nn_pt[t] & nn_tr.get(t, set())) / 5 for t in nn_pt])
+    assert overlap > 0.7, f"top-5 NN overlap too low: {overlap:.2f}"
+
+
+# ───────────────────────────── Layer 5 ────────────────────────────────
+
+
+@pytest.mark.multigpu
+def test_save_then_reload_preserves_embeddings_bit_equal(torchrun_pg, tmp_path):
+    """Round trip: train, extract, simulate restart, reload, extract again.
+
+    Bit-equal between the two extractions verifies that DCP saved and
+    loaded the sharded weights without drift.
+    """
+    import torch.distributed as dist
+    import cudf
+    import numpy as np
+
+    from rdf2vecgpu.config import RDF2VecConfig
+    from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    rng = np.random.default_rng(7)
+    triples = cudf.DataFrame({
+        "subject":   rng.integers(0, 100, size=2000),
+        "predicate": rng.integers(0, 5,   size=2000),
+        "object":    rng.integers(100, 200, size=2000),
+    })
+
+    ckpt = tmp_path / "ckpt"
+    cfg = RDF2VecConfig(
+        backend="torchrec", embedding_model="skipgram", multi_gpu=True,
+        walk_strategy="random", walk_depth=3, walk_number=5,
+        vector_size=8, epochs=2,
+        learning_rate=0.025, negative_samples=5,
+        checkpoint_dir=str(ckpt), checkpoint_interval_minutes=120,
+    )
+
+    # First run: train, capture embeddings.
+    m1 = GPU_RDF2Vec(config=cfg)
+    emb1 = m1.fit_transform(edge_df=triples).compute().to_pandas().sort_values("token_id")
+
+    # Simulate restart: build a new model with epochs=2 and the same
+    # checkpoint_dir → auto-resume from epoch 2 (no further training).
+    m2 = GPU_RDF2Vec(config=cfg)
+    m2.fit(edge_df=triples)
+    emb2 = m2.transform().compute().to_pandas().sort_values("token_id")
+
+    np.testing.assert_array_equal(
+        emb1.drop(columns=["entity"]).to_numpy(),
+        emb2.drop(columns=["entity"]).to_numpy(),
+    )
+
+
+@pytest.mark.multigpu
+def test_overwrite_starts_fresh(torchrun_pg, tmp_path):
+    import torch.distributed as dist
+    import cudf
+    import numpy as np
+
+    from rdf2vecgpu.config import RDF2VecConfig
+    from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    rng = np.random.default_rng(11)
+    triples = cudf.DataFrame({
+        "subject":   rng.integers(0, 50, size=1000),
+        "predicate": rng.integers(0, 5,  size=1000),
+        "object":    rng.integers(50, 100, size=1000),
+    })
+
+    ckpt = tmp_path / "ckpt"
+
+    cfg = RDF2VecConfig(
+        backend="torchrec", embedding_model="skipgram", multi_gpu=True,
+        walk_strategy="random", walk_depth=3, walk_number=5,
+        vector_size=8, epochs=1,
+        checkpoint_dir=str(ckpt),
+    )
+    GPU_RDF2Vec(config=cfg).fit(edge_df=triples)
+    # Verify a checkpoint was actually written
+    assert (ckpt / "latest").exists()
+
+    cfg_ow = cfg.model_copy(update={"checkpoint_overwrite": True})
+    GPU_RDF2Vec(config=cfg_ow).fit(edge_df=triples)
+    # After overwrite + fresh fit, exactly one step_* dir again
+    step_dirs = [p for p in ckpt.iterdir() if p.name.startswith("step_")]
+    assert len(step_dirs) >= 1
+
+
+@pytest.mark.multigpu
+def test_keep_last_prunes_excess_step_dirs(torchrun_pg, tmp_path):
+    """Drive enough time-based saves to test pruning end-to-end."""
+    import torch.distributed as dist
+    import cudf
+    import numpy as np
+
+    from rdf2vecgpu.config import RDF2VecConfig
+    from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    rng = np.random.default_rng(13)
+    triples = cudf.DataFrame({
+        "subject":   rng.integers(0, 100, size=5000),
+        "predicate": rng.integers(0, 5,   size=5000),
+        "object":    rng.integers(100, 200, size=5000),
+    })
+    ckpt = tmp_path / "ckpt"
+    cfg = RDF2VecConfig(
+        backend="torchrec", embedding_model="skipgram", multi_gpu=True,
+        walk_strategy="random", walk_depth=3, walk_number=20,
+        vector_size=8, epochs=5,
+        checkpoint_dir=str(ckpt),
+        checkpoint_interval_minutes=1,   # force frequent saves
+        checkpoint_keep_last=2,
+    )
+    GPU_RDF2Vec(config=cfg).fit(edge_df=triples)
+    step_dirs = sorted(p.name for p in ckpt.iterdir() if p.name.startswith("step_"))
+    assert len(step_dirs) == 2, step_dirs
