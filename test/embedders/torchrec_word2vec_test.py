@@ -42,6 +42,18 @@ def test_torchrec_backend_without_distributed_init_raises_runtime_error():
         model.fit(edge_df=None)
 
 
+def test_torchrec_transform_without_prior_fit_raises():
+    """Calling transform() on backend='torchrec' before fit() (or after
+    process group teardown) must raise — the sharded model is rank-local
+    and can't be reconstructed.
+    """
+    cfg = RDF2VecConfig(backend="torchrec", embedding_model="skipgram", multi_gpu=True)
+    model = GPU_RDF2Vec(config=cfg)
+    # No fit() call → model._torchrec_model attribute missing.
+    with pytest.raises(RuntimeError, match="rank-local"):
+        model.transform()
+
+
 # ───────────────────────────── Layer 2 ────────────────────────────────
 
 

@@ -1440,6 +1440,20 @@ class GPU_RDF2Vec:
         training run.
 
         """
+        if self.config.backend == "torchrec":
+            if not hasattr(self, "_torchrec_model"):
+                raise RuntimeError(
+                    "transform() on backend='torchrec' must be called within the "
+                    "same distributed launch as fit(). The sharded model is "
+                    "rank-local and cannot be reconstructed after the process "
+                    "group is destroyed."
+                )
+            from rdf2vecgpu.embedders.torchrec_word2vec import (
+                extract_embeddings_to_dask_cudf,
+            )
+            return extract_embeddings_to_dask_cudf(
+                self._torchrec_model, self._torchrec_vocab_df,
+            )
         # Check if model is fitted and word2idx is available
         with self.tracker.stage("Embedding_Extraction"):
             if self.word2vec_model is None or self.word2idx is None:
