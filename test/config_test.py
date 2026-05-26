@@ -176,3 +176,15 @@ def test_checkpoint_defaults_match_spec():
 def test_checkpoint_dir_accepts_string():
     cfg = RDF2VecConfig(checkpoint_dir="/tmp/ckpt")
     assert cfg.checkpoint_dir == "/tmp/ckpt"
+
+
+def test_checkpoint_interval_minutes_rejects_zero():
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        RDF2VecConfig(checkpoint_interval_minutes=0)
+
+
+def test_checkpoint_keep_last_rejects_zero():
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        RDF2VecConfig(checkpoint_keep_last=0)

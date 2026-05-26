@@ -215,7 +215,7 @@ class RDF2VecConfig(BaseModel):
     checkpoint_dir: str | None = Field(default=None)
     checkpoint_interval_minutes: int = Field(default=30, ge=1)
     checkpoint_overwrite: bool = Field(default=False)
-    checkpoint_keep_last: int = Field(default=3, ge=1)
+    checkpoint_keep_last: int = Field(default=3, ge=1)  # >=1 enforced in v1; users wanting effectively no pruning should set a large value (e.g. 9999).
     # library settings
     random_state: int = Field(default=42, ge=0)
     reproducible: bool = False
