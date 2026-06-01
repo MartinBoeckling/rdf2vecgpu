@@ -52,7 +52,7 @@ def _sample_negatives(
 
 
 def _build_sharding_plan(
-    model: nn.Module, world_size: int, device: torch.device,
+    model: nn.Module, world_size: int, device: torch.device, pg=None,
 ) -> "ShardingPlan":  # noqa: F821 (lazy import — see body)
     """Defer to torchrec's planner; no constraints in v1.
 
@@ -60,7 +60,18 @@ def _build_sharding_plan(
     that are large enough to benefit from it. Smaller tables may end up
     table-wise on a single rank, which is fine — the user's reason for
     choosing this backend is the *large* tables.
+
+    Uses ``collective_plan`` (not the rank-local ``plan``) whenever a
+    process group is available: the planner's proposal search is NOT
+    guaranteed to be bit-identical across ranks, and divergent plans give
+    each rank a different shard layout. ``DistributedModelParallel`` then
+    desyncs on the per-shard ``all_gather_object`` in
+    ``_init_from_local_shards`` and hangs forever. ``collective_plan``
+    computes the plan on rank 0 and broadcasts it, so every rank shards
+    identically. With no process group (single-process unit tests) we
+    fall back to the rank-local ``plan``.
     """
+    import torch.distributed as dist
     from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
     from torchrec.distributed.types import ModuleSharder
     from torchrec.distributed.embedding import EmbeddingCollectionSharder
@@ -71,6 +82,11 @@ def _build_sharding_plan(
     )
     planner = EmbeddingShardingPlanner(topology=topology)
     sharders: list[ModuleSharder] = [EmbeddingCollectionSharder()]
+
+    if pg is None and dist.is_available() and dist.is_initialized():
+        pg = dist.group.WORLD
+    if pg is not None:
+        return planner.collective_plan(model, sharders, pg)
     return planner.plan(model, sharders=sharders)
 
 
@@ -472,23 +488,38 @@ def _maybe_resume_checkpoint(
     return int(meta["epoch"]), int(meta["global_step"])
 
 
-def train_torchrec_word2vec(rdf2vec, edge_df, walk_vertices) -> None:
-    """Top-level training entry point for the torchrec backend.
+def train_torchrec_word2vec(rdf2vec, walks_path, vocab_path) -> None:
+    """Top-level training entry point for the torchrec backend (decoupled).
 
-    Called from :meth:`GPU_RDF2Vec._fit_via_torchrec` once pre-flight
-    checks have passed. ``rdf2vec`` is the :class:`GPU_RDF2Vec`
-    instance, which owns the config, the tracker, and the walk-corpus
-    machinery.
+    Called from :meth:`GPU_RDF2Vec.fit_from_walks` once pre-flight checks
+    have passed. ``rdf2vec`` is the :class:`GPU_RDF2Vec` instance, which
+    owns the config and the tracker.
+
+    Consumes a PRE-GENERATED walk corpus + vocab from disk — it does NOT
+    generate walks or build vocab. Those steps require a Dask-CUDA cluster
+    / cuGraph dask comms, which cannot coexist with the torchrun/NCCL
+    process group this function runs under (each multi-GPU paradigm wants
+    to own all GPUs; you cannot run a ``LocalCUDACluster`` inside every
+    torchrun rank). Prepare the corpus separately via
+    :meth:`GPU_RDF2Vec.prepare_corpus` (outside torchrun). See
+    ``docs/superpowers/specs/2026-05-26-torchrec-sharded-embeddings-design.md``
+    §4.
+
+    Parameters
+    ----------
+    walks_path : str
+        Parquet directory of walks-as-sequences (``vertices`` /
+        ``predicates`` list columns), as written by ``prepare_corpus``.
+        Lives on a filesystem visible at the same path to every rank.
+    vocab_path : str
+        Parquet file mapping ``token_id`` (int64) ↔ ``entity`` (string),
+        as written by ``prepare_corpus``. Also used as the DCP resume
+        identity key.
 
     Implementation notes
     --------------------
-    * Walks are generated via the multi-GPU walk-sequence path and
-      checkpointed to a temp parquet directory so the (eventually
-      torn-down) dask cluster does not have to stay alive through
-      training.
-    * Vocab build and pair-loader construction live on the rdf2vec
-      instance as helpers (:meth:`_build_vocab_for_walks`,
-      :meth:`_build_walk_pair_loader`) — see ``gpu_rdf2vec.py``.
+    * Pair-loader construction lives on the rdf2vec instance
+      (:meth:`_build_walk_pair_loader`) — see ``gpu_rdf2vec.py``.
     * All embedding parameters are fused via
       ``apply_optimizer_in_backward``; the standalone optimizer is a
       ``_NullOptimizer`` whose ``state_dict()`` is empty (DCP still
@@ -503,44 +534,16 @@ def train_torchrec_word2vec(rdf2vec, edge_df, walk_vertices) -> None:
 
     cfg = rdf2vec.config
 
-    # 1. Walk generation — backend-agnostic; uses existing multi-GPU path.
-    #    `walk_generation_sequences` returns an (eager / dask) cudf frame
-    #    of walks-as-sequences. We checkpoint it to a temp parquet dir so
-    #    the dask cluster can be torn down before model construction and
-    #    the resume path can identity-check vocab+walks against disk
-    #    artefacts. The dir is intentionally *not* cleaned up here —
-    #    DCP-resumed runs need both walks and vocab present on disk for
-    #    `_maybe_resume_checkpoint` to validate identity. Callers that
-    #    don't checkpoint can rely on the OS tempfile cleanup at shutdown.
-    #
-    #    Multi-rank correctness: the walk generator is stochastic and
-    #    writes to a tempfile-derived path; if every rank invoked it,
-    #    each rank would (a) re-roll independent walks and (b) write to
-    #    its own path that other ranks cannot read. Wrap with a
-    #    rank-0-only block + broadcast the path so all ranks read a
-    #    single shared walks corpus.
-    import torch.distributed as dist
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    if rank == 0:
-        walks_seq = rdf2vec.walk_generation_sequences(
-            edge_df=edge_df, walk_vertices=walk_vertices,
-        )
-        walks_path = _materialize_walks_sequences_to_parquet(walks_seq)
-        path_holder = [walks_path]
-    else:
-        path_holder = [None]
-    if dist.is_initialized():
-        dist.broadcast_object_list(path_holder, src=0)
-        dist.barrier()
-    walks_path = path_holder[0]
-
-    # 2. Vocab build / load — returns the existing word2idx (built upstream
-    #    by load_data()), token-frequency counts from the walks parquet,
-    #    and an on-disk vocab parquet path used to identity-check resumes.
-    vocab_df, token_counts, vocab_path = rdf2vec._build_vocab_for_walks(walks_path)
+    # 1. Load vocab + token counts from the prepared corpus. No walk
+    #    generation, no dask, no cuGraph here — see the function docstring
+    #    for why those cannot run under torchrun. ``vocab_path`` doubles as
+    #    the DCP resume identity key.
+    vocab_df, token_counts, vocab_path = rdf2vec._load_corpus_vocab(
+        walks_path, vocab_path
+    )
     vocab_size = len(vocab_df)
 
-    # 3. Fabric.
+    # 2. Fabric.
     fabric = Fabric(
         accelerator="gpu",
         devices="auto",
@@ -548,12 +551,12 @@ def train_torchrec_word2vec(rdf2vec, edge_df, walk_vertices) -> None:
     )
     fabric.launch()
 
-    # 4. Build the sharded model.
+    # 3. Build the sharded model.
     model = ShardedSkipGramModel(
         vocab_size=vocab_size, embedding_dim=cfg.vector_size,
     ).to(fabric.device)
 
-    # 5. Attach fused optimizer via apply_optimizer_in_backward BEFORE
+    # 4. Attach fused optimizer via apply_optimizer_in_backward BEFORE
     #    wrapping in DistributedModelParallel. This is the torchrec
     #    idiom: DMP detects the optimizer-in-backward marker on the raw
     #    embedding parameters and produces fused embedding+optimizer
@@ -571,14 +574,14 @@ def train_torchrec_word2vec(rdf2vec, edge_df, walk_vertices) -> None:
     # *some* optimizer object to round-trip).
     optimizer = _NullOptimizer()
 
-    # 6. Build plan + wrap in DMP. The optimizer-in-backward hooks
+    # 5. Build plan + wrap in DMP. The optimizer-in-backward hooks
     #    attached above survive the DMP wrapping.
     plan = _build_sharding_plan(model, world_size=fabric.world_size, device=fabric.device)
     model = DistributedModelParallel(
         module=model, device=fabric.device, plan=plan, init_data_parallel=False,
     )
 
-    # 7. Maybe resume.
+    # 6. Maybe resume.
     start_epoch, start_step = _maybe_resume_checkpoint(
         model, optimizer,
         checkpoint_dir=cfg.checkpoint_dir,
@@ -586,11 +589,11 @@ def train_torchrec_word2vec(rdf2vec, edge_df, walk_vertices) -> None:
         current_vocab_path=vocab_path,
     )
 
-    # 8. DataLoader — yields (center, context) long-tensor batches.
+    # 7. DataLoader — yields (center, context) long-tensor batches.
     loader = rdf2vec._build_walk_pair_loader(walks_path, vocab_df)
     loader = fabric.setup_dataloaders(loader, use_distributed_sampler=False)
 
-    # 9. Training loop. NOTE: do NOT skip empty batches on a single rank
+    # 8. Training loop. NOTE: do NOT skip empty batches on a single rank
     #    — peer ranks would still call fabric.backward and the NCCL
     #    collective would hang waiting for the absent rank. If a rank
     #    has no work it must still participate in the collective; in
@@ -710,9 +713,9 @@ class _NullOptimizer:
         pass
 
 
-def _materialize_walks_sequences_to_parquet(walks_seq) -> str:
-    """Persist the (dask_)cudf walks-sequences frame to a temp parquet
-    directory and return its path.
+def _materialize_walks_sequences_to_parquet(walks_seq, walks_parquet=None) -> str:
+    """Persist the (dask_)cudf walks-sequences frame to a parquet directory
+    and return its path.
 
     Mirrors what :meth:`GPU_RDF2Vec._fit_via_gensim` and
     :meth:`GPU_RDF2Vec._fit_via_pytorch_sequences` do — re-persist the
@@ -721,17 +724,29 @@ def _materialize_walks_sequences_to_parquet(walks_seq) -> str:
     generator on ``to_parquet``) and write each partition as a parquet
     file. For an in-memory cudf frame, write a single ``part.0.parquet``.
 
-    The temp directory is created via ``tempfile.mkdtemp`` and is NOT
-    cleaned up by this function — callers either rely on OS tempfile
-    cleanup at shutdown, or pass the path through DCP checkpoint
-    metadata (in which case resume needs the path to persist across
-    runs and the user is responsible for the cleanup).
+    Parameters
+    ----------
+    walks_seq
+        The (dask_)cudf walks-as-sequences frame.
+    walks_parquet : str, optional
+        Target parquet directory. When ``None`` (the default), a fresh
+        ``tempfile.mkdtemp`` directory is used — handy for throwaway
+        corpora. ``prepare_corpus`` passes an explicit, stable path so
+        the corpus is addressable across the prep→train process boundary
+        and across DCP resume runs.
+
+    Notes
+    -----
+    The directory is NOT cleaned up by this function — callers either
+    rely on OS tempfile cleanup at shutdown, or (for ``prepare_corpus``)
+    own the lifecycle of the corpus directory explicitly.
     """
     import os
     import tempfile
 
-    walks_dir = tempfile.mkdtemp(prefix="rdf2vec_torchrec_walks_")
-    walks_parquet = f"{walks_dir}/walks"
+    if walks_parquet is None:
+        walks_dir = tempfile.mkdtemp(prefix="rdf2vec_torchrec_walks_")
+        walks_parquet = f"{walks_dir}/walks"
     if hasattr(walks_seq, "persist"):
         from dask.distributed import wait as dask_wait
 

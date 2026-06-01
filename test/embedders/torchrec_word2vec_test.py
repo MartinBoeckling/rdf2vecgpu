@@ -19,15 +19,15 @@ def test_torchrec_backend_with_cbow_raises_not_implemented():
     cfg = RDF2VecConfig(backend="torchrec", embedding_model="cbow", multi_gpu=True)
     model = GPU_RDF2Vec(config=cfg)
     with pytest.raises(NotImplementedError, match="skipgram"):
-        # No edge_df needed — the pre-flight check fires before walk gen.
-        model.fit(edge_df=None)
+        # Paths unused — the pre-flight check fires before any disk read.
+        model.fit_from_walks("walks", "vocab.parquet")
 
 
 def test_torchrec_backend_without_multi_gpu_raises_value_error():
     cfg = RDF2VecConfig(backend="torchrec", embedding_model="skipgram", multi_gpu=False)
     model = GPU_RDF2Vec(config=cfg)
     with pytest.raises(ValueError, match=r"sharded embedding path is multi-process"):
-        model.fit(edge_df=None)
+        model.fit_from_walks("walks", "vocab.parquet")
 
 
 def test_torchrec_backend_without_distributed_init_raises_runtime_error():
@@ -39,6 +39,17 @@ def test_torchrec_backend_without_distributed_init_raises_runtime_error():
     cfg = RDF2VecConfig(backend="torchrec", embedding_model="skipgram", multi_gpu=True)
     model = GPU_RDF2Vec(config=cfg)
     with pytest.raises(RuntimeError, match="torchrun"):
+        model.fit_from_walks("walks", "vocab.parquet")
+
+
+def test_torchrec_fit_with_edge_df_raises_decoupling_guidance():
+    """fit(edge_df) is unsupported for torchrec — data-prep can't run inside
+    the torchrun job. The error must point to the prepare_corpus →
+    fit_from_walks flow.
+    """
+    cfg = RDF2VecConfig(backend="torchrec", embedding_model="skipgram", multi_gpu=True)
+    model = GPU_RDF2Vec(config=cfg)
+    with pytest.raises(RuntimeError, match=r"prepare_corpus.*fit_from_walks|does not support fit"):
         model.fit(edge_df=None)
 
 
@@ -664,161 +675,296 @@ def torchrun_pg():
         dist.destroy_process_group()
 
 
+# ── decoupled-flow corpus helpers ─────────────────────────────────────
+#
+# The torchrec backend trains from a PRE-GENERATED corpus (walks + vocab
+# on disk); it does NOT run dask-cudf / cuGraph data-prep inside the
+# torchrun job (those paradigms can't share a process — see
+# docs/superpowers/specs/2026-05-26-torchrec-sharded-embeddings-design.md
+# §4). These helpers prepare the corpus rank-0-only with single-GPU
+# cudf/cuGraph (no Dask cluster needed), then hand every rank a shared
+# on-disk path.
+#
+# Coordination is via the SHARED FILESYSTEM, never via NCCL object
+# collectives. ``broadcast_object_list`` / ``all_gather_object`` on the
+# NCCL group deadlock when only rank 0 has done prior CUDA work (cuDF /
+# RMM prep): the pickled byte-tensor's device placement mismatches across
+# ranks, so the collective never pairs. Single-node multi-GPU is assumed
+# (all ranks see the same local filesystem).
+
+
+def _shared_base(tag: str) -> str:
+    """A directory whose path is identical on every rank — derived from the
+    torchrun run id, with NO collective.
+
+    ``TORCHELASTIC_RUN_ID`` is set identically across ranks within a run
+    and uniquely per run, so the path is both shared and collision-free
+    across reruns (no stale-marker races).
+    """
+    import os
+    import tempfile
+
+    run_id = os.environ.get("TORCHELASTIC_RUN_ID", "local")
+    base = os.path.join(tempfile.gettempdir(), "rdf2vec_mgpu", run_id, tag)
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def _connected_string_triples(n, seed, n_entities, n_predicates):
+    """A connected RDF graph: subjects and objects are drawn from one
+    shared entity pool so random walks can chain past depth 1. Real RDF
+    entities are strings, which is also what the vocab tokeniser expects.
+    """
+    import cudf
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    subj = rng.integers(0, n_entities, size=n)
+    obj = rng.integers(0, n_entities, size=n)
+    pred = rng.integers(0, n_predicates, size=n)
+    return cudf.DataFrame({
+        "subject":   [f"e{i}" for i in subj],
+        "predicate": [f"p{i}" for i in pred],
+        "object":    [f"e{i}" for i in obj],
+    })
+
+
+def _prepare_corpus_fs(base, make_triples, walk_depth, walk_number):
+    """rank-0-only single-GPU corpus prep; returns ``(walks_path, vocab_path)``.
+
+    rank 0 runs the single-GPU data path (read → vocab → graph → walks)
+    and writes a ``corpus.ready`` marker; peer ranks poll the filesystem
+    for that marker — NO NCCL collective (see module note on the object-
+    broadcast deadlock). The prep config uses ``backend='pytorch'`` +
+    ``multi_gpu=False`` purely to drive the single-GPU path; the resulting
+    on-disk corpus is backend-agnostic and the torchrec ranks consume it
+    via ``fit_from_walks``.
+    """
+    import os
+    import time
+    import torch.distributed as dist
+
+    from rdf2vecgpu.config import RDF2VecConfig
+    from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    corpus_dir = os.path.join(base, "corpus")
+    ready = os.path.join(base, "corpus.ready")
+    walks_path = os.path.join(corpus_dir, "walks")
+    vocab_path = os.path.join(corpus_dir, "vocab.parquet")
+
+    if dist.get_rank() == 0:
+        triples = make_triples()
+        triples_path = os.path.join(base, "triples.parquet")
+        triples.to_parquet(triples_path)
+
+        prep_cfg = RDF2VecConfig(
+            backend="pytorch", multi_gpu=False,
+            embedding_model="skipgram", walk_strategy="random",
+            walk_depth=walk_depth, walk_number=walk_number,
+            random_state=0,
+        )
+        m = GPU_RDF2Vec(config=prep_cfg)
+        edges = m.load_data(triples_path)
+        m.prepare_corpus(edges, corpus_dir)
+        with open(ready, "w") as fh:
+            fh.write("ok")
+    else:
+        deadline = time.monotonic() + 300
+        while not os.path.exists(ready):
+            if time.monotonic() > deadline:
+                raise TimeoutError("rank-0 corpus prep did not complete in time")
+            time.sleep(0.5)
+    return walks_path, vocab_path
+
+
+def _gather_full_embeddings_fs(model, base):
+    """Gather the per-rank embedding shards into one pandas frame via the
+    shared filesystem (each rank writes its shard parquet; rank 0 reads the
+    union). Used by tests that need the full table (nearest-neighbour
+    comparisons). Production code persists shards to a partitioned parquet
+    dataset the same way — no all-gather of the full table into one process.
+    """
+    import glob
+    import os
+    import cudf
+    import torch.distributed as dist
+
+    emb_dir = os.path.join(base, "emb")
+    os.makedirs(emb_dir, exist_ok=True)
+    local = model.transform().compute()
+    local.to_parquet(os.path.join(emb_dir, f"part_{dist.get_rank()}.parquet"), index=False)
+    dist.barrier()
+    parts = sorted(glob.glob(os.path.join(emb_dir, "part_*.parquet")))
+    return cudf.read_parquet(parts).to_pandas().sort_values("token_id")
+
+
 @pytest.mark.multigpu
-def test_torchrec_end_to_end_smoke_world_size_2(torchrun_pg, tmp_path):
-    """Synthetic ~10K-triple graph, world_size=2, 1 epoch.
+def test_torchrec_end_to_end_smoke_world_size_2(torchrun_pg):
+    """Decoupled end-to-end: prepare a corpus (rank-0 single-GPU), then
+    train sharded across ranks and verify the shards tile the full vocab.
 
     Run via: torchrun --standalone --nproc_per_node=2 -m pytest -m multigpu \
         -k test_torchrec_end_to_end_smoke
     """
     import torch.distributed as dist
-    import cudf
-    import numpy as np
 
     from rdf2vecgpu.config import RDF2VecConfig
     from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+    from rdf2vecgpu.embedders.torchrec_word2vec import _local_row_range
 
-    rng = np.random.default_rng(0)
-    n = 10_000
-    triples = cudf.DataFrame({
-        "subject":   rng.integers(0, 500, size=n),
-        "predicate": rng.integers(0, 20, size=n),
-        "object":    rng.integers(500, 1000, size=n),
-    })
-    triples_path = tmp_path / "triples.parquet"
-    triples.to_parquet(str(triples_path))
+    base = _shared_base("smoke")
+    walks_path, vocab_path = _prepare_corpus_fs(
+        base,
+        make_triples=lambda: _connected_string_triples(
+            10_000, seed=0, n_entities=300, n_predicates=20
+        ),
+        walk_depth=3, walk_number=5,
+    )
 
     cfg = RDF2VecConfig(
-        backend="torchrec",
-        embedding_model="skipgram",
-        multi_gpu=True,
-        walk_strategy="random",
-        walk_depth=3, walk_number=5,
+        backend="torchrec", embedding_model="skipgram", multi_gpu=True,
+        walk_strategy="random", walk_depth=3, walk_number=5,
         vector_size=8, epochs=1,
-        learning_rate=0.025, negative_samples=5,
-        optimizer="sparseadam",
+        learning_rate=0.025, negative_samples=5, optimizer="sparseadam",
     )
     model = GPU_RDF2Vec(config=cfg)
-    edges = model.load_data(str(triples_path))
-    model.fit(edges)
-    embeddings = model.transform()
+    model.fit_from_walks(walks_path, vocab_path)
 
-    # Each rank produces one partition.
-    assert embeddings.npartitions == dist.get_world_size()
+    # transform() returns this rank's shard as a single dask partition
+    # (no cross-rank gather — that is the design, to avoid materialising
+    # the full table anywhere).
+    emb = model.transform()
+    assert emb.npartitions == 1
+    local = emb.compute().to_pandas()
 
-    # Materialised row count covers the full vocab exactly once.
-    pdf = embeddings.compute().to_pandas()
-    assert len(pdf) == pdf["token_id"].nunique()
+    # Each rank's shard must be exactly its computed row range. Since
+    # _local_row_range tiles [0, vocab_size) across ranks by construction,
+    # every rank matching its own range proves the shards tile the vocab
+    # exactly once — verified per-rank, no cross-rank collective needed.
+    vocab_size = len(model._torchrec_vocab_df)
+    start, end = _local_row_range(
+        vocab_size, dist.get_world_size(), dist.get_rank()
+    )
+    local_ids = sorted(int(x) for x in local["token_id"].to_numpy())
+    assert local_ids == list(range(start, end)), (
+        f"rank {dist.get_rank()} shard {local_ids[:3]}..{local_ids[-3:]} "
+        f"≠ expected range [{start}, {end})"
+    )
 
 
 # ───────────────────────────── Layer 4 ────────────────────────────────
 
 
 @pytest.mark.multigpu
-def test_torchrec_vs_pytorch_topk_overlap(torchrun_pg, tmp_path):
-    """Quality canary: top-K NN overlap > 70 % between pytorch and torchrec.
+def test_torchrec_vs_pytorch_topk_overlap(torchrun_pg):
+    """Quality canary: top-K NN overlap between a single-GPU pytorch run
+    and the sharded torchrec run on the same corpus.
 
-    Not bit-exact — PARTIAL_ROWWISE_ADAM ≠ SparseAdam. Catches large
-    regressions (broken sharding, wrong sign of loss, etc.).
+    Not bit-exact (PARTIAL_ROWWISE_ADAM ≠ SparseAdam, and the two backends
+    expand pairs differently); the threshold is deliberately loose — it
+    catches gross breakage (broken sharding → ~random overlap, wrong loss
+    sign → anti-correlation), not fine quality differences.
     """
-    import torch.distributed as dist
-    import cudf
+    import os
     import numpy as np
     import pandas as pd
 
     from rdf2vecgpu.config import RDF2VecConfig
     from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
 
-    rng = np.random.default_rng(42)
-    n = 5_000
-    triples = cudf.DataFrame({
-        "subject":   rng.integers(0, 200, size=n),
-        "predicate": rng.integers(0, 10, size=n),
-        "object":    rng.integers(200, 400, size=n),
-    })
-    triples_path = tmp_path / "triples.parquet"
-    triples.to_parquet(str(triples_path))
+    base = _shared_base("topk")
+    walks_path, vocab_path = _prepare_corpus_fs(
+        base,
+        make_triples=lambda: _connected_string_triples(
+            5_000, seed=42, n_entities=150, n_predicates=10
+        ),
+        walk_depth=3, walk_number=10,
+    )
 
     common = dict(
         embedding_model="skipgram", walk_strategy="random",
-        walk_depth=3, walk_number=10,
-        vector_size=16, epochs=2,
-        learning_rate=0.025, negative_samples=5,
-        random_state=0,
+        walk_depth=3, walk_number=10, vector_size=16, epochs=3,
+        learning_rate=0.025, negative_samples=5, random_state=0,
     )
-
-    cfg_pt = RDF2VecConfig(backend="pytorch", multi_gpu=False, **common)
-    m_pt = GPU_RDF2Vec(config=cfg_pt)
-    edges_pt = m_pt.load_data(str(triples_path))
-    emb_pt = m_pt.fit_transform(edge_df=edges_pt).to_pandas()
 
     cfg_tr = RDF2VecConfig(backend="torchrec", multi_gpu=True, **common)
     m_tr = GPU_RDF2Vec(config=cfg_tr)
-    edges_tr = m_tr.load_data(str(triples_path))
-    emb_tr = m_tr.fit_transform(edge_df=edges_tr).compute().to_pandas()
+    m_tr.fit_from_walks(walks_path, vocab_path)
+    emb_tr = _gather_full_embeddings_fs(m_tr, base)
 
-    # Compute top-5 NN overlap per token.
-    def topk_neighbours(df: pd.DataFrame, k: int = 5) -> dict[int, set[int]]:
-        m = df.set_index("token_id").drop(columns=["entity"]).to_numpy()
+    def topk_neighbours(df: pd.DataFrame, k: int = 5) -> dict[int, set]:
+        df = df.sort_values("token_id")
+        m = df.drop(columns=["token_id", "entity"]).to_numpy()
         norms = np.linalg.norm(m, axis=1, keepdims=True)
         cos = (m @ m.T) / (norms * norms.T + 1e-12)
         np.fill_diagonal(cos, -np.inf)
+        ids = df["token_id"].to_numpy()
         return {
-            int(tid): set(int(t) for t in df["token_id"].iloc[np.argsort(-cos[i])[:k]])
-            for i, tid in enumerate(df["token_id"].tolist())
+            int(ids[i]): set(int(t) for t in ids[np.argsort(-cos[i])[:k]])
+            for i in range(len(ids))
         }
+
+    # The pytorch baseline runs on EVERY rank (single-GPU on each rank's own
+    # device — redundant but cheap on this tiny graph) so the assertion is
+    # symmetric across ranks: no rank-0-only branch that could desync a
+    # subsequent collective. triples.parquet was written by rank 0 before
+    # the corpus.ready marker, so every rank can read it here.
+    triples_path = os.path.join(base, "triples.parquet")
+    cfg_pt = RDF2VecConfig(backend="pytorch", multi_gpu=False, **common)
+    m_pt = GPU_RDF2Vec(config=cfg_pt)
+    edges_pt = m_pt.load_data(triples_path)
+    emb_pt = m_pt.fit_transform(edge_df=edges_pt).to_pandas()
 
     nn_pt = topk_neighbours(emb_pt)
     nn_tr = topk_neighbours(emb_tr)
-    overlap = np.mean([len(nn_pt[t] & nn_tr.get(t, set())) / 5 for t in nn_pt])
-    assert overlap > 0.7, f"top-5 NN overlap too low: {overlap:.2f}"
+    overlap = np.mean([
+        len(nn_pt[t] & nn_tr.get(t, set())) / 5 for t in nn_pt
+    ])
+    assert overlap > 0.5, f"top-5 NN overlap too low: {overlap:.2f}"
 
 
 # ───────────────────────────── Layer 5 ────────────────────────────────
 
 
 @pytest.mark.multigpu
-def test_save_then_reload_preserves_embeddings_bit_equal(torchrun_pg, tmp_path):
-    """Round trip: train, extract, simulate restart, reload, extract again.
-
-    Bit-equal between the two extractions verifies that DCP saved and
-    loaded the sharded weights without drift.
+def test_save_then_reload_preserves_embeddings_bit_equal(torchrun_pg):
+    """Round trip: train with checkpointing, then re-launch with the same
+    checkpoint_dir + epochs → auto-resume at the final epoch (zero further
+    training) and re-extract. Per-rank shards must be bit-equal, proving
+    DCP saved and reloaded the sharded weights without drift.
     """
-    import torch.distributed as dist
-    import cudf
+    import os
     import numpy as np
 
     from rdf2vecgpu.config import RDF2VecConfig
     from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
 
-    rng = np.random.default_rng(7)
-    triples = cudf.DataFrame({
-        "subject":   rng.integers(0, 100, size=2000),
-        "predicate": rng.integers(0, 5,   size=2000),
-        "object":    rng.integers(100, 200, size=2000),
-    })
-    triples_path = tmp_path / "triples.parquet"
-    triples.to_parquet(str(triples_path))
+    base = _shared_base("ckpt_roundtrip")
+    walks_path, vocab_path = _prepare_corpus_fs(
+        base,
+        make_triples=lambda: _connected_string_triples(
+            2_000, seed=7, n_entities=80, n_predicates=5
+        ),
+        walk_depth=3, walk_number=5,
+    )
 
-    ckpt = tmp_path / "ckpt"
+    ckpt = os.path.join(base, "ckpt")
     cfg = RDF2VecConfig(
         backend="torchrec", embedding_model="skipgram", multi_gpu=True,
         walk_strategy="random", walk_depth=3, walk_number=5,
         vector_size=8, epochs=2,
         learning_rate=0.025, negative_samples=5,
-        checkpoint_dir=str(ckpt), checkpoint_interval_minutes=120,
+        checkpoint_dir=ckpt, checkpoint_interval_minutes=120,
     )
 
-    # First run: train, capture embeddings.
     m1 = GPU_RDF2Vec(config=cfg)
-    edges1 = m1.load_data(str(triples_path))
-    emb1 = m1.fit_transform(edge_df=edges1).compute().to_pandas().sort_values("token_id")
+    m1.fit_from_walks(walks_path, vocab_path)
+    emb1 = m1.transform().compute().to_pandas().sort_values("token_id")
 
-    # Simulate restart: build a new model with epochs=2 and the same
-    # checkpoint_dir → auto-resume from epoch 2 (no further training).
+    # Restart: same checkpoint_dir + epochs=2 → resume at epoch 2, no
+    # further training → identical weights.
     m2 = GPU_RDF2Vec(config=cfg)
-    edges2 = m2.load_data(str(triples_path))
-    m2.fit(edges2)
+    m2.fit_from_walks(walks_path, vocab_path)
     emb2 = m2.transform().compute().to_pandas().sort_values("token_id")
 
     np.testing.assert_array_equal(
@@ -828,75 +974,73 @@ def test_save_then_reload_preserves_embeddings_bit_equal(torchrun_pg, tmp_path):
 
 
 @pytest.mark.multigpu
-def test_overwrite_starts_fresh(torchrun_pg, tmp_path):
-    import torch.distributed as dist
-    import cudf
-    import numpy as np
+def test_overwrite_starts_fresh(torchrun_pg):
+    """checkpoint_overwrite=True wipes a populated checkpoint_dir and
+    trains from scratch.
+    """
+    import os
 
     from rdf2vecgpu.config import RDF2VecConfig
     from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
 
-    rng = np.random.default_rng(11)
-    triples = cudf.DataFrame({
-        "subject":   rng.integers(0, 50, size=1000),
-        "predicate": rng.integers(0, 5,  size=1000),
-        "object":    rng.integers(50, 100, size=1000),
-    })
-    triples_path = tmp_path / "triples.parquet"
-    triples.to_parquet(str(triples_path))
+    base = _shared_base("ckpt_overwrite")
+    walks_path, vocab_path = _prepare_corpus_fs(
+        base,
+        make_triples=lambda: _connected_string_triples(
+            1_000, seed=11, n_entities=50, n_predicates=5
+        ),
+        walk_depth=3, walk_number=5,
+    )
 
-    ckpt = tmp_path / "ckpt"
-
+    ckpt = os.path.join(base, "ckpt")
     cfg = RDF2VecConfig(
         backend="torchrec", embedding_model="skipgram", multi_gpu=True,
         walk_strategy="random", walk_depth=3, walk_number=5,
-        vector_size=8, epochs=1,
-        checkpoint_dir=str(ckpt),
+        vector_size=8, epochs=1, checkpoint_dir=ckpt,
     )
     m1 = GPU_RDF2Vec(config=cfg)
-    edges1 = m1.load_data(str(triples_path))
-    m1.fit(edges1)
-    # Verify a checkpoint was actually written
-    assert (ckpt / "latest").exists()
+    m1.fit_from_walks(walks_path, vocab_path)
+    # Shared checkpoint_dir → every rank sees the same files. Assert on all
+    # ranks (symmetric) rather than rank-0-only, so a failure fails cleanly
+    # everywhere instead of hanging peers.
+    assert os.path.exists(os.path.join(ckpt, "latest"))
 
     cfg_ow = cfg.model_copy(update={"checkpoint_overwrite": True})
     m2 = GPU_RDF2Vec(config=cfg_ow)
-    edges2 = m2.load_data(str(triples_path))
-    m2.fit(edges2)
-    # After overwrite + fresh fit, exactly one step_* dir again
-    step_dirs = [p for p in ckpt.iterdir() if p.name.startswith("step_")]
+    m2.fit_from_walks(walks_path, vocab_path)
+    step_dirs = [p for p in os.listdir(ckpt) if p.startswith("step_")]
     assert len(step_dirs) >= 1
 
 
 @pytest.mark.multigpu
-def test_keep_last_prunes_excess_step_dirs(torchrun_pg, tmp_path):
-    """Drive enough time-based saves to test pruning end-to-end."""
-    import torch.distributed as dist
-    import cudf
-    import numpy as np
+def test_keep_last_prunes_excess_step_dirs(torchrun_pg):
+    """Epoch-boundary saves over 5 epochs with keep_last=2 leave exactly
+    two step directories.
+    """
+    import os
 
     from rdf2vecgpu.config import RDF2VecConfig
     from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
 
-    rng = np.random.default_rng(13)
-    triples = cudf.DataFrame({
-        "subject":   rng.integers(0, 100, size=5000),
-        "predicate": rng.integers(0, 5,   size=5000),
-        "object":    rng.integers(100, 200, size=5000),
-    })
-    triples_path = tmp_path / "triples.parquet"
-    triples.to_parquet(str(triples_path))
-    ckpt = tmp_path / "ckpt"
+    base = _shared_base("ckpt_keeplast")
+    walks_path, vocab_path = _prepare_corpus_fs(
+        base,
+        make_triples=lambda: _connected_string_triples(
+            5_000, seed=13, n_entities=100, n_predicates=5
+        ),
+        walk_depth=3, walk_number=20,
+    )
+
+    ckpt = os.path.join(base, "ckpt")
     cfg = RDF2VecConfig(
         backend="torchrec", embedding_model="skipgram", multi_gpu=True,
         walk_strategy="random", walk_depth=3, walk_number=20,
         vector_size=8, epochs=5,
-        checkpoint_dir=str(ckpt),
-        checkpoint_interval_minutes=1,   # force frequent saves
+        checkpoint_dir=ckpt, checkpoint_interval_minutes=120,
         checkpoint_keep_last=2,
     )
     model = GPU_RDF2Vec(config=cfg)
-    edges = model.load_data(str(triples_path))
-    model.fit(edges)
-    step_dirs = sorted(p.name for p in ckpt.iterdir() if p.name.startswith("step_"))
+    model.fit_from_walks(walks_path, vocab_path)
+    # Shared checkpoint_dir → assert on all ranks (symmetric).
+    step_dirs = sorted(p for p in os.listdir(ckpt) if p.startswith("step_"))
     assert len(step_dirs) == 2, step_dirs

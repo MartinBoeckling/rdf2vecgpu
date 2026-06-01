@@ -870,97 +870,45 @@ class GPU_RDF2Vec:
             finally:
                 shutil.rmtree(walk_dir, ignore_errors=True)
 
-    def _build_vocab_for_walks(self, walks_path: str):
-        """Vocab + token-count + on-disk vocab-path for the torchrec backend.
+    def _load_corpus_vocab(self, walks_path: str, vocab_path: str):
+        """Load ``(vocab_df, token_counts, vocab_path)`` from a prepared corpus.
 
-        Contract (see Task 11 plan + Task 13 multi-GPU tests):
-            returns ``(vocab_df, token_counts, vocab_path)`` where:
-              * ``vocab_df`` — cudf.DataFrame with columns
-                ``token_id`` (int64) and ``entity`` (string), one row
-                per vocabulary token. Re-projected from
-                ``self.word2idx`` (which uses ``token`` / ``word``) so
-                the torchrec embedding-extraction code can join on the
-                contract's column names without an extra rename.
-              * ``token_counts`` — torch.LongTensor of shape
-                ``(vocab_size,)`` derived from the on-disk walks
-                parquet via the existing
-                ``_token_counts_from_walk_parquet`` helper. Used by the
-                unigram (f^0.75) negative sampler.
-              * ``vocab_path`` — absolute path to a parquet file
-                containing the vocab. ``_maybe_resume_checkpoint``
-                uses this path string (not its contents) as an
-                identity key so resumed runs can refuse to load a
-                checkpoint that was trained against a different
-                vocabulary.
+        The decoupled torchrec flow: the vocabulary is READ from the
+        on-disk parquet produced by :meth:`prepare_corpus` — it is NOT
+        rebuilt from the edge list here (that needs cuGraph / dask-cudf,
+        which cannot run under the torchrun job; see
+        :meth:`prepare_corpus`). Token-frequency counts are derived from
+        the walks parquet for the f^0.75 unigram negative sampler.
 
-        The vocabulary itself is built upstream by ``load_data() ->
-        generate_vocab()`` and stashed on ``self.word2idx`` — we do
-        NOT re-tokenise the edge list here. This method only re-projects
-        the existing vocab into the torchrec-friendly column layout and
-        materialises the on-disk identity artefact.
+        Parameters
+        ----------
+        walks_path : str
+            Parquet directory of walks-as-sequences (used only to derive
+            token counts).
+        vocab_path : str
+            Parquet file with columns ``token_id`` (int64) and ``entity``
+            (string), as written by :meth:`prepare_corpus`.
 
-        Implementation note: kept as a thin helper rather than inlined
-        because the vocab_path identity check needs a stable on-disk
-        artefact across resume runs and that plumbing is easier to read
-        as a named method than buried in the Fabric loop.
+        Returns
+        -------
+        vocab_df : cudf.DataFrame
+            Columns ``token_id`` (int64) and ``entity`` (string), one row
+            per token — the layout
+            ``torchrec_word2vec.extract_embeddings_to_dask_cudf`` joins on.
+        token_counts : torch.Tensor
+            ``int64`` tensor of shape ``(vocab_size,)``.
+        vocab_path : str
+            Echoed back unchanged; it is the DCP resume identity key (see
+            ``torchrec_word2vec._maybe_resume_checkpoint``).
         """
-        import tempfile
-
-        # word2idx may still be a dask_cudf in multi-GPU mode — materialise
-        # for the in-memory projection that follows.
-        word2idx = self.word2idx
-        if hasattr(word2idx, "compute"):
-            word2idx = word2idx.compute()
-
-        # Re-project to the (token_id: int64, entity: string) layout the
-        # torchrec backend's helpers expect. Source columns from
-        # _generate_vocab are (token: int32, word: string).
-        vocab_df = cudf.DataFrame({
-            "token_id": word2idx["token"].astype("int64"),
-            "entity":   word2idx["word"],
-        })
+        vocab_df = cudf.read_parquet(vocab_path)
 
         # Token-frequency counts over the walk parquet → torch.LongTensor.
-        # Streams the parquet with pyarrow on CPU (the dask cluster is
-        # already torn down by the time we get here in the
-        # _fit_via_pytorch_sequences sister path; torchrec follows the
-        # same teardown order in walk_generation_sequences → fabric
-        # launch).
+        # Streamed with pyarrow on CPU — no dask cluster needed.
         counts_np = _token_counts_from_walk_parquet(
             walks_path, vocab_df.shape[0]
         )
         token_counts = torch.from_numpy(counts_np).to(torch.long)
-
-        # Stable on-disk vocab identity for DCP resume. When a
-        # checkpoint_dir is configured, write to
-        # ``{checkpoint_dir}/vocab.parquet`` so the path is
-        # deterministic across ranks AND across resume runs — this is
-        # what ``_maybe_resume_checkpoint``'s vocab-identity guard
-        # compares against. Without it (tempfile.mkdtemp produces a
-        # fresh path every process / every run), resume always
-        # mismatched and the feature was a no-op.
-        # When no checkpoint_dir is set, fall back to a tempdir — the
-        # identity guard is not exercised in that case.
-        # Multi-rank safety: only rank 0 writes the parquet; all ranks
-        # barrier before returning so the file is visible everywhere.
-        from pathlib import Path
-        import torch.distributed as dist
-
-        if self.config.checkpoint_dir is not None:
-            vocab_dir = Path(self.config.checkpoint_dir)
-            vocab_dir.mkdir(parents=True, exist_ok=True)
-            vocab_path = str(vocab_dir / "vocab.parquet")
-        else:
-            vocab_path = str(
-                Path(tempfile.mkdtemp(prefix="rdf2vec_torchrec_vocab_"))
-                / "vocab.parquet"
-            )
-
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        if rank == 0:
-            vocab_df.to_parquet(vocab_path, index=False)
-        if dist.is_initialized():
-            dist.barrier()
 
         return vocab_df, token_counts, vocab_path
 
@@ -1080,14 +1028,12 @@ class GPU_RDF2Vec:
             persistent_workers=False,
         )
 
-    def _fit_via_torchrec(
-        self, edge_df, walk_vertices: cudf.Series | None = None
-    ) -> None:
-        """Train the sharded skip-gram model via torchrec + Fabric + DCP.
+    def _torchrec_preflight(self) -> None:
+        """Validate config + environment for the torchrec training backend.
 
-        Pre-flight checks run before any walk generation so the user
-        sees configuration errors immediately rather than mid-run.
-        See ``docs/superpowers/specs/2026-05-26-torchrec-sharded-embeddings-design.md``
+        Shared by :meth:`fit_from_walks`. Raises early so the user sees
+        configuration errors immediately rather than mid-run. See
+        ``docs/superpowers/specs/2026-05-26-torchrec-sharded-embeddings-design.md``
         §5 for the full error-handling contract.
         """
         # Pre-flight: model coverage
@@ -1122,10 +1068,124 @@ class GPU_RDF2Vec:
                 "Run via: torchrun --standalone --nproc_per_node=N your_script.py"
             )
 
-        # Stubbed for later tasks — wiring lives in
-        # rdf2vecgpu.embedders.torchrec_word2vec.train_torchrec_word2vec
+    def _fit_via_torchrec(
+        self, edge_df, walk_vertices: cudf.Series | None = None
+    ) -> None:
+        """``fit(edge_df)`` is unsupported for backend='torchrec'.
+
+        Data preparation (walk generation + vocab build) relies on a
+        Dask-CUDA cluster / cuGraph dask comms that cannot coexist with
+        the torchrun/NCCL process group torchrec training runs under —
+        each multi-GPU paradigm wants to own all GPUs. Prepare the corpus
+        once (outside torchrun) via :meth:`prepare_corpus`, then train via
+        :meth:`fit_from_walks`.
+        """
+        raise RuntimeError(
+            "backend='torchrec' does not support fit(edge_df) — walk generation "
+            "and vocab build cannot run inside the torchrun training job "
+            "(Dask-CUDA / cuGraph and torchrun/NCCL cannot share a process). "
+            "Prepare the corpus separately, then train:\n"
+            "  # 1. prepare (normal process; single- or multi-GPU):\n"
+            "  edges = model.load_data(path)\n"
+            "  walks_path, vocab_path = model.prepare_corpus(edges, out_dir)\n"
+            "  # 2. train (under torchrun --nproc_per_node=N):\n"
+            "  model.fit_from_walks(walks_path, vocab_path)"
+        )
+
+    def fit_from_walks(self, walks_path: str, vocab_path: str) -> None:
+        """Train the torchrec sharded skip-gram model from a prepared corpus.
+
+        The decoupled torchrec training entry point. Consumes a walk
+        corpus + vocab written by :meth:`prepare_corpus` and trains the
+        row-wise sharded model under torchrec + Lightning Fabric, with
+        optional DCP checkpointing.
+
+        MUST be launched under ``torchrun`` (the pre-flight checks enforce
+        this). Does NOT generate walks or build vocab — see
+        :meth:`prepare_corpus` for why those are a separate step. After
+        training, call :meth:`transform` within the same launch to extract
+        the sharded embeddings.
+
+        Parameters
+        ----------
+        walks_path : str
+            Parquet directory of walks-as-sequences, as returned by
+            :meth:`prepare_corpus`. Must resolve to the same data on every
+            rank (a shared filesystem for multi-node).
+        vocab_path : str
+            Parquet file mapping ``token_id`` ↔ ``entity``, as returned by
+            :meth:`prepare_corpus`. Also the DCP resume identity key.
+        """
+        self._torchrec_preflight()
         from rdf2vecgpu.embedders.torchrec_word2vec import train_torchrec_word2vec
-        train_torchrec_word2vec(self, edge_df, walk_vertices)
+        train_torchrec_word2vec(self, walks_path, vocab_path)
+
+    def prepare_corpus(
+        self, edge_df, out_dir: str, walk_vertices: cudf.Series = None
+    ) -> tuple[str, str]:
+        """Generate a walk corpus + vocab and persist them under ``out_dir``.
+
+        The data-preparation half of the decoupled torchrec flow. Run this
+        OUTSIDE ``torchrun`` — in a normal process, single-GPU
+        (``multi_gpu=False``) or on a Dask-CUDA cluster
+        (``multi_gpu=True``). The torchrec training job then consumes the
+        result via :meth:`fit_from_walks`. Walk generation and vocab build
+        rely on cuGraph / dask-cudf, which cannot run inside the
+        torchrun/NCCL process group torchrec trains under — hence the split.
+
+        Requires ``load_data`` (or an equivalent) to have already populated
+        ``self.word2idx`` and built ``self.knowledge_graph``; the usual
+        call sequence is::
+
+            edges = model.load_data(path)
+            walks_path, vocab_path = model.prepare_corpus(edges, out_dir)
+
+        Parameters
+        ----------
+        edge_df
+            The int-encoded edge frame returned by ``load_data``.
+        out_dir : str
+            Directory to write ``walks/`` (parquet dir) and
+            ``vocab.parquet`` into. Created if absent.
+        walk_vertices : cudf.Series, optional
+            Override for the walk start-vertex set; defaults to the stashed
+            subject set (see :meth:`_resolve_walk_vertices`).
+
+        Returns
+        -------
+        (walks_path, vocab_path) : tuple[str, str]
+            Absolute paths to the walks parquet directory and the vocab
+            parquet file — pass these to :meth:`fit_from_walks`.
+        """
+        import os
+        from .embedders.torchrec_word2vec import (
+            _materialize_walks_sequences_to_parquet,
+        )
+
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Walks-as-sequences → parquet (stable, addressable path).
+        walks_seq = self.walk_generation_sequences(
+            edge_df=edge_df, walk_vertices=walk_vertices,
+        )
+        walks_path = _materialize_walks_sequences_to_parquet(
+            walks_seq, walks_parquet=os.path.join(out_dir, "walks"),
+        )
+
+        # Vocab → (token_id: int64, entity: string) parquet. word2idx was
+        # built upstream by load_data() → generate_vocab() and may still be
+        # a dask_cudf in multi-GPU prep mode; materialise before projecting.
+        word2idx = self.word2idx
+        if hasattr(word2idx, "compute"):
+            word2idx = word2idx.compute()
+        vocab_df = cudf.DataFrame({
+            "token_id": word2idx["token"].astype("int64"),
+            "entity":   word2idx["word"],
+        })
+        vocab_path = os.path.join(out_dir, "vocab.parquet")
+        vocab_df.to_parquet(vocab_path, index=False)
+
+        return walks_path, vocab_path
 
     def _fit_via_pytorch_sequences(self, walk_sequences) -> None:
         """Train PyTorch skip-gram from walks-as-sequences: checkpoint the
