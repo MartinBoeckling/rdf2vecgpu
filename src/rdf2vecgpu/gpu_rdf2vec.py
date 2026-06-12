@@ -50,20 +50,26 @@ def _token_counts_from_walk_parquet(walks_parquet: str, vocab_size: int):
 
 def _token_counts_from_cudf_walks(cudf_df, vocab_size: int):
     """Token occurrence counts over an in-memory walks-as-sequences cuDF frame
-    → numpy int64 array of length ``vocab_size``. GPU equivalent of
-    ``_token_counts_from_walk_parquet`` for the single-GPU in-memory path:
-    flattens the ``vertices`` / ``predicates`` list columns on the device and
-    bincounts, dropping the ``-1`` cuGraph walk sentinels."""
-    import cupy
+    → numpy int64 array of length ``vocab_size``. Flattens the ``vertices`` /
+    ``predicates`` list columns and bincounts on CPU (via numpy), dropping the
+    ``-1`` cuGraph walk sentinels. Using numpy avoids CuPy JIT compilation at
+    call time; the cuDF list-flatten is still GPU-side so the transfer is
+    minimal (flattened 1-D integers)."""
     import numpy as np
 
-    counts = cupy.zeros(vocab_size, dtype=cupy.int64)
+    counts = np.zeros(vocab_size, dtype=np.int64)
     for col in ("vertices", "predicates"):
-        leaves = cupy.asarray(cudf_df[col].list.leaves)
-        leaves = leaves[leaves >= 0]
-        if leaves.size:
-            counts += cupy.bincount(leaves, minlength=vocab_size)[:vocab_size]
-    return cupy.asnumpy(counts).astype(np.int64)
+        leaves_series = cudf_df[col].list.leaves
+        # Transfer to host; coerce to int64 (predicates may be float64 from
+        # cuGraph's walk output — -1.0 sentinels and integer token ids).
+        flat = leaves_series.to_numpy(na_value=-1)
+        if np.issubdtype(flat.dtype, np.floating):
+            flat = flat[~np.isnan(flat)]
+        flat = flat.astype(np.int64, copy=False)
+        flat = flat[flat >= 0]
+        if flat.size:
+            counts += np.bincount(flat, minlength=vocab_size)[:vocab_size]
+    return counts
 
 
 class GPU_RDF2Vec:
@@ -1283,6 +1289,32 @@ class GPU_RDF2Vec:
         # TF32 on Tensor Cores for the embedding inner-products (spec 2026-05-15 D6).
         # "high" is the recommended Lightning setting; quality unchanged for skip-gram.
         torch.set_float32_matmul_precision(self.config.matmul_precision)
+
+        from .embedders.word2vec_loader import InMemoryWalkSeqDataModule, walks_per_pair_batch
+
+        if not self.config.multi_gpu:
+            # ── Single-GPU: GPU-resident in-memory feed (no parquet, no CPU) ──
+            if hasattr(walk_sequences, "compute"):
+                walk_sequences = walk_sequences.compute()
+            if hasattr(self.word2idx, "compute"):
+                self.word2idx = self.word2idx.compute()
+            walks_per_batch = walks_per_pair_batch(
+                self.config.pair_batch_size, self.config.walk_depth, self.config.window_size
+            )
+            n_walks = int(len(walk_sequences))
+            steps_per_epoch = max(1, -(-n_walks // walks_per_batch))
+            token_counts = _token_counts_from_cudf_walks(walk_sequences, self.word2idx.shape[0])
+            self._walked_mask = (token_counts > 0)
+            dm = InMemoryWalkSeqDataModule(
+                walk_sequences, emit_batch_size=walks_per_batch,
+                shuffle=True, seed=self.config.random_state,
+            )
+            with self.tracker.stage("Word2Vec_Training"):
+                self._train_pytorch_sequences(
+                    dm, token_counts=token_counts,
+                    steps_per_epoch=steps_per_epoch, n_gpus=1,
+                )
+            return
 
         # Single-GPU training even when the (now-torn-down) dask cluster used
         # several GPUs for walk-gen: Lightning's SLURM DDP launcher needs
