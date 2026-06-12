@@ -101,3 +101,33 @@ def test_walkseq_iterable_shuffle_deterministic_per_seed(walk_seq_dir):
     c = np.concatenate([cc[0] for cc in _WalkSeqIterable(walk_seq_dir, emit_batch_size=128, read_chunk_size=256, shuffle=True, seed=99)], axis=0)
     np.testing.assert_array_equal(a, b)          # same seed → same order
     assert not np.array_equal(a, c)              # different seed → different order
+
+
+import pytest
+
+
+@pytest.mark.gpu
+def test_inmemory_walkseq_yields_gpu_tensors_of_right_shape():
+    import cudf
+    import torch
+    from rdf2vecgpu.embedders.word2vec_loader import InMemoryWalkSeqDataModule
+
+    # 5 walks, depth=3 → vertices length 4, predicates length 3 (cuGraph -1 pads).
+    df = cudf.DataFrame({
+        "vertices":   [[0, 1, 2, 3], [1, 2, 3, -1], [2, 0, -1, -1],
+                       [3, 1, 0, 2], [0, 0, 1, -1]],
+        "predicates": [[10, 11, 12], [11, 12, -1], [12, -1, -1],
+                       [10, 10, 11], [11, 12, -1]],
+    })
+    dm = InMemoryWalkSeqDataModule(df, emit_batch_size=2, shuffle=False)
+    dm.setup()
+    batches = list(dm.train_dataloader())
+
+    # 5 rows, emit_batch_size=2 → 3 batches (2, 2, 1).
+    assert [b[0].shape[0] for b in batches] == [2, 2, 1]
+    v0, p0 = batches[0]
+    assert v0.is_cuda and p0.is_cuda            # GPU-resident, no CPU round-trip
+    assert v0.shape == (2, 4) and p0.shape == (2, 3)
+    # Round-trips the data unchanged (shuffle=False).
+    assert v0[0].tolist() == [0, 1, 2, 3]
+    assert p0[0].tolist() == [10, 11, 12]

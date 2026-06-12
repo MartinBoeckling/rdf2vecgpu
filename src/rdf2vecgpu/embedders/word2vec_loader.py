@@ -477,3 +477,83 @@ class WalkSequenceDataModule(L.LightningDataModule):
             pin_memory=True,
             persistent_workers=False,
         )
+
+
+# --------------------------------------------------------------------------- #
+# GPU-resident in-memory walk-sequence DataModule (single-GPU fast path)
+# --------------------------------------------------------------------------- #
+
+
+class _InMemoryWalkSeq(IterableDataset):
+    """GPU-resident sibling of `_WalkSeqIterable`. Materialises the
+    walks-as-sequences cuDF list columns to 2-D GPU int tensors ONCE (via
+    DLPack, zero-copy off the device), then yields `emit_batch_size`-row
+    `(vertices, predicates)` GPU slices. Single-GPU only — the whole corpus
+    lives in one device's memory, so there is no parquet/CPU hop."""
+
+    def __init__(self, cudf_df, *, emit_batch_size, shuffle=True, seed=0):
+        super().__init__()
+        for col in ("vertices", "predicates"):
+            if col not in cudf_df.columns:
+                raise ValueError(f"in-memory walks frame missing '{col}' list column")
+        n = len(cudf_df)
+        # cuDF list column -> flat leaves Series -> GPU tensor -> (n, row_len).
+        # All walks share a fixed length (cuGraph pads short walks with -1), so
+        # the leaf count is exactly n * row_len and the view is well-defined.
+        self.vertices = torch.from_dlpack(
+            cudf_df["vertices"].list.leaves.to_dlpack()
+        ).view(n, -1) if n else torch.empty((0, 0), dtype=torch.int32, device="cuda")
+        self.predicates = torch.from_dlpack(
+            cudf_df["predicates"].list.leaves.to_dlpack()
+        ).view(n, -1) if n else torch.empty((0, 0), dtype=torch.int32, device="cuda")
+        self.emit_batch_size = int(emit_batch_size)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self._epoch = -1
+
+    def __iter__(self):
+        self._epoch += 1
+        n = self.vertices.shape[0]
+        if self.shuffle and n:
+            g = torch.Generator(device=self.vertices.device)
+            g.manual_seed(self.seed + self._epoch)
+            perm = torch.randperm(n, generator=g, device=self.vertices.device)
+            v, p = self.vertices[perm], self.predicates[perm]
+        else:
+            v, p = self.vertices, self.predicates
+        eb = self.emit_batch_size
+        for s in range(0, n, eb):
+            yield v[s:s + eb], p[s:s + eb]
+
+
+class InMemoryWalkSeqDataModule(L.LightningDataModule):
+    """Feeds `(vertices, predicates)` GPU int tensors straight from an in-memory
+    cuDF walks-as-sequences frame — the GPU-resident counterpart of
+    `WalkSequenceDataModule`. num_workers is forced to 0: the batches are CUDA
+    tensors, which cannot cross DataLoader worker processes."""
+
+    def __init__(self, cudf_df, *, emit_batch_size, shuffle=True, seed=0):
+        super().__init__()
+        self.cudf_df = cudf_df
+        self.emit_batch_size = emit_batch_size
+        self.shuffle = shuffle
+        self.seed = seed
+        self._iterable = None
+
+    def setup(self, stage=None):
+        self._iterable = _InMemoryWalkSeq(
+            self.cudf_df,
+            emit_batch_size=self.emit_batch_size,
+            shuffle=self.shuffle,
+            seed=self.seed,
+        )
+
+    def train_dataloader(self):
+        if self._iterable is None:
+            self.setup()
+        return DataLoader(
+            self._iterable,
+            batch_size=None,        # the iterable yields already-batched GPU tensors
+            num_workers=0,          # CUDA tensors can't cross worker processes
+            pin_memory=False,       # already on GPU
+        )
