@@ -48,6 +48,24 @@ def _token_counts_from_walk_parquet(walks_parquet: str, vocab_size: int):
     return counts
 
 
+def _token_counts_from_cudf_walks(cudf_df, vocab_size: int):
+    """Token occurrence counts over an in-memory walks-as-sequences cuDF frame
+    → numpy int64 array of length ``vocab_size``. GPU equivalent of
+    ``_token_counts_from_walk_parquet`` for the single-GPU in-memory path:
+    flattens the ``vertices`` / ``predicates`` list columns on the device and
+    bincounts, dropping the ``-1`` cuGraph walk sentinels."""
+    import cupy
+    import numpy as np
+
+    counts = cupy.zeros(vocab_size, dtype=cupy.int64)
+    for col in ("vertices", "predicates"):
+        leaves = cupy.asarray(cudf_df[col].list.leaves)
+        leaves = leaves[leaves >= 0]
+        if leaves.size:
+            counts += cupy.bincount(leaves, minlength=vocab_size)[:vocab_size]
+    return cupy.asnumpy(counts).astype(np.int64)
+
+
 class GPU_RDF2Vec:
     def __init__(
         self,
@@ -787,8 +805,12 @@ class GPU_RDF2Vec:
             try:
                 walks_parquet = f"{walk_dir}/walks"
                 logger.info(f"Checkpointing walk sequences to {walks_parquet}")
-                if hasattr(walk_sequences, "to_parquet"):
-                    # dask_cudf.DataFrame: each worker writes its partition.
+                if hasattr(walk_sequences, "persist"):
+                    # dask_cudf.DataFrame (multi_gpu): each worker writes its
+                    # partition. Discriminate on `.persist` — NOT `.to_parquet`,
+                    # which a single-GPU cudf.DataFrame also has, so the old
+                    # check sent cudf into this dask-only branch and crashed on
+                    # `.persist()`.
                     # `random_walk_sequences()` already persist+wait-ed the
                     # walk output, but re-pin defensively here so a future
                     # refactor that moves the persist out of the corpus class
