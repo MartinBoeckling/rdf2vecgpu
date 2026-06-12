@@ -856,71 +856,91 @@ def test_torchrec_end_to_end_smoke_world_size_2(torchrun_pg):
 
 
 @pytest.mark.multigpu
-def test_torchrec_vs_pytorch_topk_overlap(torchrun_pg):
-    """Quality canary: top-K NN overlap between a single-GPU pytorch run
-    and the sharded torchrec run on the same corpus.
+def test_torchrec_recovers_planted_community_structure(torchrun_pg):
+    """Quality canary: the sharded torchrec run must produce FINITE,
+    non-degenerate embeddings that recover planted community structure.
 
-    Not bit-exact (PARTIAL_ROWWISE_ADAM ≠ SparseAdam, and the two backends
-    expand pairs differently); the threshold is deliberately loose — it
-    catches gross breakage (broken sharding → ~random overlap, wrong loss
-    sign → anti-correlation), not fine quality differences.
+    This replaces an earlier cross-backend top-K NN overlap check, which was
+    ill-posed: the pytorch baseline and torchrec build independent
+    vocabularies, and on a structureless random graph neither separates
+    entities, so the overlap sat at chance even for sane runs (the pytorch
+    reference itself recovered no structure there). Instead we plant three
+    communities (dense intra-community edges, sparse inter), so random walks —
+    and thus skip-gram co-occurrence — stay mostly within a community, and
+    assert torchrec recovers them. This catches the failure modes actually
+    observed in practice:
+
+      * divergence to NaN/Inf (unclipped SGD on the SUM skip-gram loss), and
+      * embedding collapse / broken sharding (intra ≈ inter cosine).
+
+    It deliberately uses the DEFAULT optimizer ("sgd"), so it also guards the
+    fused-optimizer gradient clipping that keeps that path stable.
     """
-    import os
     import numpy as np
-    import pandas as pd
 
     from rdf2vecgpu.config import RDF2VecConfig
     from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
 
-    base = _shared_base("topk")
+    def clustered_triples(n_comm=3, per=50, intra=6_000, inter=150, seed=42):
+        import cudf
+        rng = np.random.default_rng(seed)
+
+        def name(c, i):
+            return f"e{c}_{i}"
+
+        s, o, p = [], [], []
+        for _ in range(intra):
+            c = int(rng.integers(0, n_comm))
+            s.append(name(c, int(rng.integers(0, per))))
+            o.append(name(c, int(rng.integers(0, per))))
+            p.append("intra")
+        for _ in range(inter):
+            s.append(name(int(rng.integers(0, n_comm)), int(rng.integers(0, per))))
+            o.append(name(int(rng.integers(0, n_comm)), int(rng.integers(0, per))))
+            p.append("inter")
+        return cudf.DataFrame({"subject": s, "predicate": p, "object": o})
+
+    base = _shared_base("community")
     walks_path, vocab_path = _prepare_corpus_fs(
-        base,
-        make_triples=lambda: _connected_string_triples(
-            5_000, seed=42, n_entities=150, n_predicates=10
-        ),
-        walk_depth=3, walk_number=10,
+        base, make_triples=clustered_triples, walk_depth=4, walk_number=20,
     )
 
-    common = dict(
-        embedding_model="skipgram", walk_strategy="random",
-        walk_depth=3, walk_number=10, vector_size=16, epochs=3,
-        learning_rate=0.025, negative_samples=5, random_state=0,
+    cfg = RDF2VecConfig(
+        backend="torchrec", embedding_model="skipgram", multi_gpu=True,
+        walk_strategy="random", walk_depth=4, walk_number=20,
+        vector_size=32, epochs=5, learning_rate=0.025, negative_samples=5,
+        random_state=0,  # optimizer defaults to "sgd" -> exercises the clip
+    )
+    m = GPU_RDF2Vec(config=cfg)
+    m.fit_from_walks(walks_path, vocab_path)
+    emb = _gather_full_embeddings_fs(m, base)
+
+    vec_cols = [c for c in emb.columns if c not in ("token_id", "entity")]
+    M = emb[vec_cols].to_numpy(dtype="float64")
+
+    # (1) Finiteness — unclipped SGD on the SUM loss diverges to all-NaN; this
+    #     is the regression guard for the fused-optimizer gradient clipping.
+    assert np.isfinite(M).all(), (
+        f"non-finite embeddings: "
+        f"{int((~np.isfinite(M)).any(axis=1).sum())}/{len(M)} rows have NaN/Inf"
     )
 
-    cfg_tr = RDF2VecConfig(backend="torchrec", multi_gpu=True, **common)
-    m_tr = GPU_RDF2Vec(config=cfg_tr)
-    m_tr.fit_from_walks(walks_path, vocab_path)
-    emb_tr = _gather_full_embeddings_fs(m_tr, base)
-
-    def topk_neighbours(df: pd.DataFrame, k: int = 5) -> dict[int, set]:
-        df = df.sort_values("token_id")
-        m = df.drop(columns=["token_id", "entity"]).to_numpy()
-        norms = np.linalg.norm(m, axis=1, keepdims=True)
-        cos = (m @ m.T) / (norms * norms.T + 1e-12)
-        np.fill_diagonal(cos, -np.inf)
-        ids = df["token_id"].to_numpy()
-        return {
-            int(ids[i]): set(int(t) for t in ids[np.argsort(-cos[i])[:k]])
-            for i in range(len(ids))
-        }
-
-    # The pytorch baseline runs on EVERY rank (single-GPU on each rank's own
-    # device — redundant but cheap on this tiny graph) so the assertion is
-    # symmetric across ranks: no rank-0-only branch that could desync a
-    # subsequent collective. triples.parquet was written by rank 0 before
-    # the corpus.ready marker, so every rank can read it here.
-    triples_path = os.path.join(base, "triples.parquet")
-    cfg_pt = RDF2VecConfig(backend="pytorch", multi_gpu=False, **common)
-    m_pt = GPU_RDF2Vec(config=cfg_pt)
-    edges_pt = m_pt.load_data(triples_path)
-    emb_pt = m_pt.fit_transform(edge_df=edges_pt).to_pandas()
-
-    nn_pt = topk_neighbours(emb_pt)
-    nn_tr = topk_neighbours(emb_tr)
-    overlap = np.mean([
-        len(nn_pt[t] & nn_tr.get(t, set())) / 5 for t in nn_pt
-    ])
-    assert overlap > 0.5, f"top-5 NN overlap too low: {overlap:.2f}"
+    # (2) Structure recovery — same-community entities must be markedly closer
+    #     (cosine) than different-community ones. Collapse or broken sharding
+    #     drives the gap to ~0; a healthy run is ~0.14 on this graph.
+    df = emb[emb["entity"].str.startswith("e")].copy()
+    comm = df["entity"].str.split("_").str[0].to_numpy()
+    V = df[vec_cols].to_numpy(dtype="float64")
+    V = V / (np.linalg.norm(V, axis=1, keepdims=True) + 1e-12)
+    cos = V @ V.T
+    same = comm[:, None] == comm[None, :]
+    eye = np.eye(len(comm), dtype=bool)
+    intra = cos[same & ~eye].mean()
+    inter = cos[~same & ~eye].mean()
+    assert intra - inter > 0.05, (
+        f"no community structure recovered: intra_cos={intra:.3f} "
+        f"inter_cos={inter:.3f} gap={intra - inter:+.3f} (expect > 0.05)"
+    )
 
 
 # ───────────────────────────── Layer 5 ────────────────────────────────
