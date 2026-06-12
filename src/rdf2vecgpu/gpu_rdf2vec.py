@@ -1082,6 +1082,21 @@ class GPU_RDF2Vec:
                 "(the sharded embedding path is multi-process by construction)."
             )
 
+        # Pre-flight: the fused SGD path needs gradient clipping. The skip-gram
+        # loss is a SUM over the pair batch, so unclipped SGD diverges to NaN on
+        # non-trivial corpora; the fused optimizer-in-backward has no external
+        # clip_grad hook, so the clip is applied in-kernel via grad_clip_value.
+        # Refuse the silent-NaN config rather than train to garbage.
+        if self.config.optimizer == "sgd" and not (
+            self.config.grad_clip_value and self.config.grad_clip_value > 0
+        ):
+            raise ValueError(
+                "backend='torchrec' with optimizer='sgd' requires grad_clip_value > 0 "
+                f"(got {self.config.grad_clip_value!r}). The SUM skip-gram loss makes "
+                "unclipped SGD diverge to NaN; the fused optimizer applies the clip "
+                "in-kernel. Set grad_clip_value (e.g. 0.1) or use optimizer='sparseadam'."
+            )
+
         # Pre-flight: imports
         try:
             import torchrec  # noqa: F401

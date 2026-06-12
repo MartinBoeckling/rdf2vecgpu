@@ -987,10 +987,12 @@ def test_save_then_reload_preserves_embeddings_bit_equal(torchrun_pg):
     m2.fit_from_walks(walks_path, vocab_path)
     emb2 = m2.transform().compute().to_pandas().sort_values("token_id")
 
-    np.testing.assert_array_equal(
-        emb1.drop(columns=["entity"]).to_numpy(),
-        emb2.drop(columns=["entity"]).to_numpy(),
-    )
+    a1 = emb1.drop(columns=["entity"]).to_numpy()
+    a2 = emb2.drop(columns=["entity"]).to_numpy()
+    # Guard NaN-blindness: assert_array_equal treats NaN==NaN as equal, so an
+    # all-NaN divergence would round-trip as "bit-equal" and pass silently.
+    assert np.isfinite(a1).all(), "reloaded embeddings (run 1) contain NaN/Inf"
+    np.testing.assert_array_equal(a1, a2)
 
 
 @pytest.mark.multigpu

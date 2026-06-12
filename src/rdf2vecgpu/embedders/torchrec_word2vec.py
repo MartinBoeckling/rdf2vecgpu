@@ -217,8 +217,11 @@ def extract_embeddings_to_dask_cudf(model, vocab_df):
     local_rows, dim = in_param.shape
     end = start + local_rows
 
-    # Move to a cudf.DataFrame with dim columns labeled "0".."dim-1".
-    cupy_arr = cupy.asarray(in_param.detach())
+    # Move to a cudf.DataFrame with dim columns labeled "0".."dim-1". Cast to
+    # float32 (the documented output schema) and force contiguity: under
+    # precision="medium" the shard may be bf16 — which cupy has no dtype for —
+    # and a sharded local tensor is not guaranteed C-contiguous.
+    cupy_arr = cupy.asarray(in_param.detach().to(torch.float32).contiguous())
     shard_df = cudf.DataFrame({str(d): cupy_arr[:, d] for d in range(dim)})
     shard_df["token_id"] = cudf.Series(range(start, end), dtype="int64")
 
@@ -557,6 +560,15 @@ def train_torchrec_word2vec(rdf2vec, walks_path, vocab_path) -> None:
 
     cfg = rdf2vec.config
 
+    # 0. Seed for reproducible weight init + negative sampling. cfg.random_state
+    #    was previously ignored on this path (the pytorch backend seeds via
+    #    Lightning). Seed identically across ranks so the pre-shard table init
+    #    is consistent; torchrec then shards it deterministically.
+    if cfg.random_state is not None:
+        torch.manual_seed(cfg.random_state)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(cfg.random_state)
+
     # 1. Load vocab + token counts from the prepared corpus. No walk
     #    generation, no dask, no cuGraph here — see the function docstring
     #    for why those cannot run under torchrun. ``vocab_path`` doubles as
@@ -660,20 +672,32 @@ def train_torchrec_word2vec(rdf2vec, walks_path, vocab_path) -> None:
             )
             global_step += 1
 
-            # Time-based checkpoint.
-            if cfg.checkpoint_dir and (
-                time.monotonic() - last_ckpt_time
-                >= cfg.checkpoint_interval_minutes * 60
-            ):
-                _save_checkpoint(
-                    model, optimizer,
-                    epoch=epoch, global_step=global_step,
-                    checkpoint_dir=cfg.checkpoint_dir,
-                    keep_last=cfg.checkpoint_keep_last,
-                    vocab_path=vocab_path,
-                    config_snapshot=cfg.model_dump(),
-                )
-                last_ckpt_time = time.monotonic()
+            # Time-based checkpoint. The decision MUST be agreed across ranks
+            # BEFORE any rank enters _save_checkpoint, which issues collectives
+            # (dist.barrier / dcp.save). A per-rank wall-clock check would let
+            # one rank checkpoint while a peer runs the next forward's
+            # all-to-all — a collective mismatch that deadlocks. all_reduce(MAX)
+            # makes every rank checkpoint on the same step as soon as ANY rank's
+            # timer is due (clocks differ by ms, so they agree within a step),
+            # and last_ckpt_time resets on all ranks together.
+            if cfg.checkpoint_dir:
+                due = torch.zeros(1, device=fabric.device, dtype=torch.int32)
+                if (
+                    time.monotonic() - last_ckpt_time
+                    >= cfg.checkpoint_interval_minutes * 60
+                ):
+                    due.fill_(1)
+                dist.all_reduce(due, op=dist.ReduceOp.MAX)
+                if int(due.item()):
+                    _save_checkpoint(
+                        model, optimizer,
+                        epoch=epoch, global_step=global_step,
+                        checkpoint_dir=cfg.checkpoint_dir,
+                        keep_last=cfg.checkpoint_keep_last,
+                        vocab_path=vocab_path,
+                        config_snapshot=cfg.model_dump(),
+                    )
+                    last_ckpt_time = time.monotonic()
 
         # Epoch-boundary checkpoint.
         if cfg.checkpoint_dir:
