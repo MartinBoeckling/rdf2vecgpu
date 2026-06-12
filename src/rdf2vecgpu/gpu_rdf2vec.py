@@ -953,15 +953,24 @@ class GPU_RDF2Vec:
             shuffle=True,
             seed=cfg.random_state,
         )
+        # Rank-shard at the ROW level, not the file level. torchrec's
+        # sharded forward issues an all_to_all on EVERY step, so every rank
+        # MUST execute the same number of forward() calls or that collective
+        # desyncs and the job deadlocks. File-level sharding violates that
+        # invariant two ways: with fewer files than ranks a rank gets zero
+        # data (and previously raised, killing its peers mid-collective),
+        # and with uneven file sizes ranks get different batch counts.
+        # Instead every rank reads ALL files — the inner walk-batch stream,
+        # and therefore the emitted batch COUNT, is identical across ranks
+        # because the shuffle seed is rank-independent — and each rank keeps
+        # a disjoint row stride of every batch (see _PairsFromWalks). Equal
+        # batch counts by construction; each rank still trains on
+        # ~1/world_size of the pairs. rank/world_size are read here in the
+        # main process: DataLoader workers don't join the process group, so
+        # dist.is_initialized() is False inside them.
         import torch.distributed as dist
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            rank, ws = dist.get_rank(), dist.get_world_size()
-            ds.files = [f for i, f in enumerate(ds.files) if i % ws == rank]
-            if not ds.files:
-                raise RuntimeError(
-                    f"DDP rank {rank}/{ws}: no walk-parquet files assigned "
-                    f"(fewer files than ranks?)"
-                )
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
 
         window = cfg.window_size
 
@@ -975,15 +984,27 @@ class GPU_RDF2Vec:
             "yields (center, context) long tensors".
             """
 
-            def __init__(self, inner, window):
+            def __init__(self, inner, window, rank, world_size):
                 super().__init__()
                 self.inner = inner
                 self.window = int(window)
+                self.rank = int(rank)
+                self.world_size = int(world_size)
 
             def __iter__(self):
                 import numpy as np
                 w = self.window
                 for v_np, p_np in self.inner:
+                    # Disjoint, ~equal row stride per rank. Both ranks
+                    # iterate the same inner stream, so this yields the same
+                    # number of batches on every rank (no all_to_all
+                    # desync); an empty stride from a tiny tail batch is
+                    # fine — the loss is a SUM so an empty batch contributes
+                    # 0 yet still joins the collective, keeping ranks in
+                    # lockstep.
+                    if self.world_size > 1:
+                        v_np = v_np[self.rank::self.world_size]
+                        p_np = p_np[self.rank::self.world_size]
                     # v_np: (n, depth+1), p_np: (n, depth) — int32 with
                     # cuGraph's -1 sentinels for short walks.
                     n, depth_p1 = v_np.shape
@@ -1019,11 +1040,22 @@ class GPU_RDF2Vec:
                     x_flat = context.reshape(-1)[keep_flat]
                     yield torch.from_numpy(c_flat).long(), torch.from_numpy(x_flat).long()
 
-        pair_ds = _PairsFromWalks(ds, window=window)
+        pair_ds = _PairsFromWalks(ds, window=window, rank=rank, world_size=world_size)
+        # num_workers=0 is REQUIRED here, not just a default. This loader runs
+        # inside the torchrec training process, which has already initialised
+        # CUDA + the NCCL process group. DataLoader workers are forked from
+        # that process, and CUDA cannot be re-used across a fork — a worker
+        # touching CUDA aborts with cudaErrorInitializationError. (The 'spawn'
+        # start method would avoid the fork, but it can't pickle the nested
+        # _PairsFromWalks dataset.) Loading inline also makes iteration
+        # deterministic, so every rank yields the same batch COUNT — a
+        # prerequisite for the per-step all_to_all in the sharded forward
+        # (the training loop additionally min-reduces a continue flag as a
+        # backstop). The CPU pair-expansion is cheap relative to the GPU step.
         return DataLoader(
             pair_ds,
             batch_size=None,         # iterable yields already-batched pairs
-            num_workers=cfg.cpu_count,
+            num_workers=0,
             pin_memory=True,
             persistent_workers=False,
         )
@@ -1648,7 +1680,7 @@ class GPU_RDF2Vec:
         return cudf.concat([w2i, model_embeddings_df], axis=1)
 
     def fit_transform(
-        self, edge_df: cudf.DataFrame, walk_vertices: cudf.DataFrame
+        self, edge_df: cudf.DataFrame, walk_vertices: cudf.DataFrame = None
     ) -> cudf.DataFrame:
         """
         Train the Word2Vec model **and** immediately return the resulting
