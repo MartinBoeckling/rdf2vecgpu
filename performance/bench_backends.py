@@ -127,27 +127,36 @@ def run_single_process(args) -> dict:
     cfg = _config(backend, multi_gpu, args)
 
     client = None
+    comms = None
     if multi_gpu:
-        # pytorch-mg trains via Lightning DDP and prepares data on a Dask-CUDA
-        # cluster — both live inside this single process.
+        # pytorch-mg trains via Lightning DDP and prepares data (walks + vocab)
+        # on a Dask-CUDA cluster — both live in this single process. cuGraph's
+        # multi-GPU walk generation needs its dask comms initialized explicitly
+        # (mirrors test/e2e_multi_gpu_test.py).
         from dask_cuda import LocalCUDACluster
         from dask.distributed import Client
-        cluster = LocalCUDACluster(n_workers=args.nproc or None)
+        import cugraph.dask.comms.comms as Comms
+        cluster = LocalCUDACluster()
         client = Client(cluster)
+        Comms.initialize(p2p=True)
+        comms = Comms
 
     m = GPU_RDF2Vec(config=cfg, client=client) if client else GPU_RDF2Vec(config=cfg)
 
     metrics = _common_metrics(args, args.backend)
     _reset_vram()
-    with _timed(metrics, "t_load_s"):
-        edges = m.load_data(args.data)
-    with _timed(metrics, "t_fit_transform_s"):
-        m.fit_transform(edge_df=edges, walk_vertices=None)
-    metrics["peak_vram_gib"] = _peak_vram_gib()
-
-    if client is not None:
-        client.close()
-        client.cluster.close()
+    try:
+        with _timed(metrics, "t_load_s"):
+            edges = m.load_data(args.data)
+        with _timed(metrics, "t_fit_transform_s"):
+            m.fit_transform(edge_df=edges, walk_vertices=None)
+        metrics["peak_vram_gib"] = _peak_vram_gib()
+    finally:
+        if comms is not None:
+            comms.destroy()
+        if client is not None:
+            client.close()
+            client.cluster.close()
     return metrics
 
 
