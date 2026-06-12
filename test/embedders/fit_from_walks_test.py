@@ -93,3 +93,45 @@ def test_fit_from_walks_dispatches_per_backend(tmp_path, monkeypatch):
                         lambda **kw: called.setdefault("gensim", kw) or "model")
     m.fit_from_walks(str(walks), vocab)
     assert called["gensim"]["walks_dir"] == str(walks)
+
+
+@pytest.mark.gpu
+def test_fit_from_walks_gensim_and_pytorch_single_from_shared_corpus(tmp_path):
+    import cudf, numpy as np
+    from rdf2vecgpu.config import RDF2VecConfig
+    from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    triples = str(tmp_path / "t.parquet")
+    cudf.DataFrame({
+        "subject": [f"e{i%50}" for i in range(3000)],
+        "predicate": [f"p{i%5}" for i in range(3000)],
+        "object": [f"e{(i*3)%50}" for i in range(3000)],
+    }).to_parquet(triples)
+
+    common = dict(embedding_model="skipgram", walk_strategy="random",
+                  walk_depth=3, walk_number=10, vector_size=16, epochs=1, multi_gpu=False)
+
+    prep = GPU_RDF2Vec(config=RDF2VecConfig(backend="pytorch", **common))
+    walks_path, vocab_path = prep.prepare_corpus(prep.load_data(triples), str(tmp_path / "corpus"))
+
+    for backend in ("gensim", "pytorch"):
+        m = GPU_RDF2Vec(config=RDF2VecConfig(backend=backend, **common))
+        m.fit_from_walks(walks_path, vocab_path)
+        emb = m.transform().to_pandas()
+        vec = [c for c in emb.columns if c not in ("token", "word")]
+        assert len(emb) > 0 and np.isfinite(emb[vec].to_numpy()).all()
+
+
+@pytest.mark.gpu
+def test_fit_from_walks_pytorch_mg_subprocess(tmp_path):
+    import os, sys, subprocess, torch, pandas as pd, numpy as np
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs >=2 GPUs")
+    driver = os.path.join(os.path.dirname(__file__), "_drivers", "ffw_pytorch_mg_driver.py")
+    out = str(tmp_path / "emb.parquet")
+    env = {**os.environ, "NCCL_P2P_DISABLE": "1", "CUDA_VISIBLE_DEVICES": "0,1"}
+    r = subprocess.run([sys.executable, driver, out], env=env, capture_output=True, text=True, timeout=600)
+    assert "DRIVER_OK" in r.stdout, f"driver failed:\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr[-3000:]}"
+    emb = pd.read_parquet(out)
+    vec = [c for c in emb.columns if c not in ("token", "word")]
+    assert np.isfinite(emb[vec].to_numpy()).all()

@@ -195,7 +195,18 @@ class GPU_RDF2Vec:
         # Dask-client requirement does not apply — torchrec ranks coordinate
         # through torch.distributed, and the pre-flight check in
         # _fit_via_torchrec enforces the torchrun launch contract.
-        if self.config.multi_gpu and self.config.backend != "torchrec":
+        #
+        # backend='pytorch' with multi_gpu=True uses Lightning DDP (not Dask)
+        # when called via fit_from_walks(); the Dask client is only required
+        # when calling fit(edge_df) (walk generation uses cuGraph + Dask-CUDA).
+        # To allow constructing a pytorch-multi-GPU instance for fit_from_walks
+        # without a Dask cluster, the Dask-client enforcement is deferred to
+        # fit() itself for the pytorch backend.
+        _needs_dask_client = (
+            self.config.multi_gpu
+            and self.config.backend not in ("torchrec", "pytorch")
+        )
+        if _needs_dask_client:
             if client is None:
                 raise ValueError(
                     "multi_gpu=True requires a Dask client. Please create a "
@@ -213,6 +224,16 @@ class GPU_RDF2Vec:
             )
             dask.config.set({"dataframe.backend": "cudf"})
             # Apply cuGraph 25.6 + dask 2025.5 compatibility patches
+            from ._compat import apply_patches
+            apply_patches()
+        elif self.config.multi_gpu and self.config.backend == "pytorch" and client is not None:
+            # pytorch multi-GPU with an explicit Dask client — accept it so the
+            # fit(edge_df) walk-generation path (cuGraph + Dask-CUDA) still works.
+            self.client = client
+            logger.info(
+                f"Using provided Dask client with {len(client.scheduler_info()['workers'])} workers"
+            )
+            dask.config.set({"dataframe.backend": "cudf"})
             from ._compat import apply_patches
             apply_patches()
         else:
@@ -1494,12 +1515,17 @@ class GPU_RDF2Vec:
         """Build the SkipGram model + Lightning Trainer and fit on `datamodule`.
         Shared by `_fit_via_pytorch_sequences` (fit()) and `fit_from_walks`.
         `datamodule` yields `(vertices, predicates)` batches."""
+        # Sparse embeddings are incompatible with NCCL all_reduce (DDP multi-GPU):
+        # NCCL requires dense tensors for gradient synchronization. Use dense
+        # embeddings when training with n_gpus > 1; sparse for single-GPU to
+        # preserve memory efficiency (only touched rows allocated in gradients).
+        use_sparse = n_gpus == 1
         model = SkipGram(
             vocab_size=self.word2idx.shape[0],
             embedding_dim=self.config.vector_size,
             neg_samples=self.config.negative_samples,
             learning_rate=self.config.learning_rate,
-            use_sparse=True,
+            use_sparse=use_sparse,
             epochs=self.config.epochs,
             min_learning_rate=self.config.min_learning_rate,
             lr_decay=self.config.lr_decay,

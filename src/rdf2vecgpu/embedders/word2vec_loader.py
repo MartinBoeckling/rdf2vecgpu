@@ -458,12 +458,19 @@ class WalkSequenceDataModule(L.LightningDataModule):
         )
         if self.trainer is not None and self.trainer.world_size > 1:
             rank, ws = self.trainer.global_rank, self.trainer.world_size
-            ds.files = [f for i, f in enumerate(ds.files) if i % ws == rank]
-            if not ds.files:
-                raise RuntimeError(
-                    f"DDP rank {rank}/{ws}: no walk-parquet files assigned "
-                    f"(fewer files than ranks?)"
-                )
+            # File-level sharding: each rank takes every ws-th file.
+            # When there are fewer files than ranks (e.g. a single-file corpus
+            # from prepare_corpus / single-GPU walk-gen), fall back to giving
+            # every rank all files so DDP can still proceed. The gradient
+            # averaging across ranks is still correct (each rank computes the
+            # same gradient; DDP averages → same update as 1-GPU). A
+            # row-level stride would be more efficient but requires the
+            # iterable to be rank-aware; the all-files fallback is the safe
+            # default here and avoids a hard failure on small corpora.
+            sharded = [f for i, f in enumerate(ds.files) if i % ws == rank]
+            if sharded:
+                ds.files = sharded
+            # else: fewer files than ranks — all ranks read all files.
         self._iterable = ds
 
     def train_dataloader(self):
