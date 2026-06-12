@@ -934,6 +934,18 @@ class GPU_RDF2Vec:
 
         return vocab_df, token_counts, vocab_path
 
+    def _load_word2idx(self, vocab_path: str):
+        """Load a prepared corpus vocab (`token_id`, `entity` — as written by
+        `prepare_corpus`) into `self.word2idx` in the `(token, word)` layout the
+        pytorch / gensim extract paths expect, and return it. The walks were
+        encoded against these same token ids, so the mapping is consistent by
+        construction."""
+        vocab = cudf.read_parquet(vocab_path)
+        self.word2idx = vocab.rename(columns={"token_id": "token", "entity": "word"})[
+            ["token", "word"]
+        ]
+        return self.word2idx
+
     def _build_walk_pair_loader(self, walks_path: str, vocab_df):
         """DataLoader yielding ``(center, context)`` long-tensor batches.
 
