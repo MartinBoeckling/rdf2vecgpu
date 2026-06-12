@@ -8,14 +8,26 @@ Measures, on the SAME graph + hyperparameters, for each training backend:
 and appends one JSON row per run to ``--out`` (default
 ``performance/results/bench_results.jsonl``).
 
-The four backends launch DIFFERENTLY — this harness encapsulates each:
+Workflow — prepare-once, then train-only (removes the walk-generation confound):
+
+    # 1. Prepare corpus once from your graph
+    python performance/bench_backends.py --prepare --data G.parquet --corpus corpus/
+
+    # 2. Train each backend from the shared corpus (training-only timing)
+    python performance/bench_backends.py --backend gensim     --corpus corpus/
+    python performance/bench_backends.py --backend pytorch    --corpus corpus/
+    python performance/bench_backends.py --backend pytorch-mg --corpus corpus/
+    NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=N \\
+      performance/bench_backends.py --backend torchrec --corpus corpus/
+
+Full-pipeline fallback (prepare + train in one shot, original behaviour):
 
     backend     training        launch
     --------    -----------     ------------------------------------------------
     gensim      CPU             python performance/bench_backends.py --backend gensim --data G.parquet
     pytorch     single-GPU      python performance/bench_backends.py --backend pytorch --data G.parquet
     pytorch-mg  multi-GPU DDP   python performance/bench_backends.py --backend pytorch-mg --data G.parquet
-    torchrec    sharded         NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=N \
+    torchrec    sharded         NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=N \\
                                   performance/bench_backends.py --backend torchrec --data G.parquet
 
 IMPORTANT — read before interpreting results:
@@ -117,9 +129,40 @@ def _common_metrics(args, backend: str) -> dict:
     }
 
 
-# ─────────────────────────── single-process backends ───────────────────────────
+# ─────────────────────────── prepare-only mode ───────────────────────────
+def run_prepare(args) -> dict:
+    """Prepare (walk + vocab) corpus from --data, write to --corpus. Times the whole step."""
+    from rdf2vecgpu import GPU_RDF2Vec
+    cfg = _config("pytorch", False, args)
+    m = GPU_RDF2Vec(config=cfg)
+    metrics = _common_metrics(args, "prepare")
+    with _timed(metrics, "t_prepare_corpus_s"):
+        edges = m.load_data(args.data)
+        m.prepare_corpus(edges, args.corpus)
+    return metrics
+
+
+# ─────────────────────────── train-from-corpus (gensim/pytorch/pytorch-mg) ───────────────────────────
+def run_from_corpus(args) -> dict:
+    """Train one backend from a shared prepared corpus (fit_from_walks only)."""
+    from rdf2vecgpu import GPU_RDF2Vec
+    backend = "pytorch" if args.backend in ("pytorch", "pytorch-mg") else args.backend
+    multi_gpu = args.backend == "pytorch-mg"
+    cfg = _config(backend, multi_gpu, args)
+    m = GPU_RDF2Vec(config=cfg)                    # pytorch-mg needs NO Dask client now
+    walks = os.path.join(args.corpus, "walks")
+    vocab = os.path.join(args.corpus, "vocab.parquet")
+    metrics = _common_metrics(args, args.backend)
+    _reset_vram()
+    with _timed(metrics, "t_fit_from_walks_s"):
+        m.fit_from_walks(walks, vocab)
+    metrics["peak_vram_gib"] = _peak_vram_gib()
+    return metrics
+
+
+# ─────────────────────────── single-process backends (full pipeline) ───────────────────────────
 def run_single_process(args) -> dict:
-    """gensim / pytorch (single-GPU) / pytorch-mg (DDP via a Dask client)."""
+    """gensim / pytorch (single-GPU) / pytorch-mg (DDP via a Dask client) — full pipeline fallback."""
     from rdf2vecgpu import GPU_RDF2Vec
 
     backend = "pytorch" if args.backend in ("pytorch", "pytorch-mg") else args.backend
@@ -162,9 +205,17 @@ def run_single_process(args) -> dict:
 
 # ─────────────────────────── torchrec (under torchrun) ───────────────────────────
 def run_torchrec(args) -> dict | None:
-    """Decoupled: rank 0 prepares the corpus (single-GPU), every rank trains
-    from it. MUST be launched under torchrun. Returns metrics on rank 0, None
-    on other ranks (so only rank 0 writes the result row)."""
+    """Train with torchrec under torchrun.
+
+    If ``--corpus`` is given: every rank trains directly from the pre-prepared
+    corpus (training-only timing — no prep step).  Rank 0 does NOT re-prepare.
+
+    If ``--corpus`` is NOT given (legacy / full-pipeline): rank 0 prepares the
+    corpus, then every rank trains from it.
+
+    Returns metrics on rank 0, None on other ranks (so only rank 0 writes the
+    result row).
+    """
     import torch
     import torch.distributed as dist
     from rdf2vecgpu import GPU_RDF2Vec
@@ -173,7 +224,7 @@ def run_torchrec(args) -> dict | None:
         raise SystemExit(
             "--backend torchrec must be launched under torchrun, e.g.\n"
             "  NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=2 "
-            "performance/bench_backends.py --backend torchrec --data G.parquet"
+            "performance/bench_backends.py --backend torchrec --corpus corpus/"
         )
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -181,33 +232,37 @@ def run_torchrec(args) -> dict | None:
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
-    corpus_dir = args.corpus_dir or os.path.join(
-        os.path.dirname(os.path.abspath(args.out)), "bench_corpus"
-    )
-    walks_path = os.path.join(corpus_dir, "walks")
-    vocab_path = os.path.join(corpus_dir, "vocab.parquet")
-    ready = os.path.join(corpus_dir, "READY")
-
     metrics = _common_metrics(args, "torchrec")
     metrics["world_size"] = world_size
 
-    # 1. Corpus prep on rank 0 only (cuGraph/cuDF single-GPU, OUTSIDE the NCCL
-    #    training collectives) — peers wait on the filesystem marker.
-    if rank == 0:
-        prep_cfg = _config("pytorch", False, args)  # single-GPU data path
-        prep = GPU_RDF2Vec(config=prep_cfg)
-        with _timed(metrics, "t_prepare_corpus_s"):
-            edges = prep.load_data(args.data)
-            prep.prepare_corpus(edges, corpus_dir)
-        open(ready, "w").write("ok")
+    if args.corpus:
+        # ── train-from-corpus mode: skip prep, time fit_from_walks only ──
+        walks_path = os.path.join(args.corpus, "walks")
+        vocab_path = os.path.join(args.corpus, "vocab.parquet")
     else:
-        deadline = time.monotonic() + args.prep_timeout_s
-        while not os.path.exists(ready):
-            if time.monotonic() > deadline:
-                raise TimeoutError("rank-0 corpus prep timed out")
-            time.sleep(1.0)
+        # ── legacy full-pipeline mode: rank 0 prepares, peers wait ──
+        corpus_dir = args.corpus_dir or os.path.join(
+            os.path.dirname(os.path.abspath(args.out)), "bench_corpus"
+        )
+        walks_path = os.path.join(corpus_dir, "walks")
+        vocab_path = os.path.join(corpus_dir, "vocab.parquet")
+        ready = os.path.join(corpus_dir, "READY")
 
-    # 2. Sharded training on every rank.
+        if rank == 0:
+            prep_cfg = _config("pytorch", False, args)  # single-GPU data path
+            prep = GPU_RDF2Vec(config=prep_cfg)
+            with _timed(metrics, "t_prepare_corpus_s"):
+                edges = prep.load_data(args.data)
+                prep.prepare_corpus(edges, corpus_dir)
+            open(ready, "w").write("ok")
+        else:
+            deadline = time.monotonic() + args.prep_timeout_s
+            while not os.path.exists(ready):
+                if time.monotonic() > deadline:
+                    raise TimeoutError("rank-0 corpus prep timed out")
+                time.sleep(1.0)
+
+    # Sharded training on every rank.
     m = GPU_RDF2Vec(config=_config("torchrec", True, args))
     _reset_vram()
     dist.barrier()
@@ -222,21 +277,47 @@ def run_torchrec(args) -> dict | None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--backend", required=True, choices=["gensim", "pytorch", "pytorch-mg", "torchrec"])
-    p.add_argument("--data", required=True, help="path to the triple parquet (e.g. data/wikidata5m/wikidata5m_kg.parquet)")
+    # ── mode flags ──
+    p.add_argument("--prepare", action="store_true",
+                   help="prepare walk corpus from --data into --corpus, write a 'prepare' metrics row, then exit")
+    p.add_argument("--backend", choices=["gensim", "pytorch", "pytorch-mg", "torchrec"],
+                   help="training backend (required unless --prepare is set)")
+    # ── data / corpus ──
+    p.add_argument("--data", default="",
+                   help="path to the triple parquet (required for --prepare or full-pipeline mode)")
+    p.add_argument("--corpus", default="",
+                   help="directory holding a prepared corpus (walks/ + vocab.parquet). "
+                        "When set (and not --prepare), backends train from this corpus via "
+                        "fit_from_walks only (training-only timing).")
+    # ── output ──
     p.add_argument("--out", default="performance/results/bench_results.jsonl")
     p.add_argument("--tag", default="", help="free-form label for this run (e.g. 'wikidata5m')")
+    # ── legacy / torchrec options ──
     p.add_argument("--nproc", type=int, default=0, help="pytorch-mg: Dask-CUDA workers (0=auto). torchrec uses torchrun --nproc_per_node.")
-    p.add_argument("--corpus-dir", default="", help="torchrec: where to write the prepared corpus (default: alongside --out)")
+    p.add_argument("--corpus-dir", default="", help="torchrec full-pipeline fallback: where to write the prepared corpus (default: alongside --out)")
     p.add_argument("--prep-timeout-s", type=int, default=3600)
     for k, v in DEFAULTS.items():
         argtype = type(v)
         p.add_argument(f"--{k.replace('_', '-')}", dest=k, type=argtype, default=v)
     args = p.parse_args()
 
-    if args.backend == "torchrec":
+    # ── validate arg combinations ──
+    if args.prepare:
+        if not args.data:
+            p.error("--prepare requires --data")
+        if not args.corpus:
+            p.error("--prepare requires --corpus")
+        metrics = run_prepare(args)
+    elif args.backend is None:
+        p.error("--backend is required unless --prepare is set")
+    elif args.backend == "torchrec":
         metrics = run_torchrec(args)
+    elif args.corpus:
+        metrics = run_from_corpus(args)
     else:
+        # Full-pipeline fallback: --data must be provided
+        if not args.data:
+            p.error("--data is required when --corpus is not set")
         metrics = run_single_process(args)
 
     if metrics is not None:  # rank 0 (or single-process)
