@@ -21,6 +21,7 @@ The content of this repository readme can be found here:
   - [Repository Structure](#repository-structure)
   - [Capability overview](#capability-overview)
 - [Quick start](#quick-start)
+- [Sharded embeddings across GPUs (torchrec backend)](#sharded-embeddings-across-gpus-torchrec-backend)
 - [Implementation Details](#implementation-details)
 - [License](#license)
 - [Roadmap](#roadmap)
@@ -130,6 +131,7 @@ RDF2Vec is a powerful technique to generate vector embeddings of entities in RDF
 
 - GPU-backed walk generation over CUDA Kernels
 - Batched Word2Vec training with Pytorch lightning
+- Row-wise **sharded embeddings across GPUs** (torchrec) for tables larger than single-GPU VRAM
 - Pluggable rdf loaders and parquet, csv, txt integration
 - Performance comparison can be found in the following [folder](performance/)
 
@@ -203,13 +205,91 @@ embeddings.to_parquet("data/wikidata5m/wikidata5m_embeddings.parquet", index=Fal
 
 ### Optional extras
 
-The experiment tracking backends and the test suite are opt-in:
+The experiment tracking backends, the gensim/torchrec training backends, and
+the test suite are opt-in:
 
 ```bash
 pip install "rdf2vecgpu[mlflow]"
 pip install "rdf2vecgpu[wandb]"
+pip install "rdf2vecgpu[gensim]"
 pip install "rdf2vecgpu[test]"
 ```
+
+For the sharded multi-GPU `torchrec` backend, install `torch`, `torchrec`,
+and `fbgemm-gpu` as a **matched release** from the PyTorch CUDA wheel index
+(they share a build ABI — a mismatch imports fine but fails at runtime), then
+the extra:
+
+```bash
+# CUDA 12.8 example (matches RAPIDS cudf-cu12/cugraph-cu12 25.06)
+pip install torch==2.9.1 torchrec==1.4.0 fbgemm-gpu==1.4.1 \
+  --index-url https://pypi.org/simple \
+  --extra-index-url https://download.pytorch.org/whl/cu128
+pip install "rdf2vecgpu[torchrec]"
+```
+
+## Sharded embeddings across GPUs (`torchrec` backend)
+
+When the embedding table is too large for a single GPU's VRAM (cuDF's int32
+`size_type` already caps a single device at ~2.1 B rows), train with
+`backend="torchrec"`: the in/out embedding tables are **row-wise sharded**
+across GPUs via torchrec `DistributedModelParallel`, training runs under
+Lightning Fabric, and checkpointing uses Distributed Checkpoint (DCP).
+Skip-gram only for now.
+
+Because torchrec training runs under `torchrun`/NCCL while the cuGraph +
+dask-cudf walk generation wants its own GPU cluster, the two **cannot share a
+process**. So the workflow is decoupled into two steps:
+
+**1. Prepare the walk corpus once (outside `torchrun`, single process):**
+
+```python
+from rdf2vecgpu import GPU_RDF2Vec, RDF2VecConfig
+
+cfg = RDF2VecConfig(walk_strategy="random", walk_depth=4, walk_number=20,
+                    embedding_model="skipgram")  # walk_strategy is free to choose
+m = GPU_RDF2Vec(config=cfg)
+edges = m.load_data("data/kg.parquet")
+walks_path, vocab_path = m.prepare_corpus(edges, out_dir="corpus/")
+# writes corpus/walks/ (parquet) + corpus/vocab.parquet
+```
+
+**2. Train the sharded model under `torchrun` (one process per GPU):**
+
+```python
+# train_sharded.py
+from rdf2vecgpu import GPU_RDF2Vec, RDF2VecConfig
+
+cfg = RDF2VecConfig(
+    backend="torchrec", embedding_model="skipgram", multi_gpu=True,
+    walk_depth=4, walk_number=20, vector_size=128, epochs=5,
+    learning_rate=0.025, negative_samples=5,
+    optimizer="sgd",                 # gradient-clipped in the fused kernel
+    checkpoint_dir="ckpt/",          # optional: DCP checkpoint + auto-resume
+)
+m = GPU_RDF2Vec(config=cfg)
+m.fit_from_walks("corpus/walks", "corpus/vocab.parquet")
+emb = m.transform()                  # dask_cudf.DataFrame, one partition per rank
+emb.to_parquet("embeddings/")        # partitioned parquet dataset
+```
+
+```bash
+NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=2 train_sharded.py
+```
+
+Notes:
+
+- **`NCCL_P2P_DISABLE=1`** — on consumer multi-GPU boxes without NVLink, NCCL
+  peer-to-peer over PCIe can deadlock the very first collective (a silent
+  hang during `DistributedModelParallel` init). Disabling P2P routes
+  collectives through shared memory/host and resolves it. Leave it unset on
+  NVLink systems, where P2P is faster.
+- **`transform()` returns this rank's shard** as a single dask partition (no
+  cross-rank gather — the full table is never materialised in one process).
+  Persist to a partitioned parquet dataset; each rank writes its part.
+- The walk corpus on disk is **backend-agnostic**: any `walk_strategy` may be
+  used in step 1, and the same corpus can also feed the `pytorch`/`gensim`
+  backends.
 
 ## Implementation Details
 

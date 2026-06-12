@@ -5,6 +5,58 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-06-12
+
+This release adds a **row-wise sharded Word2Vec training backend** for
+embedding tables that exceed a single GPU's VRAM, built on Meta's
+[torchrec](https://github.com/pytorch/torchrec). The embedding tables are
+sharded across GPUs via `DistributedModelParallel`, training runs under
+Lightning Fabric, checkpointing uses Distributed Checkpoint (DCP), and
+extraction returns a `dask_cudf.DataFrame` (one partition per rank, no
+cross-rank gather). Skip-gram only in this release.
+
+### Added
+
+- **`backend="torchrec"` sharded-embedding training backend.** New value on
+  `RDF2VecConfig.backend`. Because torchrec training runs under
+  `torchrun`/NCCL while the cuGraph/dask-cudf walk generation wants its own
+  cluster, the two are **decoupled**: prepare the walk corpus once (outside
+  `torchrun`), then train from it on every rank.
+  - `GPU_RDF2Vec.prepare_corpus(edge_df, out_dir, walk_vertices=None)` —
+    runs the single-GPU data path and writes a backend-agnostic corpus
+    (`walks/` parquet + `vocab.parquet`) to `out_dir`. Returns
+    `(walks_path, vocab_path)`.
+  - `GPU_RDF2Vec.fit_from_walks(walks_path, vocab_path)` — the torchrec
+    training entry point; must be launched under
+    `torchrun --standalone --nproc_per_node=N`.
+  - `transform()` returns the trained embeddings as a `dask_cudf.DataFrame`
+    (per-rank shard; schema `token_id, entity, "0".."dim-1"`).
+  - DCP checkpointing via `checkpoint_dir`, `checkpoint_interval_minutes`,
+    `checkpoint_keep_last`, `checkpoint_overwrite`; auto-resume on relaunch.
+- `embedders/torchrec_word2vec.py` — the sharded model
+  (`ShardedSkipGramModel`), Fabric training loop, fused-optimizer mapping,
+  sharding plan, DCP save/resume, and `dask_cudf` extraction.
+- Optional install extra: `pip install "rdf2vecgpu[torchrec]"` (see the
+  README "Sharded embeddings across GPUs" section for the CUDA wheel index
+  and the `NCCL_P2P_DISABLE=1` note).
+
+### Fixed
+
+- **Fused-optimizer gradient clipping.** The torchrec backend now enables
+  FBGEMM gradient clipping (`gradient_clipping=True`,
+  `max_gradient=grad_clip_value`). The skip-gram loss is a SUM over the pair
+  batch, so without a clip the default `"sgd"` optimizer diverged to NaN on
+  non-trivial corpora — the fused optimizer-in-backward has no external
+  `clip_grad` hook, unlike the pytorch backend.
+- `fit_transform`'s `walk_vertices` argument now defaults to `None`, matching
+  `fit()` and its own docstring.
+
+### Notes
+
+- **Hardware/runtime:** on consumer multi-GPU boxes without NVLink, NCCL P2P
+  over PCIe can deadlock the first collective. Export `NCCL_P2P_DISABLE=1`
+  when launching the torchrec backend (see the README).
+
 ## [0.4.0] — 2026-04-27
 
 This release bundles a four-PR upstream-port sequence that ports
