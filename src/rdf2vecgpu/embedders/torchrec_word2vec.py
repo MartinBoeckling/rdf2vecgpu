@@ -204,19 +204,18 @@ def extract_embeddings_to_dask_cudf(model, vocab_df):
     import cudf
     import cupy
     import dask_cudf
-    import torch.distributed as dist
 
-    # Locate the in-embedding table parameter on this rank.
-    in_param = _get_in_table_local_tensor(model)         # cuda tensor (local_rows, dim)
+    # Locate this rank's shard of the in-embedding table AND its authoritative
+    # global row offset, read straight from torchrec's shard metadata. Do NOT
+    # recompute the offset from vocab_size/world_size: torchrec's row-wise
+    # block sizing (ceil block, remainder on the last rank) disagrees with a
+    # naive split for any vocab_size not divisible by world_size, which would
+    # mislabel every token id on at least one rank. ``model`` here is also the
+    # DMP wrapper, which does not expose ``vocab_size`` — another reason to
+    # trust the shard metadata over the module.
+    in_param, start = _get_in_table_local_shard(model)   # cuda tensor (local_rows, dim)
     local_rows, dim = in_param.shape
-
-    # Compute the (start, end) row range this rank owns.
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    start, end = _local_row_range(model.vocab_size, world_size, rank)
-    assert end - start == local_rows, (
-        f"local rows {local_rows} ≠ shard size {end - start} on rank {rank}"
-    )
+    end = start + local_rows
 
     # Move to a cudf.DataFrame with dim columns labeled "0".."dim-1".
     cupy_arr = cupy.asarray(in_param.detach())
@@ -232,28 +231,49 @@ def extract_embeddings_to_dask_cudf(model, vocab_df):
 
 
 def _local_row_range(vocab_size: int, world_size: int, rank: int) -> tuple[int, int]:
-    """Even split with the remainder absorbed by the last rank."""
-    base = vocab_size // world_size
-    start = rank * base
-    end = vocab_size if rank == world_size - 1 else start + base
+    """Row range ``[start, end)`` that ``rank`` owns under torchrec row-wise
+    sharding.
+
+    MUST mirror torchrec's block sizing: ``block = ceil(vocab_size /
+    world_size)``; earlier ranks each own a full ``block`` and the remainder
+    lands on the last populated rank, which owns *fewer*. This is the OPPOSITE
+    of a naive floor split (remainder on the last rank); the two disagree
+    whenever ``vocab_size % world_size != 0`` — verified against
+    ``ShardedTensor.local_shards()[0].metadata.shard_offsets`` (V=321, W=2 →
+    rank0 owns [0,161), rank1 owns [161,321)).
+
+    Production extraction reads the offset straight from the shard metadata
+    (:func:`_get_in_table_local_shard`); this helper exists for callers (the
+    tests) that need to predict the tiling without a live sharded model.
+    """
+    import math
+
+    block = math.ceil(vocab_size / world_size)
+    start = min(rank * block, vocab_size)
+    end = min(start + block, vocab_size)
     return start, end
 
 
-def _get_in_table_local_tensor(model) -> torch.Tensor:
-    """Return the rank-local tensor for the in-embedding table.
+def _get_in_table_local_shard(model) -> "tuple[torch.Tensor, int]":
+    """Return ``(local_tensor, start_row)`` for the in-embedding table on
+    this rank.
+
+    ``start_row`` is the AUTHORITATIVE global row offset of this rank's
+    shard, read from torchrec's ``ShardedTensor`` metadata — never
+    recomputed (see :func:`_local_row_range` for why a recomputed offset
+    drifts from torchrec's actual ceil-block split).
 
     Two paths:
-    1. Post-DMP: torchrec wraps the parameter as a ShardedTensor /
-       DTensor exposing ``.local_tensor()`` — return that.
-    2. Pre-DMP or world_size=1 unwrapped: walk
-       ``in_collection.embeddings`` directly and return the
-       ``nn.Embedding.weight.data``.
+    1. Post-DMP: the state_dict value is a ``ShardedTensor`` whose single
+       local shard carries both the tensor and its ``shard_offsets`` —
+       return ``(shard.tensor, shard_offsets[0])``.
+    2. Pre-DMP or world_size=1 unwrapped: walk ``in_collection.embeddings``
+       directly and return ``(weight.data, 0)`` — the whole table lives on
+       this rank starting at row 0.
 
-    The two branches are deliberately separate. If torchrec ships a
-    state_dict that contains the table key but where the value lacks
-    ``local_tensor`` (e.g. a future API change), we fall through to the
-    direct access — never return a full unsliced tensor as if it were a
-    shard.
+    The two branches are deliberately separate: if torchrec ever ships a
+    state_dict whose value lacks the sharded API, we fall through to direct
+    access rather than mislabel a full tensor as a shard at offset 0.
     """
     # Path 1: post-DMP sharded value
     try:
@@ -262,17 +282,20 @@ def _get_in_table_local_tensor(model) -> torch.Tensor:
         sd = {}
     for key, val in sd.items():
         if ShardedSkipGramModel.IN_TABLE_NAME in key and "weight" in key:
-            if hasattr(val, "local_tensor"):
-                return val.local_tensor()
-            # Key matched but no .local_tensor — this is the pre-DMP
+            if hasattr(val, "local_shards"):
+                shards = val.local_shards()
+                if shards:
+                    shard = shards[0]
+                    return shard.tensor, int(shard.metadata.shard_offsets[0])
+            # Key matched but no ShardedTensor shards — this is the pre-DMP
             # case where the state_dict value IS the full nn.Embedding
-            # weight. Fall through to path 2 rather than returning the
-            # full tensor as a "shard".
+            # weight. Fall through to path 2 rather than returning the full
+            # tensor as a "shard".
             break
 
-    # Path 2: pre-DMP direct access to nn.Embedding weights
+    # Path 2: pre-DMP direct access to nn.Embedding weights (start row 0)
     for table in model.in_collection.embeddings.values():
-        return table.weight.data
+        return table.weight.data, 0
     raise RuntimeError("could not locate in-embedding table on this rank")
 
 
@@ -593,19 +616,35 @@ def train_torchrec_word2vec(rdf2vec, walks_path, vocab_path) -> None:
     loader = rdf2vec._build_walk_pair_loader(walks_path, vocab_df)
     loader = fabric.setup_dataloaders(loader, use_distributed_sampler=False)
 
-    # 8. Training loop. NOTE: do NOT skip empty batches on a single rank
-    #    — peer ranks would still call fabric.backward and the NCCL
-    #    collective would hang waiting for the absent rank. If a rank
-    #    has no work it must still participate in the collective; in
-    #    practice the loader sharding already guarantees every rank
-    #    sees the same batch cadence.
+    # 8. Training loop.
+    #    torchrec's sharded forward issues an all_to_all on EVERY step, so
+    #    every rank MUST execute the same number of forward()s per epoch or
+    #    the collective desyncs and the job deadlocks. The row-striped pair
+    #    loader (see _build_walk_pair_loader) keeps the batch COUNT equal in
+    #    the common case, but multi-file / multi-worker loaders can still
+    #    drift by a batch, so we additionally gate each step on a min-reduce
+    #    "join": the moment ANY rank runs out of batches, EVERY rank stops
+    #    this epoch together (dropping at most the uneven tail). Do NOT skip
+    #    empty batches mid-stream — a size-0 row stride still carries a
+    #    tensor and must join the collective (its SUM loss is 0); only true
+    #    exhaustion (next() -> None) lowers the continue flag.
+    import torch.distributed as dist
+
     global_step = start_step
     last_ckpt_time = time.monotonic()
     token_counts_dev = (
         token_counts.to(fabric.device) if hasattr(token_counts, "to") else None
     )
     for epoch in range(start_epoch, cfg.epochs):
-        for batch in loader:
+        data_iter = iter(loader)
+        while True:
+            batch = next(data_iter, None)
+            have = torch.ones(1, device=fabric.device, dtype=torch.int32)
+            if batch is None:
+                have.zero_()
+            dist.all_reduce(have, op=dist.ReduceOp.MIN)
+            if int(have.item()) == 0:
+                break
             center, context = batch
             negative = _sample_negatives(
                 n_rows=center.size(0), n_neg=cfg.negative_samples,
@@ -615,8 +654,9 @@ def train_torchrec_word2vec(rdf2vec, walks_path, vocab_path) -> None:
             loss = model(center, context, negative)
             fabric.backward(loss)
             # optimizer step is fused into backward via apply_optimizer_in_backward.
-            rdf2vec.tracker.log(
-                {"train/loss": loss.item(), "epoch": epoch, "step": global_step}
+            rdf2vec.tracker.log_metrics(
+                {"train/loss": loss.item(), "epoch": float(epoch)},
+                step=global_step,
             )
             global_step += 1
 
@@ -678,12 +718,28 @@ def _fused_optimizer_from_config(cfg) -> tuple[type, dict]:
     actually exported and have the expected
     ``__init__(params, lr=...)`` signature.
     """
+    # Gradient clipping is REQUIRED for the SGD path, not optional. The
+    # skip-gram loss is a SUM over the pair batch (see ShardedSkipGramModel.
+    # forward), so a hot token's gradient is the sum over all its pairs in the
+    # batch — large enough that plain SGD diverges to NaN on non-trivial
+    # corpora. The pytorch backend tames this with the same `grad_clip_value`
+    # via an explicit clip_grad between backward and step; the fused
+    # optimizer-in-backward gives us no such hook, so we hand the clip to
+    # FBGEMM's kernel. `gradient_clipping=True` + `max_gradient=v` clamps each
+    # gradient element to [-v, v], matching grad_clip_mode="element" (the
+    # default). PartialRowWiseAdam already normalises per-row, so it is stable
+    # without the clip, but applying it there too is harmless and keeps the
+    # two optimizers' semantics aligned.
+    kwargs = {"lr": cfg.learning_rate}
+    if getattr(cfg, "grad_clip_value", 0):
+        kwargs["gradient_clipping"] = True
+        kwargs["max_gradient"] = float(cfg.grad_clip_value)
     if cfg.optimizer == "sgd":
         from torchrec.optim import SGD
-        return SGD, {"lr": cfg.learning_rate}
+        return SGD, kwargs
     if cfg.optimizer == "sparseadam":
         from torchrec.optim import PartialRowWiseAdam
-        return PartialRowWiseAdam, {"lr": cfg.learning_rate}
+        return PartialRowWiseAdam, kwargs
     raise ValueError(
         f"backend='torchrec' does not support optimizer={cfg.optimizer!r}"
     )
