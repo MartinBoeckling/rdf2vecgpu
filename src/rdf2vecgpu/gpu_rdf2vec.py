@@ -1355,25 +1355,6 @@ class GPU_RDF2Vec:
                     f"sample={self.config.sample} | negative_sampling={self.config.negative_sampling}"
                 )
 
-                model = SkipGram(
-                    vocab_size=self.word2idx.shape[0],
-                    embedding_dim=self.config.vector_size,
-                    neg_samples=self.config.negative_samples,
-                    learning_rate=self.config.learning_rate,
-                    use_sparse=True,
-                    epochs=self.config.epochs,
-                    min_learning_rate=self.config.min_learning_rate,
-                    lr_decay=self.config.lr_decay,
-                    window=self.config.window_size,
-                    accumulate_grad_batches=self.config.accumulate_grad_batches,
-                    steps_per_epoch=steps_per_epoch,
-                    grad_clip_value=self.config.grad_clip_value,
-                    optimizer=self.config.optimizer,
-                    grad_clip_mode=self.config.grad_clip_mode,
-                    sample=self.config.sample,
-                    negative_sampling=self.config.negative_sampling,
-                    token_counts=token_counts,
-                )
                 datamodule = WalkSequenceDataModule(
                     walks_parquet,
                     batch_size=walks_per_batch,
@@ -1381,43 +1362,71 @@ class GPU_RDF2Vec:
                     shuffle=True,
                     seed=self.config.random_state,
                 )
-                self.tracker.log_pytorch()
-                trainer = L.Trainer(
-                    max_epochs=self.config.epochs,
-                    log_every_n_steps=200,
-                    accelerator="gpu",
-                    precision=32,
-                    devices=n_gpus,
-                    strategy="ddp" if n_gpus > 1 else "auto",
-                    num_nodes=self.config.num_nodes,
-                    accumulate_grad_batches=self.config.accumulate_grad_batches,
-                    enable_checkpointing=False,
-                    enable_progress_bar=False,
+                self._train_pytorch_sequences(
+                    datamodule, token_counts=token_counts,
+                    steps_per_epoch=steps_per_epoch, n_gpus=n_gpus,
                 )
-                trainer.fit(model, datamodule)
-                self.tracker.log_model_pytorch(model, artifact_path="word2vec_model")
-                self.word2vec_model = model
-                self.tracker.log_params({
-                    "vector_size": self.config.vector_size,
-                    "window_size": self.config.window_size,
-                    "epochs": self.config.epochs,
-                    "negative_samples": self.config.negative_samples,
-                    "embedding_model": "skipgram",
-                    "optimizer": self.config.optimizer,
-                    "learning_rate": self.config.learning_rate,
-                    "min_learning_rate": self.config.min_learning_rate,
-                    "lr_decay": self.config.lr_decay,
-                    "pair_batch_size": self.config.pair_batch_size,
-                    "accumulate_grad_batches": self.config.accumulate_grad_batches,
-                    "grad_clip_value": self.config.grad_clip_value,
-                    "grad_clip_mode": self.config.grad_clip_mode,
-                    "sample": self.config.sample,
-                    "negative_sampling": self.config.negative_sampling,
-                    "backend": "pytorch",
-                    "corpus": "walk_sequences_onfly_gpu",
-                })
             finally:
                 shutil.rmtree(walk_dir, ignore_errors=True)
+
+    def _train_pytorch_sequences(self, datamodule, *, token_counts, steps_per_epoch, n_gpus):
+        """Build the SkipGram model + Lightning Trainer and fit on `datamodule`.
+        Shared by `_fit_via_pytorch_sequences` (fit()) and `fit_from_walks`.
+        `datamodule` yields `(vertices, predicates)` batches."""
+        model = SkipGram(
+            vocab_size=self.word2idx.shape[0],
+            embedding_dim=self.config.vector_size,
+            neg_samples=self.config.negative_samples,
+            learning_rate=self.config.learning_rate,
+            use_sparse=True,
+            epochs=self.config.epochs,
+            min_learning_rate=self.config.min_learning_rate,
+            lr_decay=self.config.lr_decay,
+            window=self.config.window_size,
+            accumulate_grad_batches=self.config.accumulate_grad_batches,
+            steps_per_epoch=steps_per_epoch,
+            grad_clip_value=self.config.grad_clip_value,
+            optimizer=self.config.optimizer,
+            grad_clip_mode=self.config.grad_clip_mode,
+            sample=self.config.sample,
+            negative_sampling=self.config.negative_sampling,
+            token_counts=token_counts,
+        )
+        self.tracker.log_pytorch()
+        trainer = L.Trainer(
+            max_epochs=self.config.epochs,
+            log_every_n_steps=200,
+            accelerator="gpu",
+            precision=32,
+            devices=n_gpus,
+            strategy="ddp" if n_gpus > 1 else "auto",
+            num_nodes=self.config.num_nodes,
+            accumulate_grad_batches=self.config.accumulate_grad_batches,
+            enable_checkpointing=False,
+            enable_progress_bar=False,
+        )
+        trainer.fit(model, datamodule)
+        self.tracker.log_model_pytorch(model, artifact_path="word2vec_model")
+        self.word2vec_model = model
+        self.tracker.log_params({
+            "vector_size": self.config.vector_size,
+            "window_size": self.config.window_size,
+            "epochs": self.config.epochs,
+            "negative_samples": self.config.negative_samples,
+            "embedding_model": "skipgram",
+            "optimizer": self.config.optimizer,
+            "learning_rate": self.config.learning_rate,
+            "min_learning_rate": self.config.min_learning_rate,
+            "lr_decay": self.config.lr_decay,
+            "pair_batch_size": self.config.pair_batch_size,
+            "accumulate_grad_batches": self.config.accumulate_grad_batches,
+            "grad_clip_value": self.config.grad_clip_value,
+            "grad_clip_mode": self.config.grad_clip_mode,
+            "sample": self.config.sample,
+            "negative_sampling": self.config.negative_sampling,
+            "backend": "pytorch",
+            "corpus": "walk_sequences_onfly_gpu",
+        })
 
     def _fit_from_parquet(self, walk_path: str) -> None:
         """Train Word2Vec from parquet shards using DDP across all GPUs."""
