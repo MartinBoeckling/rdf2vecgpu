@@ -199,9 +199,11 @@ class GPU_RDF2Vec:
         # backend='pytorch' with multi_gpu=True uses Lightning DDP (not Dask)
         # when called via fit_from_walks(); the Dask client is only required
         # when calling fit(edge_df) (walk generation uses cuGraph + Dask-CUDA).
-        # To allow constructing a pytorch-multi-GPU instance for fit_from_walks
-        # without a Dask cluster, the Dask-client enforcement is deferred to
-        # fit() itself for the pytorch backend.
+        # So the client is NOT enforced at construction for the pytorch backend,
+        # allowing a pytorch-multi-GPU instance for fit_from_walks without a Dask
+        # cluster. If you instead call fit(edge_df) on such an instance without a
+        # client, the missing-cluster error surfaces later from construct_graph
+        # (cuGraph multi-GPU comms not initialized), not here.
         _needs_dask_client = (
             self.config.multi_gpu
             and self.config.backend not in ("torchrec", "pytorch")
@@ -1266,6 +1268,12 @@ class GPU_RDF2Vec:
 
         if backend == "gensim":
             from .embedders.gensim_word2vec import train_gensim_word2vec   # lazy: optional extra
+            # Coverage mask for transform() (zeros un-walked rows) — parity with
+            # the fit() gensim path (_fit_via_gensim), which sets _walked_mask
+            # from the walk-corpus token counts.
+            self._walked_mask = (
+                _token_counts_from_walk_parquet(walks_path, self.word2idx.shape[0]) > 0
+            )
             with self.tracker.stage("Word2Vec_Training"):
                 self.word2vec_model = train_gensim_word2vec(
                     walks_dir=walks_path, word2idx_df=self.word2idx,
@@ -1289,11 +1297,16 @@ class GPU_RDF2Vec:
                 import pyarrow.parquet as _pq
                 n_gpus = torch.cuda.device_count()
                 token_counts = _token_counts_from_walk_parquet(walks_path, self.word2idx.shape[0])
-                n_walks = sum(
-                    _pq.read_metadata(f).num_rows
-                    for f in _glob.glob(f"{walks_path}/*.parquet")
-                ) or 1
-                steps_per_epoch = max(1, -(-n_walks // (walks_per_batch * n_gpus)))
+                files = _glob.glob(f"{walks_path}/*.parquet")
+                n_walks = sum(_pq.read_metadata(f).num_rows for f in files) or 1
+                # When the corpus has fewer parquet files than DDP ranks,
+                # WalkSequenceDataModule cannot shard a single file and instead
+                # gives EVERY rank ALL files, so each rank runs
+                # n_walks/walks_per_batch steps — NOT n_walks/(walks_per_batch*
+                # world_size). Size the LR schedule for the real per-rank step
+                # count so it doesn't bottom out ~world_size× too early.
+                step_divisor = walks_per_batch * (n_gpus if len(files) >= n_gpus else 1)
+                steps_per_epoch = max(1, -(-n_walks // step_divisor))
                 dm = WalkSequenceDataModule(
                     walks_path, batch_size=walks_per_batch,
                     num_workers=self.config.cpu_count, shuffle=True, seed=self.config.random_state,

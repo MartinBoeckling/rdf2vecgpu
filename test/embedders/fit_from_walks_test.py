@@ -77,6 +77,7 @@ def test_fit_from_walks_missing_corpus_raises(tmp_path):
 
 def test_fit_from_walks_dispatches_per_backend(tmp_path, monkeypatch):
     import cudf
+    import numpy as np
     from rdf2vecgpu.config import RDF2VecConfig
     from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
 
@@ -87,7 +88,15 @@ def test_fit_from_walks_dispatches_per_backend(tmp_path, monkeypatch):
 
     called = {}
     m = GPU_RDF2Vec(config=RDF2VecConfig(backend="gensim", embedding_model="skipgram"))
-    monkeypatch.setattr(m, "_load_word2idx", lambda vp: called.setdefault("vocab", vp))
+
+    def _fake_load(vp):
+        called["vocab"] = vp
+        m.word2idx = cudf.DataFrame({"token": [0, 1], "word": ["a", "b"]})
+    monkeypatch.setattr(m, "_load_word2idx", _fake_load)
+    # gensim branch derives the walked_mask from the walk parquet — stub that
+    # read so the test stays a pure dispatch check (the part.0.parquet is junk).
+    monkeypatch.setattr("rdf2vecgpu.gpu_rdf2vec._token_counts_from_walk_parquet",
+                        lambda *a, **k: np.array([1, 1]))
     # train_gensim_word2vec is imported lazily from its source module — patch it THERE.
     monkeypatch.setattr("rdf2vecgpu.embedders.gensim_word2vec.train_gensim_word2vec",
                         lambda **kw: called.setdefault("gensim", kw) or "model")

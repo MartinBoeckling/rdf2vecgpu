@@ -156,6 +156,12 @@ def run_from_corpus(args) -> dict:
     _reset_vram()
     with _timed(metrics, "t_fit_from_walks_s"):
         m.fit_from_walks(walks, vocab)
+    with _timed(metrics, "t_transform_s"):
+        emb = m.transform()
+        # torchrec returns a dask_cudf shard per rank; materialise to force the
+        # extraction work so the timing is comparable across backends.
+        if hasattr(emb, "compute"):
+            emb = emb.compute()
     metrics["peak_vram_gib"] = _peak_vram_gib()
     return metrics
 

@@ -509,10 +509,10 @@ class _InMemoryWalkSeq(IterableDataset):
         # the leaf count is exactly n * row_len and the view is well-defined.
         self.vertices = torch.from_dlpack(
             cudf_df["vertices"].list.leaves.to_dlpack()
-        ).view(n, -1) if n else torch.empty((0, 0), dtype=torch.int32, device="cuda")
+        ).contiguous().view(n, -1) if n else torch.empty((0, 0), dtype=torch.int32, device="cuda")
         self.predicates = torch.from_dlpack(
             cudf_df["predicates"].list.leaves.to_dlpack()
-        ).view(n, -1) if n else torch.empty((0, 0), dtype=torch.int32, device="cuda")
+        ).contiguous().view(n, -1) if n else torch.empty((0, 0), dtype=torch.int32, device="cuda")
         self.emit_batch_size = int(emit_batch_size)
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
