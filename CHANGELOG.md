@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`fit_from_walks(walks_path, vocab_path)` is now a cross-backend training
+  entry point** (previously torchrec-only). After `prepare_corpus` writes a
+  single backend-agnostic corpus (walks-as-sequences parquet + `vocab.parquet`),
+  any backend trains from it: gensim (CPU), single-GPU pytorch, multi-GPU
+  pytorch (Lightning DDP), or torchrec (sharded, under `torchrun`). Generate
+  walks once; compare or swap embedding backends without regenerating.
+- `InMemoryWalkSeqDataModule` — a GPU-resident walks loader that yields
+  `(vertices, predicates)` GPU tensors straight from a cuDF frame via DLPack
+  (zero-copy), the GPU-native counterpart of `WalkSequenceDataModule`.
+
+### Changed
+
+- **Single-GPU pytorch skip-gram trains GPU-resident again.** The path no longer
+  round-trips walks through a temp parquet + CPU (pyarrow/NumPy) decode; it feeds
+  `_train_pytorch_sequences` directly from the in-memory cuDF walks via
+  `InMemoryWalkSeqDataModule` (cuGraph → cuDF → DLPack → training). This restores
+  the pre-spike in-memory default that the `7b6172f` throwaway spike had dropped.
+  Multi-GPU still checkpoints the dask_cudf corpus to parquet for DDP.
+- `GPU_RDF2Vec(backend="pytorch", multi_gpu=True)` no longer requires a Dask
+  client at construction — `fit_from_walks` trains via Lightning DDP (no Dask).
+  A client is still accepted/used for the `fit(edge_df)` walk-generation path.
+- The multi-GPU pytorch `fit_from_walks` path uses dense embeddings under DDP
+  (`use_sparse=False`); NCCL `all_reduce` cannot synchronise sparse gradients.
+  Single-GPU stays sparse.
+
+### Fixed
+
+- gensim single-GPU `fit()` crashed with `AttributeError: DataFrame object has
+  no attribute persist` — the dask-vs-cudf discriminator tested `.to_parquet`
+  (which a single-GPU `cudf.DataFrame` also has) instead of `.persist`.
+- `_token_counts_from_cudf_walks` coerces cuGraph's float64 predicate leaves to
+  int64 before bincount (they are not always integer-typed).
+- `WalkSequenceDataModule` no longer raises when a corpus has fewer parquet
+  files than DDP ranks; all ranks read all files (DDP gradient averaging stays
+  correct) instead of starving a rank.
+
+### Performance
+
+- `performance/bench_backends.py` reworked to a **prepare-once, train-only**
+  comparison: `--prepare` writes the shared corpus (timed once), then each
+  backend runs `fit_from_walks` only (`--corpus`), so the comparison measures
+  embedding training without the walk-generation confound. cuGraph dask comms
+  are initialised for the full-pipeline pytorch-mg fallback.
+
 ## [0.5.0] — 2026-06-12
 
 This release adds a **row-wise sharded Word2Vec training backend** for

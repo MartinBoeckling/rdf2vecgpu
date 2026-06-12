@@ -188,4 +188,5 @@ test.py
 wikidata*
 uv.lock
 .uv.lock
-.DS_Storeperformance/results/bench_results.jsonl
+.DS_Store
+performance/results/bench_results.jsonl

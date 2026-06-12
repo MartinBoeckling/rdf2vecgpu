@@ -289,7 +289,36 @@ Notes:
   Persist to a partitioned parquet dataset; each rank writes its part.
 - The walk corpus on disk is **backend-agnostic**: any `walk_strategy` may be
   used in step 1, and the same corpus can also feed the `pytorch`/`gensim`
-  backends.
+  backends (see below).
+
+### `prepare_corpus` → `fit_from_walks` for *any* backend
+
+The decoupled seam isn't torchrec-only. `fit_from_walks(walks_path, vocab_path)`
+trains **whichever backend** the config selects from the same prepared corpus —
+so you can generate walks once and compare or swap embedding backends without
+regenerating them:
+
+```python
+# same corpus/ from step 1 above
+for backend in ("gensim", "pytorch", "torchrec"):
+    m = GPU_RDF2Vec(config=RDF2VecConfig(backend=backend, embedding_model="skipgram",
+                                         multi_gpu=(backend == "torchrec")))
+    m.fit_from_walks("corpus/walks", "corpus/vocab.parquet")
+    emb = m.transform()
+```
+
+Launch model per backend (inherent, unchanged):
+
+- **gensim** and **single-GPU pytorch** — a plain `python` process. The
+  single-GPU pytorch path keeps the walks **GPU-resident** (cuDF → DLPack → GPU
+  tensors, no temp-parquet/CPU round-trip).
+- **multi-GPU pytorch** (`multi_gpu=True`) — a plain `python` process; Lightning
+  spawns DDP internally. Set `NCCL_P2P_DISABLE=1` on PCIe-only multi-GPU hosts.
+- **torchrec** — under `torchrun` (one process per GPU), as shown above.
+
+`prepare_corpus` writes a single corpus; the benchmark in
+[`performance/`](performance/) uses exactly this to compare *training-only* time
+and peak VRAM across all four backends.
 
 ## Implementation Details
 
