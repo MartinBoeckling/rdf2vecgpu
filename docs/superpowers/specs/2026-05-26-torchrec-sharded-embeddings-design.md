@@ -1,8 +1,66 @@
 # Torchrec-backed sharded embeddings for Word2Vec training
 
-**Status:** Design approved 2026-05-26. Implementation plan pending.
+**Status:** Implemented and verified end-to-end on 2× RTX A6000 (2026-06-12). v0.5.0.
 **Scope:** v1 of a new `backend="torchrec"` training backend.
 **Out of scope:** CBOW + order-aware skip-gram under sharding; CPU/UVM offload; custom sharding plans; backwards-compatibility with `pl.Trainer` on the sharded path.
+
+---
+
+## Update (2026-06-12) — implemented architecture & verification findings
+
+The sections below are the original approved design. Four things changed during
+implementation and first end-to-end verification; **where they conflict, this
+update wins**:
+
+1. **Decoupled data-prep from training (supersedes §3 `_fit_via_torchrec` and
+   the §4 `fit(edge_df)` path).** The cuGraph + dask-cudf walk generation runs
+   its own GPU cluster and **cannot share a process with the `torchrun`/NCCL
+   job** (each paradigm wants to own all GPUs; symptoms were
+   `cudaErrorInvalidDevice` + a dtype merge crash in `_generate_vocab`). The
+   backend is therefore split into two entry points:
+   - `GPU_RDF2Vec.prepare_corpus(edge_df, out_dir, walk_vertices=None)` — runs
+     the single-GPU data path **outside** `torchrun`; writes a backend-agnostic
+     corpus (`walks/` parquet + `vocab.parquet`). Any `walk_strategy` is valid;
+     the on-disk corpus is the contract.
+   - `GPU_RDF2Vec.fit_from_walks(walks_path, vocab_path)` — the training entry,
+     launched under `torchrun`; loads vocab + walks and trains. It does **no**
+     walk generation. `_fit_via_torchrec(edge_df)` now raises with guidance
+     pointing here.
+
+2. **NCCL P2P deadlock on PCIe boxes.** On consumer multi-GPU hosts without
+   NVLink, NCCL peer-to-peer over PCIe deadlocks the **first** collective —
+   the failure looks like a `DistributedModelParallel`-init hang in object
+   collectives (the `_get_pg_default_device will be deprecated` warning is a
+   red herring, not a version problem). **Mitigation: export
+   `NCCL_P2P_DISABLE=1`.** Do not bake it into the library (NVLink systems want
+   P2P); document it as a deployment note.
+
+3. **Fused-optimizer gradient clipping (correctness, not perf).** The skip-gram
+   loss is a SUM over the pair batch, so the default `"sgd"` optimizer diverges
+   to all-NaN without clipping. The pytorch backend uses an explicit
+   `clip_grad`; the fused optimizer-in-backward has no such hook, so
+   `_fused_optimizer_from_config` passes FBGEMM `gradient_clipping=True,
+   max_gradient=grad_clip_value` (element-wise; matches
+   `grad_clip_mode="element"`). The optimizer classes are
+   `torchrec.optim.SGD` / `PartialRowWiseAdam` (not the `EXACT_SGD` /
+   `PARTIAL_ROWWISE_ADAM` enum names guessed in §2).
+
+4. **Batch-count join + row-striped loader (correctness).** torchrec's sharded
+   forward all-to-alls every step, so every rank must run the same number of
+   `forward()`s. The pair loader row-stripes each walk batch across ranks (not
+   per-file sharding, which starved ranks), runs with `num_workers=0` (forked
+   CUDA workers abort), and the training loop gates each step on a min-reduce
+   "join" so all ranks stop together.
+
+**Verified stack:** torch 2.9.1+cu128 · torchrec 1.4.0+cu128 · fbgemm-gpu
+1.4.1+cu128 · RAPIDS 25.06. **Tests green:** single-GPU 22 passed; multi-GPU
+5 passed (smoke, planted-community-structure, DCP save/reload bit-equal,
+overwrite, keep-last). The cross-backend top-K overlap test (§6) was replaced
+by `test_torchrec_recovers_planted_community_structure` (finite + intra/inter
+cosine gap), because the original was ill-posed on a structureless graph with
+independent vocabularies.
+
+---
 
 ## 1. Problem
 
@@ -244,8 +302,19 @@ Notably **absent:** any `walk_strategy` restriction. Walks are sequences of toke
 
 ## 7. Follow-ups (explicitly deferred)
 
-- **`fit_from_walks(walks_path, vocab_path)` entry point**, applied across all three backends, exposing the on-disk walks parquet as the natural seam between extraction and training. Deferred to its own design + PR; bundling here would muddy the scope.
+- ~~**`fit_from_walks(walks_path, vocab_path)` entry point**~~ — **DONE** (see the
+  2026-06-12 update). The torchrec backend required the decoupling, so
+  `prepare_corpus` + `fit_from_walks` landed here rather than as a separate PR.
+  Generalising the same seam across the `pytorch`/`gensim` backends is still
+  open.
 - **Removing the existing `backend="gensim" + walk_strategy="bfs"` restriction** (same decoupling principle); separate PR.
+- **`grad_clip_mode="row"` parity** for the torchrec path — FBGEMM's fused clip
+  is element-wise (`max_gradient`), so it matches `grad_clip_mode="element"`
+  (the default) but not the L2-per-row mode. Add row-norm clipping if/when a
+  user needs it.
+- **Async / overlapped data loading** for the torchrec pair loader — currently
+  `num_workers=0` (forked CUDA workers abort, and `spawn` can't pickle the
+  nested dataset). A picklable, spawn-safe loader would restore I/O overlap.
 - **CBOW and order-aware skip-gram** under sharding.
 - **CPU/UVM offload** for tables exceeding aggregate VRAM.
 - **Custom `ParameterConstraints`** if torchrec's planner picks suboptimally at some specific scale we haven't observed yet.
