@@ -1180,18 +1180,33 @@ class GPU_RDF2Vec:
         )
 
     def fit_from_walks(self, walks_path: str, vocab_path: str) -> None:
-        """Train the torchrec sharded skip-gram model from a prepared corpus.
+        """Train a Word2Vec model from a prepared on-disk walk corpus.
 
-        The decoupled torchrec training entry point. Consumes a walk
-        corpus + vocab written by :meth:`prepare_corpus` and trains the
-        row-wise sharded model under torchrec + Lightning Fabric, with
-        optional DCP checkpointing.
+        The decoupled training entry point: prepare a corpus once via
+        :meth:`prepare_corpus` (or any walk-generation step that writes
+        the standard ``(vertices: list<int>, predicates: list<int>)``
+        parquet layout), then call this method to train any supported
+        backend from it.
 
-        MUST be launched under ``torchrun`` (the pre-flight checks enforce
-        this). Does NOT generate walks or build vocab — see
-        :meth:`prepare_corpus` for why those are a separate step. After
-        training, call :meth:`transform` within the same launch to extract
-        the sharded embeddings.
+        Supported backends (``config.backend``):
+
+        * **gensim** — streams walk sequences from the parquet directory
+          and trains gensim's negative-sampling Word2Vec on CPU.
+          ``gensim`` is an OPTIONAL extra and is imported lazily here so
+          that installations without it are unaffected.
+        * **pytorch (single-GPU)** — reads the corpus into a GPU-resident
+          cuDF frame and trains via :class:`InMemoryWalkSeqDataModule` +
+          the skip-gram SGD path.
+        * **pytorch (multi-GPU)** — streams the parquet per-rank under DDP
+          using :class:`WalkSequenceDataModule`.
+        * **torchrec** — runs the row-wise sharded torchrec skip-gram
+          model under ``torchrun``. MUST be launched via
+          ``torchrun --standalone --nproc_per_node=N``.
+
+        Does NOT generate walks or build vocab — see :meth:`prepare_corpus`
+        for why those are a separate step (cuGraph / Dask-CUDA and
+        torchrun/NCCL cannot share a process). After training, call
+        :meth:`transform` to extract embeddings.
 
         Parameters
         ----------
@@ -1201,11 +1216,85 @@ class GPU_RDF2Vec:
             rank (a shared filesystem for multi-node).
         vocab_path : str
             Parquet file mapping ``token_id`` ↔ ``entity``, as returned by
-            :meth:`prepare_corpus`. Also the DCP resume identity key.
+            :meth:`prepare_corpus`. Also the DCP resume identity key for
+            the torchrec backend.
+
+        Raises
+        ------
+        FileNotFoundError
+            If ``walks_path`` or ``vocab_path`` does not exist on disk.
+        ValueError
+            If an unsupported backend is specified.
+        RuntimeError
+            (torchrec only) If not launched under ``torchrun``.
         """
-        self._torchrec_preflight()
-        from rdf2vecgpu.embedders.torchrec_word2vec import train_torchrec_word2vec
-        train_torchrec_word2vec(self, walks_path, vocab_path)
+        import os
+        if not os.path.exists(walks_path):
+            raise FileNotFoundError(f"walks_path does not exist: {walks_path}")
+        if not os.path.exists(vocab_path):
+            raise FileNotFoundError(f"vocab_path does not exist: {vocab_path}")
+
+        backend = self.config.backend
+        if backend == "torchrec":
+            self._torchrec_preflight()
+            from rdf2vecgpu.embedders.torchrec_word2vec import train_torchrec_word2vec
+            train_torchrec_word2vec(self, walks_path, vocab_path)
+            return
+
+        self._load_word2idx(vocab_path)
+
+        if backend == "gensim":
+            from .embedders.gensim_word2vec import train_gensim_word2vec   # lazy: optional extra
+            with self.tracker.stage("Word2Vec_Training"):
+                self.word2vec_model = train_gensim_word2vec(
+                    walks_dir=walks_path, word2idx_df=self.word2idx,
+                    vector_size=self.config.vector_size, window=self.config.window_size,
+                    min_count=self.config.min_count, embedding_model=self.config.embedding_model,
+                    negative=self.config.negative_samples, epochs=self.config.epochs,
+                    workers=self.config.cpu_count, learning_rate=self.config.learning_rate,
+                    random_state=self.config.random_state,
+                )
+            return
+
+        if backend == "pytorch":
+            from .embedders.word2vec_loader import (
+                InMemoryWalkSeqDataModule, WalkSequenceDataModule, walks_per_pair_batch,
+            )
+            walks_per_batch = walks_per_pair_batch(
+                self.config.pair_batch_size, self.config.walk_depth, self.config.window_size
+            )
+            if self.config.multi_gpu:
+                import glob as _glob
+                import pyarrow.parquet as _pq
+                n_gpus = torch.cuda.device_count()
+                token_counts = _token_counts_from_walk_parquet(walks_path, self.word2idx.shape[0])
+                n_walks = sum(
+                    _pq.read_metadata(f).num_rows
+                    for f in _glob.glob(f"{walks_path}/*.parquet")
+                ) or 1
+                steps_per_epoch = max(1, -(-n_walks // (walks_per_batch * n_gpus)))
+                dm = WalkSequenceDataModule(
+                    walks_path, batch_size=walks_per_batch,
+                    num_workers=self.config.cpu_count, shuffle=True, seed=self.config.random_state,
+                )
+            else:
+                df = cudf.read_parquet(walks_path)
+                n_gpus = 1
+                token_counts = _token_counts_from_cudf_walks(df, self.word2idx.shape[0])
+                steps_per_epoch = max(1, -(-int(len(df)) // walks_per_batch))
+                dm = InMemoryWalkSeqDataModule(
+                    df, emit_batch_size=walks_per_batch,
+                    shuffle=True, seed=self.config.random_state,
+                )
+            self._walked_mask = (token_counts > 0)
+            with self.tracker.stage("Word2Vec_Training"):
+                self._train_pytorch_sequences(
+                    dm, token_counts=token_counts,
+                    steps_per_epoch=steps_per_epoch, n_gpus=n_gpus,
+                )
+            return
+
+        raise ValueError(f"fit_from_walks: unsupported backend {backend!r}")
 
     def prepare_corpus(
         self, edge_df, out_dir: str, walk_vertices: cudf.Series = None

@@ -65,3 +65,31 @@ def test_single_gpu_fit_uses_in_memory_feed_no_temp_parquet(tmp_path, monkeypatc
     emb = m.transform().to_pandas()
     vec = [c for c in emb.columns if c not in ("token", "word")]
     assert np.isfinite(emb[vec].to_numpy()).all()
+
+
+def test_fit_from_walks_missing_corpus_raises(tmp_path):
+    from rdf2vecgpu.config import RDF2VecConfig
+    from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+    m = GPU_RDF2Vec(config=RDF2VecConfig(backend="gensim", embedding_model="skipgram"))
+    with pytest.raises(FileNotFoundError):
+        m.fit_from_walks(str(tmp_path / "missing_walks"), str(tmp_path / "missing.parquet"))
+
+
+def test_fit_from_walks_dispatches_per_backend(tmp_path, monkeypatch):
+    import cudf
+    from rdf2vecgpu.config import RDF2VecConfig
+    from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    walks = tmp_path / "walks"; walks.mkdir()
+    (walks / "part.0.parquet").write_bytes(b"x")          # existence only
+    vocab = str(tmp_path / "vocab.parquet")
+    cudf.DataFrame({"token_id": [0, 1], "entity": ["a", "b"]}).to_parquet(vocab)
+
+    called = {}
+    m = GPU_RDF2Vec(config=RDF2VecConfig(backend="gensim", embedding_model="skipgram"))
+    monkeypatch.setattr(m, "_load_word2idx", lambda vp: called.setdefault("vocab", vp))
+    # train_gensim_word2vec is imported lazily from its source module — patch it THERE.
+    monkeypatch.setattr("rdf2vecgpu.embedders.gensim_word2vec.train_gensim_word2vec",
+                        lambda **kw: called.setdefault("gensim", kw) or "model")
+    m.fit_from_walks(str(walks), vocab)
+    assert called["gensim"]["walks_dir"] == str(walks)
