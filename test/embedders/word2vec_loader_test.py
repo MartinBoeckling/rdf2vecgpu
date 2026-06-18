@@ -94,6 +94,63 @@ def test_walkseq_iterable_shuffle_permutes_within_chunk_but_keeps_rows(walk_seq_
     np.testing.assert_array_equal(v_all[:, 0] // 10, (p_all[:, 0] - 100000) // 10)
 
 
+def test_walkseq_iterable_rank_striping_disjoint_equal_counts(walk_seq_dir):
+    """Multi-GPU DDP: each rank must train on a DISJOINT 1/world_size row-shard,
+    and every rank must emit the SAME number of batches. pytorch-mg uses
+    Lightning's automatic loop (no per-step all_reduce join available), so equal
+    batch counts must hold by construction or the per-step gradient all_reduce
+    desyncs and the job hangs. 1000 walks / 4 ranks → 250 rows each, divisible."""
+    from rdf2vecgpu.embedders.word2vec_loader import _WalkSeqIterable
+    ws = 4
+    per_rank_ids, batch_counts = {}, {}
+    for rank in range(ws):
+        it = _WalkSeqIterable(walk_seq_dir, emit_batch_size=64, read_chunk_size=256,
+                              shuffle=False, rank=rank, world_size=ws)
+        batches = list(iter(it))
+        batch_counts[rank] = len(batches)
+        per_rank_ids[rank] = (
+            np.concatenate([b[0][:, 0] // 10 for b in batches])
+            if batches else np.array([], dtype=np.int32)
+        )
+    # equal batch counts across ranks — the DDP requirement
+    assert len(set(batch_counts.values())) == 1, batch_counts
+    # each rank gets exactly 1000/4 = 250 distinct walk rows
+    for rank, ids in per_rank_ids.items():
+        assert len(ids) == 250 and len(np.unique(ids)) == 250
+    # ranks are disjoint and together cover all 1000 walks
+    allids = np.concatenate(list(per_rank_ids.values()))
+    assert len(allids) == 1000 and len(np.unique(allids)) == 1000
+
+
+def test_walkseq_iterable_rank_striping_equal_counts_when_indivisible(tmp_path):
+    """When rows don't divide evenly across ranks, every rank STILL emits the
+    same batch count (the < world_size remainder rows are dropped). 10 walks /
+    3 ranks → 3 rows each (9 used, 1 dropped), 2 batches each at emit=2."""
+    import pyarrow as pa
+    d = tmp_path / "walks"; d.mkdir()
+    n = 10
+    vs = np.arange(n, dtype=np.int32)[:, None] * 10 + np.arange(2, dtype=np.int32)[None, :]
+    ps = np.arange(n, dtype=np.int32)[:, None] * 10 + 100000
+    pq.write_table(pa.table({
+        "vertices": pa.array(list(vs), type=pa.list_(pa.int32())),
+        "predicates": pa.array(list(ps), type=pa.list_(pa.int32())),
+    }), d / "part.0.parquet")
+
+    from rdf2vecgpu.embedders.word2vec_loader import _WalkSeqIterable
+    ws = 3
+    per_rank_ids, batch_counts = {}, {}
+    for rank in range(ws):
+        batches = list(iter(_WalkSeqIterable(str(d), emit_batch_size=2,
+                          read_chunk_size=4, shuffle=False, rank=rank, world_size=ws)))
+        batch_counts[rank] = len(batches)
+        per_rank_ids[rank] = np.concatenate([b[0][:, 0] // 10 for b in batches])
+    assert len(set(batch_counts.values())) == 1, batch_counts        # equal counts
+    for ids in per_rank_ids.values():
+        assert len(ids) == 3 and len(np.unique(ids)) == 3            # 10//3 each
+    allids = np.concatenate(list(per_rank_ids.values()))
+    assert len(allids) == 9 and len(np.unique(allids)) == 9          # disjoint, 1 dropped
+
+
 def test_walkseq_iterable_shuffle_deterministic_per_seed(walk_seq_dir):
     from rdf2vecgpu.embedders.word2vec_loader import _WalkSeqIterable
     a = np.concatenate([b[0] for b in _WalkSeqIterable(walk_seq_dir, emit_batch_size=128, read_chunk_size=256, shuffle=True, seed=3)], axis=0)

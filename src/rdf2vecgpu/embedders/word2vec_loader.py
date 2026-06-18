@@ -371,11 +371,13 @@ class _WalkSeqIterable(IterableDataset):
     `read_chunk_size`-row PyArrow batches (cheap), decodes them vectorised, then
     re-slices into `emit_batch_size`-row sub-batches and yields each as
     (vertices, predicates) numpy int32 arrays of shape (n, depth+1) / (n, depth).
-    Files are sharded across DataLoader workers (DDP-rank sharding is done by the
-    caller, by trimming `.files`)."""
+    Single-rank (world_size=1): files split across DataLoader workers, all rows
+    emitted. DDP (world_size>1): each rank row-strides a disjoint 1/world_size of
+    the corpus, capped so every rank emits the same number of batches (required
+    because DDP all_reduces gradients every step)."""
 
     def __init__(self, walks_dir, *, emit_batch_size, read_chunk_size=262_144,
-                 shuffle=True, seed=0):
+                 shuffle=True, seed=0, rank=0, world_size=1):
         super().__init__()
         files = sorted(set(
             glob.glob(f"{walks_dir}/*.parquet")
@@ -388,6 +390,17 @@ class _WalkSeqIterable(IterableDataset):
         self.read_chunk_size = int(read_chunk_size)
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        # For DDP (world_size > 1) we row-stride the corpus across ranks and cap
+        # every rank to the same row budget, so each rank emits an identical
+        # number of batches (the per-step gradient all_reduce would otherwise
+        # desync and hang). That needs the global row count up front — cheap, it
+        # comes from parquet metadata without reading any data.
+        self.total_rows = (
+            sum(pq.ParquetFile(f).metadata.num_rows for f in self.files)
+            if self.world_size > 1 else None
+        )
         # epoch counter so successive epochs (Lightning re-iterates the dataloader)
         # get a different shuffle. Bumped in __iter__.
         self._epoch = -1
@@ -395,9 +408,30 @@ class _WalkSeqIterable(IterableDataset):
     def __iter__(self):
         wi = get_worker_info()
         n_w, w_id = (wi.num_workers, wi.id) if wi else (1, 0)
-        my = [f for k, f in enumerate(self.files) if k % n_w == w_id]
-        eb = self.emit_batch_size
         self._epoch += 1
+        if self.world_size > 1:
+            yield from self._iter_ddp_strided(n_w, w_id)
+        else:
+            yield from self._iter_single(n_w, w_id)
+
+    def _maybe_shuffle(self, v, p, *, shard_id, f_idx, c_idx):
+        # cuGraph emits the ~walk_number walks of each start vertex consecutively;
+        # without this shuffle a vertex's walks clump into one or two batches
+        # (over-aggregating its gradient / hitting the grad clip, then absent the
+        # rest of the epoch). Shuffling within the (large) read chunk spreads each
+        # vertex's walks across ~read_chunk_size/emit_batch_size batches. Seed mixes
+        # shard id, file index, chunk index and epoch so it's deterministic-per-run
+        # but varies across.
+        if not self.shuffle or v.shape[0] == 0:
+            return v, p
+        rng = np.random.default_rng((self.seed, self._epoch, shard_id, f_idx, c_idx))
+        perm = rng.permutation(v.shape[0])
+        return v[perm], p[perm]
+
+    def _iter_single(self, n_w, w_id):
+        """Single-rank streaming: files split across DataLoader workers, all rows."""
+        eb = self.emit_batch_size
+        my = [f for k, f in enumerate(self.files) if k % n_w == w_id]
         for f_idx, f in enumerate(my):
             pf = pq.ParquetFile(f)
             for c_idx, b in enumerate(
@@ -405,26 +439,59 @@ class _WalkSeqIterable(IterableDataset):
             ):
                 v = _flat_list_array_to_2d(b.column("vertices"))
                 p = _flat_list_array_to_2d(b.column("predicates"))
-                n = v.shape[0]
-                if n == 0:
+                if v.shape[0] == 0:
                     continue
-                if self.shuffle:
-                    # cuGraph emits the ~walk_number walks of each start vertex
-                    # consecutively; without this shuffle a vertex's walks clump
-                    # into one or two batches (over-aggregating its gradient /
-                    # hitting the grad clip, then absent the rest of the epoch).
-                    # Shuffling within the (large) read chunk spreads each
-                    # vertex's walks across ~read_chunk_size/emit_batch_size
-                    # batches. Seed mixes file index, chunk index, worker id and
-                    # epoch so it's deterministic-per-run but varies across.
-                    rng = np.random.default_rng(
-                        (self.seed, self._epoch, w_id, f_idx, c_idx)
-                    )
-                    perm = rng.permutation(n)
-                    v = v[perm]
-                    p = p[perm]
-                for s in range(0, n, eb):
+                v, p = self._maybe_shuffle(v, p, shard_id=w_id, f_idx=f_idx, c_idx=c_idx)
+                for s in range(0, v.shape[0], eb):
                     yield v[s:s + eb], p[s:s + eb]
+
+    def _iter_ddp_strided(self, n_w, w_id):
+        """DDP streaming: each (rank, worker) owns a disjoint global row-stride and
+        emits exactly ``total_rows // (world_size * n_w)`` rows, so every rank emits
+        the same number of batches. Rows are buffered across read chunks and emitted
+        in full ``emit_batch_size`` blocks (only the final block is ragged) so the
+        batch COUNT depends only on the per-shard cap — never on chunk boundaries."""
+        eb = self.emit_batch_size
+        n_shards = self.world_size * n_w
+        shard_id = self.rank * n_w + w_id
+        cap = self.total_rows // n_shards          # rows this shard trains on
+        if cap == 0:
+            return
+        emitted = 0
+        g = 0                                      # global row offset across all files
+        carry_v = carry_p = None
+        for f_idx, f in enumerate(self.files):
+            pf = pq.ParquetFile(f)
+            for c_idx, b in enumerate(
+                pf.iter_batches(columns=["vertices", "predicates"], batch_size=self.read_chunk_size)
+            ):
+                v = _flat_list_array_to_2d(b.column("vertices"))
+                p = _flat_list_array_to_2d(b.column("predicates"))
+                m = v.shape[0]
+                if m == 0:
+                    continue
+                # rows in [g, g+m) owned by this shard: (g + local) % n_shards == shard_id
+                start = (shard_id - g) % n_shards
+                if start < m:
+                    owned = np.arange(start, m, n_shards)
+                    take = min(len(owned), cap - emitted)
+                    owned = owned[:take]
+                    if len(owned):
+                        ov, op = v[owned], p[owned]
+                        ov, op = self._maybe_shuffle(ov, op, shard_id=shard_id, f_idx=f_idx, c_idx=c_idx)
+                        carry_v = ov if carry_v is None else np.concatenate([carry_v, ov])
+                        carry_p = op if carry_p is None else np.concatenate([carry_p, op])
+                        emitted += len(owned)
+                        while carry_v.shape[0] >= eb:
+                            yield carry_v[:eb], carry_p[:eb]
+                            carry_v, carry_p = carry_v[eb:], carry_p[eb:]
+                g += m
+                if emitted >= cap:
+                    break
+            if emitted >= cap:
+                break
+        if carry_v is not None and carry_v.shape[0] > 0:
+            yield carry_v, carry_p
 
 
 def _walkseq_collate(item):
@@ -449,29 +516,21 @@ class WalkSequenceDataModule(L.LightningDataModule):
         self._iterable = None
 
     def setup(self, stage=None):
-        ds = _WalkSeqIterable(
+        # The iterable row-strides across DDP ranks itself (each rank trains on a
+        # disjoint 1/world_size of the rows, with equal batch counts) — so a
+        # single-file corpus from single-GPU prepare_corpus shards correctly
+        # without any redundant all-ranks-all-files replication.
+        rank = self.trainer.global_rank if self.trainer is not None else 0
+        world_size = self.trainer.world_size if self.trainer is not None else 1
+        self._iterable = _WalkSeqIterable(
             self.walks_dir,
             emit_batch_size=self.batch_size,
             read_chunk_size=self.read_chunk_size,
             shuffle=self.shuffle,
             seed=self.seed,
+            rank=rank,
+            world_size=world_size,
         )
-        if self.trainer is not None and self.trainer.world_size > 1:
-            rank, ws = self.trainer.global_rank, self.trainer.world_size
-            # File-level sharding: each rank takes every ws-th file.
-            # When there are fewer files than ranks (e.g. a single-file corpus
-            # from prepare_corpus / single-GPU walk-gen), fall back to giving
-            # every rank all files so DDP can still proceed. The gradient
-            # averaging across ranks is still correct (each rank computes the
-            # same gradient; DDP averages → same update as 1-GPU). A
-            # row-level stride would be more efficient but requires the
-            # iterable to be rank-aware; the all-files fallback is the safe
-            # default here and avoids a hard failure on small corpora.
-            sharded = [f for i, f in enumerate(ds.files) if i % ws == rank]
-            if sharded:
-                ds.files = sharded
-            # else: fewer files than ranks — all ranks read all files.
-        self._iterable = ds
 
     def train_dataloader(self):
         if self._iterable is None:

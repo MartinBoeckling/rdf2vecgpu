@@ -1299,14 +1299,13 @@ class GPU_RDF2Vec:
                 token_counts = _token_counts_from_walk_parquet(walks_path, self.word2idx.shape[0])
                 files = _glob.glob(f"{walks_path}/*.parquet")
                 n_walks = sum(_pq.read_metadata(f).num_rows for f in files) or 1
-                # When the corpus has fewer parquet files than DDP ranks,
-                # WalkSequenceDataModule cannot shard a single file and instead
-                # gives EVERY rank ALL files, so each rank runs
-                # n_walks/walks_per_batch steps — NOT n_walks/(walks_per_batch*
-                # world_size). Size the LR schedule for the real per-rank step
-                # count so it doesn't bottom out ~world_size× too early.
-                step_divisor = walks_per_batch * (n_gpus if len(files) >= n_gpus else 1)
-                steps_per_epoch = max(1, -(-n_walks // step_divisor))
+                # WalkSequenceDataModule row-strides the corpus across DDP ranks
+                # and caps each rank to n_walks // n_gpus rows (regardless of how
+                # many parquet files the corpus has), so each rank runs
+                # ceil((n_walks // n_gpus) / walks_per_batch) steps. Size the LR
+                # schedule for that exact per-rank step count.
+                per_rank_walks = n_walks // n_gpus
+                steps_per_epoch = max(1, -(-per_rank_walks // walks_per_batch))
                 dm = WalkSequenceDataModule(
                     walks_path, batch_size=walks_per_batch,
                     num_workers=self.config.cpu_count, shuffle=True, seed=self.config.random_state,
@@ -1553,13 +1552,25 @@ class GPU_RDF2Vec:
             token_counts=token_counts,
         )
         self.tracker.log_pytorch()
+        # Multi-GPU DDP: force Lightning to self-spawn one worker per GPU, even
+        # inside a SLURM allocation. By default Lightning auto-detects SLURM
+        # (SLURM_NTASKS) and defers process launch to SLURM; under `--ntasks=1`
+        # that silently collapses DDP to a single rank ("MEMBER: 1/1"). Pinning a
+        # LightningEnvironment (creates_processes_externally=False) restores the
+        # plain-`python` subprocess-launch path this backend is designed for.
+        if n_gpus > 1:
+            from lightning.pytorch.strategies import DDPStrategy
+            from lightning.pytorch.plugins.environments import LightningEnvironment
+            strategy = DDPStrategy(cluster_environment=LightningEnvironment())
+        else:
+            strategy = "auto"
         trainer = L.Trainer(
             max_epochs=self.config.epochs,
             log_every_n_steps=200,
             accelerator="gpu",
             precision=32,
             devices=n_gpus,
-            strategy="ddp" if n_gpus > 1 else "auto",
+            strategy=strategy,
             num_nodes=self.config.num_nodes,
             accumulate_grad_batches=self.config.accumulate_grad_batches,
             enable_checkpointing=False,
