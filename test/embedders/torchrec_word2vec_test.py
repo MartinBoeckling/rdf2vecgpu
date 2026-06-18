@@ -46,6 +46,20 @@ def test_torchrec_backend_with_cbow_raises_not_implemented():
         model.fit_from_walks("walks", "vocab.parquet")
 
 
+def test_torchrec_backend_with_sgd_rejected():
+    # The fused optimizer-in-backward applies the update inside the FBGEMM kernel,
+    # where gradient clipping is a no-op (the gradient_clipping/max_gradient kwargs
+    # are silently dropped). So unclipped SGD diverges on the SUM skip-gram loss for
+    # non-trivial vocabularies. Reject sgd at preflight — even with grad_clip_value>0,
+    # which used to be (wrongly) accepted — and point to the stable rowwiseadagrad path.
+    cfg = RDF2VecConfig(backend="torchrec", embedding_model="skipgram", multi_gpu=True,
+                        optimizer="sgd", grad_clip_value=0.1)
+    model = GPU_RDF2Vec(config=cfg)
+    with pytest.raises(ValueError, match="rowwiseadagrad"):
+        # Paths unused — the pre-flight check fires before any disk read.
+        model.fit_from_walks("walks", "vocab.parquet")
+
+
 def test_torchrec_backend_without_multi_gpu_raises_value_error():
     cfg = RDF2VecConfig(backend="torchrec", embedding_model="skipgram", multi_gpu=False)
     model = GPU_RDF2Vec(config=cfg)
@@ -59,7 +73,10 @@ def test_torchrec_backend_without_distributed_init_raises_runtime_error():
 
     assert not dist.is_initialized(), "this test must run outside a distributed launch"
 
-    cfg = RDF2VecConfig(backend="torchrec", embedding_model="skipgram", multi_gpu=True)
+    # Use a supported optimizer so the distributed-init guard fires — the default
+    # "sgd" would be rejected earlier in the preflight (its fused clip is a no-op).
+    cfg = RDF2VecConfig(backend="torchrec", embedding_model="skipgram", multi_gpu=True,
+                        optimizer="rowwiseadagrad")
     model = GPU_RDF2Vec(config=cfg)
     with pytest.raises(RuntimeError, match="torchrun"):
         model.fit_from_walks("walks", "vocab.parquet")
@@ -896,15 +913,19 @@ def test_torchrec_recovers_planted_community_structure(torchrun_pg):
       * divergence to NaN/Inf (unclipped SGD on the SUM skip-gram loss), and
       * embedding collapse / broken sharding (intra ≈ inter cosine).
 
-    It deliberately uses the DEFAULT optimizer ("sgd"), so it also guards the
-    fused-optimizer gradient clipping that keeps that path stable.
+    It uses optimizer="rowwiseadagrad" (EXACT_ROWWISE_ADAGRAD), torchrec's stable
+    SGD-family path: per-row Adagrad is gradient-following (no momentum) with a
+    per-row LR decay, so it stays finite AND recovers structure. Plain sgd is
+    rejected at preflight (the fused optimizer-in-backward can't clip → unclipped
+    sgd diverges); Adam/sparseadam is stable but collapses on this tiny vocab.
+    This canary guards exactly that distinction.
     """
     import numpy as np
 
     from rdf2vecgpu.config import RDF2VecConfig
     from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
 
-    def clustered_triples(n_comm=3, per=50, intra=6_000, inter=150, seed=42):
+    def clustered_triples(n_comm=3, per=200, intra=30_000, inter=600, seed=42):
         import cudf
         rng = np.random.default_rng(seed)
 
@@ -923,7 +944,7 @@ def test_torchrec_recovers_planted_community_structure(torchrun_pg):
             p.append("inter")
         return cudf.DataFrame({"subject": s, "predicate": p, "object": o})
 
-    base = _shared_base("community")
+    base = _shared_base("community_big")
     walks_path, vocab_path = _prepare_corpus_fs(
         base, make_triples=clustered_triples, walk_depth=4, walk_number=20,
     )
@@ -931,8 +952,13 @@ def test_torchrec_recovers_planted_community_structure(torchrun_pg):
     cfg = RDF2VecConfig(
         backend="torchrec", embedding_model="skipgram", multi_gpu=True,
         walk_strategy="random", walk_depth=4, walk_number=20,
-        vector_size=32, epochs=5, learning_rate=0.025, negative_samples=5,
-        random_state=0,  # optimizer defaults to "sgd" -> exercises the clip
+        vector_size=32, epochs=40, learning_rate=0.05, negative_samples=5,
+        optimizer="rowwiseadagrad",  # per-row Adagrad: gradient-following + per-row
+                                     # LR decay → stable AND recovers structure (sgd's
+                                     # in-kernel clip is a no-op → diverges; Adam
+                                     # collapses on this tiny vocab; LARS unusable in
+                                     # FBGEMM 1.4 — no get_optimizer_state)
+        random_state=0,
     )
     m = GPU_RDF2Vec(config=cfg)
     m.fit_from_walks(walks_path, vocab_path)
@@ -941,8 +967,9 @@ def test_torchrec_recovers_planted_community_structure(torchrun_pg):
     vec_cols = [c for c in emb.columns if c not in ("token_id", "entity")]
     M = emb[vec_cols].to_numpy(dtype="float64")
 
-    # (1) Finiteness — unclipped SGD on the SUM loss diverges to all-NaN; this
-    #     is the regression guard for the fused-optimizer gradient clipping.
+    # (1) Finiteness — guards against divergence. RowWiseAdagrad's per-row LR
+    #     decay keeps it stable on the SUM loss; plain sgd would diverge (its
+    #     in-kernel clip is a no-op), which is why sgd is rejected for torchrec.
     assert np.isfinite(M).all(), (
         f"non-finite embeddings: "
         f"{int((~np.isfinite(M)).any(axis=1).sum())}/{len(M)} rows have NaN/Inf"

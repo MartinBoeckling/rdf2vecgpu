@@ -1145,19 +1145,25 @@ class GPU_RDF2Vec:
                 "(the sharded embedding path is multi-process by construction)."
             )
 
-        # Pre-flight: the fused SGD path needs gradient clipping. The skip-gram
-        # loss is a SUM over the pair batch, so unclipped SGD diverges to NaN on
-        # non-trivial corpora; the fused optimizer-in-backward has no external
-        # clip_grad hook, so the clip is applied in-kernel via grad_clip_value.
-        # Refuse the silent-NaN config rather than train to garbage.
-        if self.config.optimizer == "sgd" and not (
-            self.config.grad_clip_value and self.config.grad_clip_value > 0
-        ):
+        # Pre-flight: reject SGD. The fused optimizer-in-backward applies the
+        # update INSIDE the FBGEMM kernel, where gradient clipping is a no-op —
+        # the `gradient_clipping`/`max_gradient` kwargs are silently dropped (they
+        # belong to a separate GradientClippingOptimizer wrapper that only clips a
+        # standalone `.step()`, not a fused-in-backward update). So torchrec SGD
+        # runs UNCLIPPED, and the SUM skip-gram loss makes hot-token gradients
+        # overshoot → divergence to garbage on non-trivial vocabularies (verified
+        # on wikidata5m: per-batch loss 33k → 1.79M; a 100×-tighter clip had zero
+        # effect, confirming the clip is dead). grad_clip_value does NOT make it
+        # safe — that earlier guard rested on a false premise. PartialRowWiseAdam
+        # is per-row adaptive and stable without clipping. Refuse silent garbage.
+        if self.config.optimizer == "sgd":
             raise ValueError(
-                "backend='torchrec' with optimizer='sgd' requires grad_clip_value > 0 "
-                f"(got {self.config.grad_clip_value!r}). The SUM skip-gram loss makes "
-                "unclipped SGD diverge to NaN; the fused optimizer applies the clip "
-                "in-kernel. Set grad_clip_value (e.g. 0.1) or use optimizer='sparseadam'."
+                "backend='torchrec' does not support optimizer='sgd': the fused "
+                "optimizer-in-backward cannot apply gradient clipping, so the SUM "
+                "skip-gram loss makes unclipped SGD diverge on non-trivial "
+                "vocabularies. Use optimizer='rowwiseadagrad' (per-row Adagrad — "
+                "gradient-following, stable, recovers structure given enough steps) "
+                "or 'sparseadam' (PartialRowWiseAdam)."
             )
 
         # Pre-flight: imports

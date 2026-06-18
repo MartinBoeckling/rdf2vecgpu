@@ -800,30 +800,31 @@ def _fused_optimizer_from_config(cfg) -> tuple[type, dict]:
     actually exported and have the expected
     ``__init__(params, lr=...)`` signature.
     """
-    # Gradient clipping is REQUIRED for the SGD path, not optional. The
-    # skip-gram loss is a SUM over the pair batch (see ShardedSkipGramModel.
-    # forward), so a hot token's gradient is the sum over all its pairs in the
-    # batch — large enough that plain SGD diverges to NaN on non-trivial
-    # corpora. The pytorch backend tames this with the same `grad_clip_value`
-    # via an explicit clip_grad between backward and step; the fused
-    # optimizer-in-backward gives us no such hook, so we hand the clip to
-    # FBGEMM's kernel. `gradient_clipping=True` + `max_gradient=v` clamps each
-    # gradient element to [-v, v], matching grad_clip_mode="element" (the
-    # default). PartialRowWiseAdam already normalises per-row, so it is stable
-    # without the clip, but applying it there too is harmless and keeps the
-    # two optimizers' semantics aligned.
-    kwargs = {"lr": cfg.learning_rate}
-    if getattr(cfg, "grad_clip_value", 0):
-        kwargs["gradient_clipping"] = True
-        kwargs["max_gradient"] = float(cfg.grad_clip_value)
-    if cfg.optimizer == "sgd":
-        from torchrec.optim import SGD
-        return SGD, kwargs
+    # Plain SGD is rejected (also gated at _torchrec_preflight): the fused
+    # optimizer-in-backward applies the update inside the FBGEMM kernel and CANNOT
+    # clip — `gradient_clipping`/`max_gradient` are silently dropped (they belong to
+    # a separate GradientClippingOptimizer wrapper for a standalone `.step()`), so
+    # unclipped SGD diverges to garbage on large vocab (wikidata5m: loss 33k → 1.79M;
+    # a 100× tighter clip changed nothing). Two stable fused optimizers are offered:
+    #  - rowwiseadagrad (EXACT_ROWWISE_ADAGRAD): per-row Adagrad. Gradient-following
+    #    (SGD-family, no momentum) with a per-row gradient-accumulation scaling that
+    #    decays the effective per-row LR → inherently stable, no clip needed. The
+    #    canonical torchrec/DLRM embedding optimizer.
+    #  - sparseadam (PartialRowWiseAdam): per-row adaptive; stable but Adam-family
+    #    (momentum can collapse embeddings to a common direction on tiny vocabs).
+    # NB: LARS-SGD (OptimType.LARS_SGD) would be the ideal SGD-family fit, but
+    # FBGEMM 1.4 has no get_optimizer_state for it, so DistributedModelParallel
+    # cannot even construct a LARS-fused model (NotImplementedError at DMP init).
+    # Defense-in-depth — never return a plain SGD here.
+    if cfg.optimizer == "rowwiseadagrad":
+        from torchrec.optim import RowWiseAdagrad
+        return RowWiseAdagrad, {"lr": cfg.learning_rate}
     if cfg.optimizer == "sparseadam":
         from torchrec.optim import PartialRowWiseAdam
-        return PartialRowWiseAdam, kwargs
+        return PartialRowWiseAdam, {"lr": cfg.learning_rate}
     raise ValueError(
-        f"backend='torchrec' does not support optimizer={cfg.optimizer!r}"
+        f"backend='torchrec' supports optimizer in {{'rowwiseadagrad', 'sparseadam'}} "
+        f"(got {cfg.optimizer!r}); plain SGD's fused path cannot clip gradients → divergence."
     )
 
 

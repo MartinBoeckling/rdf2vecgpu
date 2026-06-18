@@ -180,7 +180,7 @@ class RDF2VecConfig(BaseModel):
     # many skip-gram pairs (small → no hot predicate token is over-aggregated;
     # large → GPU-efficient). lr decays linearly learning_rate → min_learning_rate
     # over the run (classic word2vec / gensim's alpha schedule).
-    optimizer: Literal["sgd", "sparseadam"] = "sgd"
+    optimizer: Literal["sgd", "sparseadam", "rowwiseadagrad"] = "sgd"
     sample: float = Field(default=0.001, ge=0)          # frequent-token subsampling (gensim's `sample`); 0 disables. Default 1e-3 = gensim's classic recipe (overnight-sweep §7.4 sub_f075 validation).
     negative_sampling: Literal["uniform", "unigram"] = "unigram"   # "unigram" = classic f^0.75 negatives (overnight-sweep §7.4 sub_f075 validation; "uniform" is opt-in).
     min_learning_rate: float = Field(default=0.0001, ge=0)
