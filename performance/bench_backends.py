@@ -110,6 +110,41 @@ def _is_leader() -> bool:
     return os.environ.get("RANK", "0") == "0" and os.environ.get("LOCAL_RANK", "0") == "0"
 
 
+def _export_kgreat_tsv(emb, path: str) -> None:
+    """Write entity embeddings as a KGrEAT embedding TSV: tab-separated, NO header,
+    column 0 = entity (the `word`/IRI), remaining columns = the L1-normalized
+    vector. Mirrors KGrEAT's embedding-rdf2vec `_serialize_embeddings` (unit
+    L1 norm, 6 decimals) so the file drops straight into kg/<id>/embedding/."""
+    import numpy as np
+    import pandas as pd
+    if hasattr(emb, "to_pandas"):
+        emb = emb.to_pandas()
+    # entity column is "word" (gensim/pytorch) or "entity" (torchrec); the id
+    # column is "token" or "token_id". Exclude both id and entity from the vector.
+    ent_col = "word" if "word" in emb.columns else "entity"
+    id_like = {"token", "word", "token_id", "entity"}
+    vec_cols = [c for c in emb.columns if c not in id_like]
+    M = emb[vec_cols].to_numpy(dtype="float64")
+    norms = np.abs(M).sum(axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    M = np.round(M / norms, 6)
+    out = pd.DataFrame(M, index=np.asarray(emb[ent_col]))
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    out.to_csv(path, sep="\t", header=False)
+
+
+def _concat_rank_shards(path: str, world_size: int) -> None:
+    """torchrec shards the vocab row-wise across ranks, so each rank writes a
+    disjoint `<path>.rank<r>` shard; rank 0 concatenates them into the final TSV."""
+    with open(path, "w") as out:
+        for r in range(world_size):
+            shard = f"{path}.rank{r}"
+            if os.path.exists(shard):
+                with open(shard) as fh:
+                    out.write(fh.read())
+                os.remove(shard)
+
+
 def _config(backend: str, multi_gpu: bool, args) -> "RDF2VecConfig":  # noqa: F821
     from rdf2vecgpu import RDF2VecConfig
     return RDF2VecConfig(
@@ -178,6 +213,8 @@ def run_from_corpus(args) -> dict:
         if hasattr(emb, "compute"):
             emb = emb.compute()
     metrics["peak_vram_gib"] = _peak_vram_gib()
+    if args.export_kgreat:
+        _export_kgreat_tsv(emb, args.export_kgreat)
     return metrics
 
 
@@ -290,6 +327,16 @@ def run_torchrec(args) -> dict | None:
     with _timed(metrics, "t_fit_from_walks_s"):
         m.fit_from_walks(walks_path, vocab_path)
     metrics["peak_vram_gib"] = _peak_vram_gib()
+    # KGrEAT export: transform() is rank-local (sharded model), so it MUST run
+    # inside the launch. Each rank writes its disjoint shard; rank 0 concatenates.
+    if args.export_kgreat:
+        emb = m.transform()
+        if hasattr(emb, "compute"):
+            emb = emb.compute()
+        _export_kgreat_tsv(emb, f"{args.export_kgreat}.rank{rank}")
+        dist.barrier()
+        if rank == 0:
+            _concat_rank_shards(args.export_kgreat, world_size)
     dist.barrier()
     dist.destroy_process_group()
 
@@ -313,6 +360,9 @@ def main() -> None:
     # ── output ──
     p.add_argument("--out", default="performance/results/bench_results.jsonl")
     p.add_argument("--tag", default="", help="free-form label for this run (e.g. 'wikidata5m')")
+    p.add_argument("--export-kgreat", default="", dest="export_kgreat",
+                   help="also write entity embeddings as a KGrEAT TSV (tab-sep, no header, "
+                        "L1-normalized) to this path, for downstream-task evaluation")
     # ── legacy / torchrec options ──
     p.add_argument("--nproc", type=int, default=0, help="pytorch-mg: Dask-CUDA workers (0=auto). torchrec uses torchrun --nproc_per_node.")
     p.add_argument("--corpus-dir", default="", help="torchrec full-pipeline fallback: where to write the prepared corpus (default: alongside --out)")
