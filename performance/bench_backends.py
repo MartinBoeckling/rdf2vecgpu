@@ -97,6 +97,17 @@ def _reset_vram() -> None:
         pass
 
 
+def _is_leader() -> bool:
+    """Only the leader process writes the result row.
+
+    - single-process backends (gensim / pytorch single-GPU): no RANK/LOCAL_RANK → leader.
+    - torchrec (torchrun): non-rank-0 already returns None, but guard anyway.
+    - pytorch-mg: Lightning's DDP-subprocess launcher re-runs this whole script in
+      each worker (LOCAL_RANK set), so every rank would otherwise append a row.
+    """
+    return os.environ.get("RANK", "0") == "0" and os.environ.get("LOCAL_RANK", "0") == "0"
+
+
 def _config(backend: str, multi_gpu: bool, args) -> "RDF2VecConfig":  # noqa: F821
     from rdf2vecgpu import RDF2VecConfig
     return RDF2VecConfig(
@@ -326,7 +337,7 @@ def main() -> None:
             p.error("--data is required when --corpus is not set")
         metrics = run_single_process(args)
 
-    if metrics is not None:  # rank 0 (or single-process)
+    if metrics is not None and _is_leader():  # rank 0 (or single-process)
         metrics["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
         with open(args.out, "a") as fh:
