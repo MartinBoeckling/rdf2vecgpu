@@ -1252,14 +1252,20 @@ class GPU_RDF2Vec:
             (torchrec only) If not launched under ``torchrun``.
         """
         import os
+        # Backend config preflight (torchrec: cbow unsupported / must run under
+        # torchrun) fires BEFORE any disk read, so a misconfiguration raises its
+        # specific error instead of being masked by a FileNotFoundError when the
+        # paths also happen to be missing.
+        backend = self.config.backend
+        if backend == "torchrec":
+            self._torchrec_preflight()
+
         if not os.path.exists(walks_path):
             raise FileNotFoundError(f"walks_path does not exist: {walks_path}")
         if not os.path.exists(vocab_path):
             raise FileNotFoundError(f"vocab_path does not exist: {vocab_path}")
 
-        backend = self.config.backend
         if backend == "torchrec":
-            self._torchrec_preflight()
             from rdf2vecgpu.embedders.torchrec_word2vec import train_torchrec_word2vec
             train_torchrec_word2vec(self, walks_path, vocab_path)
             return
