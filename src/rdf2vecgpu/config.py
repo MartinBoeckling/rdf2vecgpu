@@ -227,6 +227,13 @@ class RDF2VecConfig(BaseModel):
     tracker: Literal["mlflow", "wandb", "none"] = "none"
     tracker_kwargs: Optional[dict] = None
     tracker_run_name: Optional[str] = None
+    # torchrec training-progress visibility (the Fabric loop has no Lightning
+    # progress bar). When tracker != "none", loss/epoch are logged every
+    # `progress_log_every_n_steps`. `progress_print` additionally emits a flushed
+    # stdout line at the same cadence (rank 0 only) so progress shows up in a
+    # redirected/buffered job log. (Also toggleable via env RDF2VEC_TORCHREC_PROGRESS.)
+    progress_print: bool = False
+    progress_log_every_n_steps: int = Field(default=200, ge=1)
     # literal handling settings
     literal_predicates: Optional[list[str]] = None
     literal_strategy: Literal["drop", "bin"] = "drop"

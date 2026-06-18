@@ -15,6 +15,10 @@
 source /ceph/mboeckli/rdf2vecgpu/performance/slurm/env.sh
 
 export NCCL_P2P_DISABLE=1
+# torchrec's Fabric loop has no Lightning progress bar; this prints a flushed
+# rank-0 progress line (epoch | step | loss | steps/s) every 200 steps so the
+# otherwise-buffered job log shows live progress.
+export RDF2VEC_TORCHREC_PROGRESS=1
 
 torchrun --standalone --nproc_per_node=4 \
   performance/bench_backends.py --backend torchrec \

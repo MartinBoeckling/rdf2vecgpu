@@ -51,6 +51,46 @@ def _sample_negatives(
     raise ValueError(f"unknown negative-sampling strategy: {strategy!r}")
 
 
+def _env_progress_enabled() -> bool:
+    """Convenience override so the SLURM harness can flip the progress print
+    without touching config plumbing: RDF2VEC_TORCHREC_PROGRESS=1."""
+    import os
+    return os.environ.get("RDF2VEC_TORCHREC_PROGRESS", "").strip().lower() not in (
+        "", "0", "false", "no",
+    )
+
+
+class _ProgressMeter:
+    """Decides when to emit a torchrec training-progress point and formats it.
+
+    Host-only (no GPU / process group) so it is unit-testable. ``due(step)`` is
+    cadence-only and gates BOTH tracker logging and the optional stdout print;
+    ``enabled`` toggles only the flushed print. ``format`` tracks the previous
+    emission to report steps/sec.
+    """
+
+    def __init__(self, *, every_n_steps: int, enabled: bool):
+        self.every = int(every_n_steps)
+        self.enabled = bool(enabled)
+        self._last_step = 0
+        self._last_time = None
+
+    def due(self, step: int) -> bool:
+        return self.every > 0 and step % self.every == 0
+
+    def format(self, *, epoch: int, step: int, loss: float, now: float) -> str:
+        if self._last_time is None:
+            sps = 0.0
+        else:
+            dt = now - self._last_time
+            sps = (step - self._last_step) / dt if dt > 0 else 0.0
+        self._last_step, self._last_time = step, now
+        return (
+            f"[torchrec] epoch {epoch} | step {step:,} | "
+            f"loss {loss:.4f} | {sps:.1f} steps/s"
+        )
+
+
 def _build_sharding_plan(
     model: nn.Module, world_size: int, device: torch.device, pg=None,
 ) -> "ShardingPlan":  # noqa: F821 (lazy import — see body)
@@ -644,6 +684,10 @@ def train_torchrec_word2vec(rdf2vec, walks_path, vocab_path) -> None:
 
     global_step = start_step
     last_ckpt_time = time.monotonic()
+    progress = _ProgressMeter(
+        every_n_steps=cfg.progress_log_every_n_steps,
+        enabled=cfg.progress_print or _env_progress_enabled(),
+    )
     token_counts_dev = (
         token_counts.to(fabric.device) if hasattr(token_counts, "to") else None
     )
@@ -666,10 +710,24 @@ def train_torchrec_word2vec(rdf2vec, walks_path, vocab_path) -> None:
             loss = model(center, context, negative)
             fabric.backward(loss)
             # optimizer step is fused into backward via apply_optimizer_in_backward.
-            rdf2vec.tracker.log_metrics(
-                {"train/loss": loss.item(), "epoch": float(epoch)},
-                step=global_step,
-            )
+            # Progress emission (tracker + optional flushed stdout print) is
+            # cadenced and rank-0-only. loss.item() forces a device sync, so we
+            # only pay it on a logging step and only when something consumes it.
+            # The block contains no collectives, so gating it to rank 0 is safe.
+            want_log = (cfg.tracker != "none") or progress.enabled
+            if fabric.is_global_zero and want_log and progress.due(global_step):
+                loss_val = loss.item()
+                if cfg.tracker != "none":
+                    rdf2vec.tracker.log_metrics(
+                        {"train/loss": loss_val, "epoch": float(epoch)},
+                        step=global_step,
+                    )
+                if progress.enabled:
+                    print(
+                        progress.format(epoch=epoch, step=global_step,
+                                        loss=loss_val, now=time.monotonic()),
+                        flush=True,
+                    )
             global_step += 1
 
             # Time-based checkpoint. The decision MUST be agreed across ranks

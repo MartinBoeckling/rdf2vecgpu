@@ -15,6 +15,29 @@ from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
 # ───────────────────────────── Layer 1 ────────────────────────────────
 
 
+def test_progress_meter_due_respects_cadence():
+    from rdf2vecgpu.embedders.torchrec_word2vec import _ProgressMeter
+    m = _ProgressMeter(every_n_steps=200, enabled=True)
+    assert not m.due(199)
+    assert m.due(200)
+    assert m.due(400)
+    assert not m.due(401)
+    # every_n_steps=0 disables the cadence (and avoids modulo-by-zero)
+    assert not _ProgressMeter(every_n_steps=0, enabled=True).due(0)
+    # `enabled` toggles the print, not the cadence — `due` is cadence-only
+    assert _ProgressMeter(every_n_steps=200, enabled=False).due(200)
+
+
+def test_progress_meter_format_reports_rate_and_fields():
+    from rdf2vecgpu.embedders.torchrec_word2vec import _ProgressMeter
+    m = _ProgressMeter(every_n_steps=200, enabled=True)
+    first = m.format(epoch=2, step=200, loss=1.25, now=100.0)
+    assert "epoch 2" in first and "step 200" in first and "loss 1.2500" in first
+    assert "0.0 steps/s" in first                       # no prior sample → rate 0
+    second = m.format(epoch=2, step=400, loss=0.5, now=110.0)
+    assert "20.0 steps/s" in second                     # 200 steps / 10 s
+
+
 def test_torchrec_backend_with_cbow_raises_not_implemented():
     cfg = RDF2VecConfig(backend="torchrec", embedding_model="cbow", multi_gpu=True)
     model = GPU_RDF2Vec(config=cfg)
