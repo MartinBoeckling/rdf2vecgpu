@@ -34,6 +34,8 @@ HP_ARGS=(
   --negative-samples "$NEGATIVE"
   --random-state    "$RANDOM_STATE"
   --cpu-count       "$CPU_COUNT"
+  --grad-clip-value "$GRAD_CLIP"
+  --optimizer       "$OPTIMIZER"
 )
 
 echo "[env] host=$(hostname) job=${SLURM_JOB_ID:-NA} backend=${BACKEND:-?} tag=${TAG:-?}"

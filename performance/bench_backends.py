@@ -66,6 +66,8 @@ DEFAULTS = dict(
     negative_samples=5,
     random_state=42,
     cpu_count=20,
+    grad_clip_value=0.1,
+    optimizer="sgd",
 )
 
 
@@ -125,6 +127,8 @@ def _config(backend: str, multi_gpu: bool, args) -> "RDF2VecConfig":  # noqa: F8
         random_state=args.random_state,
         multi_gpu=multi_gpu,
         cpu_count=args.cpu_count,
+        grad_clip_value=args.grad_clip_value,
+        optimizer=args.optimizer,
     )
 
 

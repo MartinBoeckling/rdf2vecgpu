@@ -25,6 +25,8 @@ LR=0.025
 NEGATIVE=5
 RANDOM_STATE=42
 CPU_COUNT=20
+GRAD_CLIP=0.1
+OPTIMIZER=sgd
 
 # ── per-dataset settings ──
 case "$DS" in
@@ -52,7 +54,9 @@ mkdir -p "$WORK/logs" "$OUTDIR"
 EXPORTS="ALL,DATA=$DATA,CORPUS=$CORPUS,OUTDIR=$OUTDIR,TAG=$TAG"
 EXPORTS="$EXPORTS,WALK_STRATEGY=$WALK_STRATEGY,WALK_DEPTH=$WALK_DEPTH,WALK_NUMBER=$WALK_NUMBER"
 EXPORTS="$EXPORTS,EMB_MODEL=$EMB_MODEL,EPOCHS=$EPOCHS,VECTOR_SIZE=$VECTOR_SIZE,WINDOW=$WINDOW"
-EXPORTS="$EXPORTS,MIN_COUNT=$MIN_COUNT,LR=$LR,NEGATIVE=$NEGATIVE,RANDOM_STATE=$RANDOM_STATE,CPU_COUNT=$CPU_COUNT"
+EXPORTS="$EXPORTS,MIN_COUNT=$MIN_COUNT,NEGATIVE=$NEGATIVE,RANDOM_STATE=$RANDOM_STATE,CPU_COUNT=$CPU_COUNT,GRAD_CLIP=$GRAD_CLIP"
+# LR and OPTIMIZER are appended per-job below (torchrec needs rowwiseadagrad +
+# a GloVe-scale LR; the others use the dataset default LR + sgd).
 
 echo "=== sweep: $TAG ==="
 echo "  data   : $DATA"
@@ -62,14 +66,19 @@ echo "  walk_number=$WALK_NUMBER depth=$WALK_DEPTH vector_size=$VECTOR_SIZE epoc
 echo
 
 PREP=$(sbatch --parsable --job-name="prep_$TAG" \
-       --export="$EXPORTS,BACKEND=prepare" "$SLURM_DIR/prepare.sbatch")
+       --export="$EXPORTS,LR=$LR,OPTIMIZER=$OPTIMIZER,BACKEND=prepare" "$SLURM_DIR/prepare.sbatch")
 echo "prepare      -> job $PREP"
 
 for B in gensim pytorch pytorch_mg torchrec; do
+  # torchrec's fused optimizer-in-backward can't clip gradients, so sgd diverges;
+  # rowwiseadagrad (GloVe's per-row Adagrad) is stable + recovers structure at a
+  # GloVe-scale LR. gensim/pytorch keep sgd at the dataset default LR.
+  OPT="$OPTIMIZER"; OLR="$LR"
+  if [ "$B" = "torchrec" ]; then OPT="rowwiseadagrad"; OLR="0.05"; fi
   JID=$(sbatch --parsable --dependency=afterok:"$PREP" \
         --job-name="${B}_$TAG" \
-        --export="$EXPORTS,BACKEND=$B" "$SLURM_DIR/train_${B}.sbatch")
-  echo "train $B  -> job $JID  (afterok:$PREP)"
+        --export="$EXPORTS,LR=$OLR,OPTIMIZER=$OPT,BACKEND=$B" "$SLURM_DIR/train_${B}.sbatch")
+  echo "train $B  -> job $JID  (afterok:$PREP, optimizer=$OPT lr=$OLR)"
 done
 
 echo
