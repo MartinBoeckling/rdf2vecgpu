@@ -31,7 +31,12 @@ class RDF2VecConfig(BaseModel):
         a ``"weights"`` column (cuGraph standard name).
 
     embedding_model : {"skipgram", "cbow"}, default "skipgram"
-        Word2Vec variant used for embedding training.
+        Word2Vec variant used for embedding training. Prefer the default
+        ``"skipgram"``: on the dbpedia2016 GEval benchmark, CBOW was the weakest
+        backend on every task (it mean-pools context and washes out the rare,
+        long-tail entities that dominate knowledge graphs). ``"cbow"`` is
+        supported but not recommended; the pytorch CBOW path uses a full softmax
+        (small/medium graphs) while the gensim backend's CBOW scales.
 
     vector_size : int, default 256
         Dimensionality of the output embeddings.
