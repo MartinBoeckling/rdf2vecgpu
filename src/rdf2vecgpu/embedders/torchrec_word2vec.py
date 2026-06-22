@@ -8,6 +8,8 @@ this module can be imported without those extras installed.
 """
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import nn
 
@@ -116,8 +118,15 @@ def _build_sharding_plan(
     from torchrec.distributed.types import ModuleSharder
     from torchrec.distributed.embedding import EmbeddingCollectionSharder
 
+    # local_world_size = GPUs per node. Without it Topology assumes all ranks
+    # live on one host (local_world_size==world_size) and places global rank r's
+    # shard on cuda:r — which doesn't exist on a multi-node run (node 1's rank 4
+    # is physically cuda:0). Derive it from the elastic env; falls back to
+    # world_size for a single-node job (unchanged behaviour).
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "0")) or world_size
     topology = Topology(
         world_size=world_size,
+        local_world_size=local_world_size,
         compute_device=device.type,  # "cuda"
     )
     planner = EmbeddingShardingPlanner(topology=topology)
@@ -618,10 +627,17 @@ def train_torchrec_word2vec(rdf2vec, walks_path, vocab_path) -> None:
     )
     vocab_size = len(vocab_df)
 
-    # 2. Fabric.
+    # 2. Fabric. Under torchrun, WORLD_SIZE spans all nodes while devices="auto"
+    #    resolves to the per-node GPU count (LOCAL_WORLD_SIZE); Fabric defaults
+    #    num_nodes=1, so a multi-node launch fails its devices*num_nodes==world_size
+    #    check. Derive num_nodes from the elastic env (=1 for single-node).
+    _ws = int(os.environ.get("WORLD_SIZE", "0"))
+    _lws = int(os.environ.get("LOCAL_WORLD_SIZE", "0"))
+    _num_nodes = max(1, _ws // _lws) if (_ws and _lws) else 1
     fabric = Fabric(
         accelerator="gpu",
         devices="auto",
+        num_nodes=_num_nodes,
         precision=_fabric_precision_from_config(cfg),
     )
     fabric.launch()
