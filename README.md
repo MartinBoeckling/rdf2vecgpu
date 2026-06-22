@@ -36,7 +36,14 @@ pip install rdf2vecgpu
 ```
 
 > [!IMPORTANT]
-> Make sure to install the accompanying cuda version as outlined in the [following section](#repository-setup)
+> **Requirements:** Linux x86_64, an NVIDIA GPU, and a driver supporting **CUDA 12.x**.
+> The CUDA-12 wheels (`cudf-cu12`, `cugraph-cu12`, `torch`) bundle their own CUDA
+> libraries, so no system CUDA toolkit is required — only a compatible driver.
+> As of the pinned **RAPIDS 25.6** the entire stack resolves from PyPI, so the
+> single `pip install rdf2vecgpu` above is sufficient; the
+> `--extra-index-url=https://pypi.nvidia.com` step needed by older RAPIDS
+> releases is **no longer required**. See [Repository setup](#repository-setup)
+> for version-matched manual installs.
 
 ## Repository setup
 
@@ -49,16 +56,15 @@ Cuda 12.6 installation
 pip install torch torchvision torchaudio
 ```
 
-2. Detailed cudf installation instruction [here](https://docs.rapids.ai/install/).
-Cudf Cuda 12 install
+2. RAPIDS cuDF / cuGraph — pinned to **25.6**, available directly on PyPI
+([RAPIDS install docs](https://docs.rapids.ai/install/)):
 
 ```bash
-pip install \
-    --extra-index-url=https://pypi.nvidia.com \
-    "cudf-cu12==25.4.*" "dask-cudf-cu12==25.4.*" \
-    "cugraph-cu12==25.4.*" "nx-cugraph-cu12==25.4.*" \
-    "nx-cugraph-cu12==25.4.*"
+pip install "cudf-cu12==25.6.*" "cugraph-cu12==25.6.*" "dask-cudf-cu12==25.6.*"
 ```
+
+> For a **pre-25.6** RAPIDS pin (not fully published to PyPI) add the NVIDIA
+> index: `pip install --extra-index-url=https://pypi.nvidia.com ...`.
 
 The requirement files and conda environment files can be found here:
 
