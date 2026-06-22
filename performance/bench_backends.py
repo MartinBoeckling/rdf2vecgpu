@@ -136,14 +136,28 @@ def _export_kgreat_tsv(emb, path: str) -> None:
 
 def _concat_rank_shards(path: str, world_size: int) -> None:
     """torchrec shards the vocab row-wise across ranks, so each rank writes a
-    disjoint `<path>.rank<r>` shard; rank 0 concatenates them into the final TSV."""
+    disjoint `<path>.rank<r>` shard; rank 0 concatenates them into the final TSV.
+
+    All ``world_size`` shards must be present: a silently-skipped missing shard
+    would drop ~1/world_size of the vocabulary and emit a complete-looking but
+    truncated embedding. This happens e.g. on a MULTI-NODE run where the export
+    path is node-local — rank 0 then sees only its own node's shards. Fail loud
+    and leave the surviving shards on disk for diagnosis rather than concatenating
+    a partial result."""
+    shards = [f"{path}.rank{r}" for r in range(world_size)]
+    missing = [s for s in shards if not os.path.exists(s)]
+    if missing:
+        raise RuntimeError(
+            f"_concat_rank_shards: {len(missing)}/{world_size} rank shards missing "
+            f"for {path}: {missing}. Refusing to emit a truncated embedding. "
+            "On multi-node runs the --export-kgreat path must be on a SHARED "
+            "filesystem visible to every rank."
+        )
     with open(path, "w") as out:
-        for r in range(world_size):
-            shard = f"{path}.rank{r}"
-            if os.path.exists(shard):
-                with open(shard) as fh:
-                    out.write(fh.read())
-                os.remove(shard)
+        for shard in shards:
+            with open(shard) as fh:
+                out.write(fh.read())
+            os.remove(shard)
 
 
 def _config(backend: str, multi_gpu: bool, args) -> "RDF2VecConfig":  # noqa: F821

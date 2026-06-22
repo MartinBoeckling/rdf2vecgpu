@@ -40,9 +40,11 @@ export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}
 export NCCL_IFACE_SUBNET=${NCCL_IFACE_SUBNET:-10.5.}
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export NCCL_DEBUG_SUBSYS=INIT,NET
-# Fail a desync/hang in minutes, not the default 30, during bring-up.
+# Make a stuck collective RAISE instead of spinning forever. Note: this does NOT
+# shorten the timeout DURATION — that's the init_process_group(timeout=) default
+# (~10 min for NCCL); there is no env var for it (NCCL_TIMEOUT is not read by
+# NCCL/PyTorch). To fail faster during bring-up, pass a shorter timeout in code.
 export TORCH_NCCL_BLOCKING_WAIT=1
-export NCCL_TIMEOUT=600
 export RDF2VEC_TORCHREC_PROGRESS=1
 
 # ── workload (dbpedia2016 corpus already on disk) ──

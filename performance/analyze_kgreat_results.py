@@ -80,12 +80,17 @@ def main():
     for task, metric, cover, best in records:
         cells = []
         valid = {e: best[e] for e in embeddings if e in best}
+        # Only mark / tally a "win" when the row is actually contested (>=2
+        # backends present); a lone survivor (others missing or quarantined)
+        # trivially equals the max and must not be credited as best.
+        contested = len(valid) >= 2
         top = max(valid.values()) if valid else None
         for e in embeddings:
             if e in best:
                 v = best[e]
-                mark = "*" if (top is not None and abs(v - top) < 1e-9) else " "
-                if top is not None and abs(v - top) < 1e-9:
+                is_top = contested and top is not None and abs(v - top) < 1e-9
+                mark = "*" if is_top else " "
+                if is_top:
                     wins[e] += 1
                 cells.append(f"{v:>+8.4f}{mark}")
             else:
