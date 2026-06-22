@@ -89,7 +89,7 @@ class GPU_RDF2Vec:
         intermediate artefacts.
         2. **Generate random walks** (or, in the future, BFS walks) that serve as a
         textual corpus.
-        3. **Train a Word2Vec model** (currently Skip‑gram, CBOW forthcoming) on
+        3. **Train a Word2Vec model** (currently Skip‑gram, and CBOW — note CBOW uses a full softmax, best for small/medium graphs; prefer Skip-gram or the gensim backend at large scale) on
         this corpus with all heavy‐lifting—negative sampling, matrix ops, CUDA
         kernels—performed on the GPU and orchestrated through PyTorch Lightning.
         4. **Export the learned embeddings** back to cuDF for further downstream

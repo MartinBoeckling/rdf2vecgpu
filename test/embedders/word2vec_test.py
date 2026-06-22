@@ -1,5 +1,5 @@
 import torch
-from rdf2vecgpu.embedders.word2vec import SkipGram
+from rdf2vecgpu.embedders.word2vec import SkipGram, CBOW
 
 
 def test_skipgram_new_kwargs_accepted_and_stored():
@@ -80,6 +80,35 @@ def test_skipgram_learns_clustered_cooccurrence():
     emb = torch.nn.functional.normalize(model.get_embeddings(), dim=1)
     sim = emb @ emb.t()
     intra = ((sim[:10, :10].sum() + sim[10:, 10:].sum()) - 20.0) / (2 * 90)   # exclude diagonal
+    inter = sim[:10, 10:].mean()
+    assert torch.isfinite(emb).all()
+    assert intra.item() > inter.item() + 0.1, (intra.item(), inter.item())
+
+
+def test_cbow_learns_clustered_cooccurrence():
+    """CBOW must learn the same planted 2-cluster structure as skip-gram, and
+    expose get_embeddings() (regression: it was missing, so transform() crashed
+    with AttributeError on the embedding_model='cbow' path)."""
+    import lightning as L
+    from torch.utils.data import TensorDataset, DataLoader
+
+    L.seed_everything(0, workers=True)
+    g = torch.Generator().manual_seed(0)
+    n, n_ctx = 8000, 4
+    centers = torch.randint(0, 20, (n,), generator=g)
+    cluster = centers // 10                                    # 0:tokens0-9, 1:tokens10-19
+    context = (cluster.unsqueeze(1) * 10
+               + torch.randint(0, 10, (n, n_ctx), generator=g)).long()
+    dl = DataLoader(TensorDataset(context, centers.long()), batch_size=64, shuffle=True,
+                    generator=torch.Generator().manual_seed(0))
+
+    model = CBOW(vocab_size=20, embedding_dim=8, learning_rate=0.05)
+    L.Trainer(max_epochs=20, accelerator="cpu", logger=False,
+              enable_checkpointing=False, enable_progress_bar=False).fit(model, dl)
+
+    emb = torch.nn.functional.normalize(model.get_embeddings(), dim=1)   # must exist
+    sim = emb @ emb.t()
+    intra = ((sim[:10, :10].sum() + sim[10:, 10:].sum()) - 20.0) / (2 * 90)
     inter = sim[:10, 10:].mean()
     assert torch.isfinite(emb).all()
     assert intra.item() > inter.item() + 0.1, (intra.item(), inter.item())

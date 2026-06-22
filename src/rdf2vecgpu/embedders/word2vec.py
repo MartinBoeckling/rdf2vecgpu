@@ -324,6 +324,10 @@ class CBOW(L.LightningModule):
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
 
+    def get_embeddings(self):
+        """Entity-level embedding table used downstream (the input/syn0 table)."""
+        return self.in_embeddings.weight.data
+
 
 class OrderAwareSkipgram(L.LightningModule):
     def __init__(
