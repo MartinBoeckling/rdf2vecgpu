@@ -68,6 +68,7 @@ DEFAULTS = dict(
     cpu_count=20,
     grad_clip_value=0.1,
     optimizer="sgd",
+    pair_batch_size=32768,
 )
 
 
@@ -164,6 +165,7 @@ def _config(backend: str, multi_gpu: bool, args) -> "RDF2VecConfig":  # noqa: F8
         cpu_count=args.cpu_count,
         grad_clip_value=args.grad_clip_value,
         optimizer=args.optimizer,
+        pair_batch_size=args.pair_batch_size,
     )
 
 

@@ -13,6 +13,10 @@
 
 source /ceph/mboeckli/rdf2vecgpu/performance/slurm/env.sh
 
+# Optional KGrEAT entity-embedding export (set EXPORT_KGREAT to a .tsv path).
+EXPORT_ARG=()
+[ -n "${EXPORT_KGREAT:-}" ] && EXPORT_ARG+=(--export-kgreat "$EXPORT_KGREAT")
+
 python performance/bench_backends.py --backend gensim \
   --corpus "$CORPUS" --out "$OUTDIR/gensim.jsonl" --tag "$TAG" \
-  "${HP_ARGS[@]}"
+  "${HP_ARGS[@]}" ${EXPORT_ARG[@]+"${EXPORT_ARG[@]}"}
