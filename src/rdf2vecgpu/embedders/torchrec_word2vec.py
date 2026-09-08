@@ -77,6 +77,149 @@ def _sample_negatives(
     raise ValueError(f"unknown negative-sampling strategy: {strategy!r}")
 
 
+def _env_profile_enabled() -> bool:
+    """RDF2VEC_TORCHREC_PROFILE=1 turns on :class:`_StepProfiler` (diagnostic
+    runs only — it synchronises the device every step)."""
+    import os
+    return os.environ.get("RDF2VEC_TORCHREC_PROFILE", "").strip().lower() not in (
+        "", "0", "false", "no",
+    )
+
+
+class _StepProfiler:
+    """Per-step time attribution for diagnostic runs (RDF2VEC_TORCHREC_PROFILE=1).
+
+    Host wall-clock per segment of the training step — ``drain`` (waiting at
+    the top of the step for the previous step's GPU work: large means
+    GPU-bound, ~0 means the GPU idles on the host), ``next`` (loader wait +
+    H2D copy), ``join`` (the per-step all_reduce + ``.item()``),
+    ``negatives``, ``forward`` (torchrec input all-to-all + lookup),
+    ``backward`` (output all-to-all + fused optimizer) and ``log`` — plus the
+    GPU time of forward+backward from CUDA events. Every rank measures; the
+    report gathers the means so a slow rank (the one everybody's join waits
+    for) shows up. Rank 0 additionally records a ``torch.profiler`` window and
+    prints the kernel / collective table. Disabled (the default) every method
+    returns immediately; enabled, ``drain()`` synchronises the device once per
+    step, so the numbers attribute time but are not a production rate.
+    """
+
+    SEGMENTS = ("drain", "next", "join", "negatives", "forward", "backward", "log")
+
+    def __init__(self, enabled: bool, device, rank: int, *, skip: int = 50,
+                 profile_window: "tuple[int, int] | None" = (150, 20)):
+        self.enabled = bool(enabled)
+        self.device = device
+        self.rank = int(rank)
+        self.skip = int(skip)
+        self.profile_window = profile_window
+        self.step = 0
+        self.host = {s: [] for s in self.SEGMENTS}
+        self.gpu_ms: list = []
+        self._t0 = {}
+        self._events = None
+        self._tp = None
+        if self.enabled and self.rank == 0:
+            print("[torchrec][profile] enabled: device synchronised every step — "
+                  "the steps/s below are NOT a production rate", flush=True)
+
+    def begin(self, seg: str) -> None:
+        if self.enabled:
+            import time
+            self._t0[seg] = time.perf_counter()
+
+    def end(self, seg: str) -> None:
+        if self.enabled and self.step >= self.skip:
+            import time
+            self.host[seg].append(time.perf_counter() - self._t0[seg])
+
+    def drain(self) -> None:
+        """Top of the step: wait for outstanding GPU work (timed as ``drain``)
+        and close the previous step's CUDA events."""
+        if not self.enabled:
+            return
+        self.begin("drain")
+        torch.cuda.synchronize(self.device)
+        self.end("drain")
+        if self._events is not None:
+            a, b = self._events
+            if b is not None and self.step - 1 >= self.skip:
+                self.gpu_ms.append(a.elapsed_time(b))
+            self._events = None
+
+    def gpu_start(self) -> None:
+        if self.enabled:
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record()
+            self._events = (ev, None)
+
+    def gpu_end(self) -> None:
+        if self.enabled and self._events is not None:
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record()
+            self._events = (self._events[0], ev)
+
+    def end_step(self) -> None:
+        if not self.enabled:
+            return
+        self.step += 1
+        if self.profile_window is None or self.rank != 0:
+            return
+        start, length = self.profile_window
+        start += self.skip
+        if self.step == start:
+            from torch.profiler import ProfilerActivity, profile
+            self._tp = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+            self._tp.start()
+        elif self.step == start + length and self._tp is not None:
+            self._tp.stop()
+            print(f"[torchrec][profile] torch.profiler over steps {start}-{start + length} "
+                  "(rank 0), by CUDA time:", flush=True)
+            print(self._tp.key_averages().table(sort_by="cuda_time_total", row_limit=25), flush=True)
+            print("[torchrec][profile] same window by CPU time:", flush=True)
+            print(self._tp.key_averages().table(sort_by="cpu_time_total", row_limit=15), flush=True)
+            self._tp = None
+
+    def summary(self) -> "dict | None":
+        if not self.enabled:
+            return None
+        import numpy as np
+        mean = {s: (1e3 * float(np.mean(v)) if v else 0.0) for s, v in self.host.items()}
+        p95 = {s: (1e3 * float(np.percentile(v, 95)) if v else 0.0) for s, v in self.host.items()}
+        return {
+            "n": len(self.host["next"]), "mean_ms": mean, "p95_ms": p95,
+            "total_ms": sum(mean.values()),
+            "gpu_ms": float(np.mean(self.gpu_ms)) if self.gpu_ms else 0.0,
+            "gpu_p95_ms": float(np.percentile(self.gpu_ms, 95)) if self.gpu_ms else 0.0,
+        }
+
+    def report(self, epoch: int) -> None:
+        """Gather every rank's summary (collective) and print it on rank 0."""
+        if not self.enabled:
+            return
+        import torch.distributed as dist
+        mine = self.summary()
+        if dist.is_initialized():
+            gathered = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, mine)
+        else:
+            gathered = [mine]
+        if self.rank != 0:
+            return
+        segs = " | ".join(f"{s} {mine['mean_ms'][s]:.2f}" for s in self.SEGMENTS)
+        print(f"[torchrec][profile] epoch {epoch}: {mine['n']} measured steps after {self.skip} "
+              f"warm-up; rank 0 host ms/step: {segs} | total {mine['total_ms']:.2f} ; "
+              f"gpu fwd+bwd {mine['gpu_ms']:.2f} ms (p95 {mine['gpu_p95_ms']:.2f})", flush=True)
+        p95 = " | ".join(f"{s} {mine['p95_ms'][s]:.2f}" for s in self.SEGMENTS)
+        print(f"[torchrec][profile] rank 0 p95 ms: {p95}", flush=True)
+        for r, g in enumerate(gathered):
+            if g is None:
+                continue
+            m = g["mean_ms"]
+            print(f"[torchrec][profile] rank {r}: next {m['next']:.2f} | drain {m['drain']:.2f} | "
+                  f"join {m['join']:.2f} | forward {m['forward']:.2f} | backward {m['backward']:.2f} | "
+                  f"total {g['total_ms']:.2f} | gpu {g['gpu_ms']:.2f} ms", flush=True)
+
+
 def _env_progress_enabled() -> bool:
     """Convenience override so the SLURM harness can flip the progress print
     without touching config plumbing: RDF2VEC_TORCHREC_PROGRESS=1."""
@@ -901,29 +1044,45 @@ def train_torchrec_word2vec(rdf2vec, walks_path, vocab_path) -> None:
         if cfg.negative_sampling == "unigram" and hasattr(token_counts, "to")
         else None
     )
+    prof = _StepProfiler(_env_profile_enabled(), fabric.device, fabric.global_rank)
     for epoch in range(start_epoch, cfg.epochs):
         data_iter = iter(loader)
         while True:
+            prof.drain()
+            prof.begin("next")
             batch = next(data_iter, None)
+            prof.end("next")
+            prof.begin("join")
             have = torch.ones(1, device=fabric.device, dtype=torch.int32)
             if batch is None:
                 have.zero_()
             dist.all_reduce(have, op=dist.ReduceOp.MIN)
-            if int(have.item()) == 0:
+            ok = int(have.item())
+            prof.end("join")
+            if ok == 0:
                 break
             center, context = batch
+            prof.begin("negatives")
             negative = _sample_negatives(
                 n_rows=center.size(0), n_neg=cfg.negative_samples,
                 vocab_size=vocab_size, device=fabric.device,
                 strategy=cfg.negative_sampling, cdf=neg_cdf,
             )
+            prof.end("negatives")
+            prof.gpu_start()
+            prof.begin("forward")
             loss = model(center, context, negative)
+            prof.end("forward")
+            prof.begin("backward")
             fabric.backward(loss)
+            prof.end("backward")
+            prof.gpu_end()
             # optimizer step is fused into backward via apply_optimizer_in_backward.
             # Progress emission (tracker + optional flushed stdout print) is
             # cadenced and rank-0-only. loss.item() forces a device sync, so we
             # only pay it on a logging step and only when something consumes it.
             # The block contains no collectives, so gating it to rank 0 is safe.
+            prof.begin("log")
             want_log = (cfg.tracker != "none") or progress.enabled
             if fabric.is_global_zero and want_log and progress.due(global_step):
                 loss_val = loss.item()
@@ -938,7 +1097,9 @@ def train_torchrec_word2vec(rdf2vec, walks_path, vocab_path) -> None:
                                         loss=loss_val, now=time.monotonic()),
                         flush=True,
                     )
+            prof.end("log")
             global_step += 1
+            prof.end_step()
 
             # Time-based checkpoint. The decision MUST be agreed across ranks
             # BEFORE any rank enters _save_checkpoint, which issues collectives
@@ -966,6 +1127,8 @@ def train_torchrec_word2vec(rdf2vec, walks_path, vocab_path) -> None:
                         config_snapshot=cfg.model_dump(),
                     )
                     last_ckpt_time = time.monotonic()
+
+        prof.report(epoch)
 
         # Epoch-boundary checkpoint.
         if cfg.checkpoint_dir:

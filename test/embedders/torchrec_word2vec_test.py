@@ -1442,3 +1442,32 @@ def test_iter_local_embeddings_tiles_vocab_and_matches_transform(torchrun_pg):
         vec, ref[[str(d) for d in range(8)]].to_numpy(dtype=np.float32)
     )
 
+
+@pytest.mark.gpu
+def test_step_profiler_attributes_segments_and_gpu_time_only_when_enabled():
+    import torch
+    from rdf2vecgpu.embedders.torchrec_word2vec import _StepProfiler
+
+    dev = torch.device("cuda")
+    prof = _StepProfiler(True, dev, rank=0, skip=1, profile_window=None)
+    x = torch.randn(1024, 1024, device=dev)
+    for _ in range(3):
+        prof.drain()
+        for seg in ("next", "join", "negatives"):
+            prof.begin(seg); prof.end(seg)
+        prof.gpu_start()
+        prof.begin("forward"); y = x @ x; prof.end("forward")
+        prof.begin("backward"); y = y @ x; prof.end("backward")
+        prof.gpu_end()
+        prof.begin("log"); prof.end("log")
+        prof.end_step()
+    prof.drain()
+    s = prof.summary()
+    assert s["n"] == 2                                   # step 0 skipped as warm-up
+    assert set(s["mean_ms"]) == set(_StepProfiler.SEGMENTS)
+    assert s["gpu_ms"] > 0 and s["total_ms"] >= s["mean_ms"]["forward"]
+    assert len(prof.gpu_ms) == 2
+
+    off = _StepProfiler(False, dev, rank=0)
+    off.drain(); off.begin("next"); off.end("next"); off.gpu_start(); off.gpu_end(); off.end_step()
+    assert off.summary() is None and off.step == 0 and off.host["next"] == []

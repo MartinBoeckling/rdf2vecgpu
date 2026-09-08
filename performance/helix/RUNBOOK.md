@@ -220,6 +220,26 @@ Open items to watch on the first full-scale attempt:
   instead of 2.25M. Still
   open: every rank decodes all 311 GB and keeps 1/8 (cheap: 0.25 s/shard warm),
   and the per-step `all_reduce`+`.item()` join.
+* **Where the Wikidata epoch's time went** (job 14636218 log + sacct): steady
+  median 79.0 steps/s (p95 80.3) from step 200 on; 857 s (9%) lost to ten
+  recurring windows at ~31 steps/s (~2,800 steps each, every ~50k steps —
+  stub-dense corpus regions where the loader decodes ~6 walks per surviving
+  walk), five 13–46 s all-rank stalls (one is the 2-hourly 293 GB checkpoint)
+  and ~80 s start-up. 83M pairs/s aggregate = 10.4M/GPU × 7 rows × 400 B ≈
+  60 GB/s per GPU, ~1.3% of H200 HBM bandwidth — so NOT bandwidth-bound; the
+  per-rank pair rate is close to the 2× A100-40GB dbpedia runs (7.8M/s/rank),
+  which points at per-step fixed costs (Python step loop, all-to-all latency,
+  the join sync). CPU 11.9 of 48 cores busy on average (~1.5/rank), 2.52 TB
+  read (8 × the 304 GB corpus), 600 GB written, MaxRSS 1.12 TB (cgroup figure,
+  likely includes page cache). Vocab: 392.9M tokens = 124.9M `entity/Q` items,
+  125M `Special:EntityData` document nodes, ~140M external URLs (DOIs,
+  catalogues — leaf nodes, hence the 40% stub walks), 0.8% literals.
+* **Step-time attribution:** `RDF2VEC_TORCHREC_PROFILE=1` (diagnostic only —
+  synchronises the device every step) prints per-rank host ms/step for
+  drain / next / join / negatives / forward / backward / log, CUDA-event GPU
+  time for forward+backward, and a 20-step `torch.profiler` kernel/collective
+  table on rank 0 (`[torchrec][profile] …` lines). Queued 2026-09-08 on
+  dbpedia2016 with 2 and 4 A100s (`results/dbpedia_d100_e1_prof{2,4}`).
 * **Quality gate**: dbpedia2016 d100 runs with `EXPORT_KGREAT` queued 2026-09-04
   (`results/dbpedia_d100_e1`, `_e5`; same lr/batch/optimizer as the Wikidata
   run) — rsync the TSVs to dws and score with the GEval harness
