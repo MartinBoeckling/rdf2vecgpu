@@ -220,6 +220,19 @@ class _StepProfiler:
                   f"total {g['total_ms']:.2f} | gpu {g['gpu_ms']:.2f} ms", flush=True)
 
 
+def _env_step_sync_enabled() -> bool:
+    """RDF2VEC_TORCHREC_STEP_SYNC=1: a device-wide ``torch.cuda.synchronize()``
+    at the top of every training step (default off). Kept as an experiment
+    switch: an A/B on dbpedia (2 GPUs, same node, 2026-09-08, jobs 14698160 /
+    14698161) measured 22.1 vs 21.8 steps/s — no effect. The apparent 1.5×
+    that motivated it was a node difference (o05c01 vs the gpu4 nodes), not
+    the sync."""
+    import os
+    return os.environ.get("RDF2VEC_TORCHREC_STEP_SYNC", "0").strip().lower() not in (
+        "", "0", "false", "no",
+    )
+
+
 def _env_progress_enabled() -> bool:
     """Convenience override so the SLURM harness can flip the progress print
     without touching config plumbing: RDF2VEC_TORCHREC_PROGRESS=1."""
@@ -410,11 +423,16 @@ class ShardedSkipGramModel(nn.Module):
             out_dict["context_or_negative"].values().view(batch_size, 1 + n_neg, self.embedding_dim)
         )
 
-        pos_embed = out_embed[:, 0, :]                # (B, dim)
-        neg_embed = out_embed[:, 1:, :]               # (B, neg, dim)
-
-        pos_score = (center_embed * pos_embed).sum(dim=-1)                            # (B,)
-        neg_score = torch.bmm(neg_embed, center_embed.unsqueeze(-1)).squeeze(-1)      # (B, neg)
+        # One fused multiply + reduce over (B, 1+neg, dim) yields every logit.
+        # This used to be torch.bmm(neg_embed, center.unsqueeze(-1)): a batch
+        # of B tiny (neg×dim)·(dim×1) GEMMs that cuBLAS runs as ~B independent
+        # micro-kernels — 33% of the step's GPU time in the 2026-09-08 dbpedia
+        # profile (22 of 68 ms at 525k pairs/rank), more than the sharded
+        # lookups, the all-to-all and the optimizer together. Same math, same
+        # gradients; only the kernel changed.
+        scores = (out_embed * center_embed.unsqueeze(1)).sum(dim=-1)   # (B, 1+neg)
+        pos_score = scores[:, 0]                                        # (B,)
+        neg_score = scores[:, 1:]                                       # (B, neg)
 
         pos_loss = -torch.nn.functional.logsigmoid(pos_score)
         neg_loss = -torch.nn.functional.logsigmoid(-neg_score).sum(dim=-1)
@@ -1045,9 +1063,14 @@ def train_torchrec_word2vec(rdf2vec, walks_path, vocab_path) -> None:
         else None
     )
     prof = _StepProfiler(_env_profile_enabled(), fabric.device, fabric.global_rank)
+    step_sync = _env_step_sync_enabled() and not prof.enabled   # the profiler drains itself
+    if fabric.is_global_zero:
+        print(f"[torchrec] per-step device sync: {'on' if step_sync or prof.enabled else 'off'}", flush=True)
     for epoch in range(start_epoch, cfg.epochs):
         data_iter = iter(loader)
         while True:
+            if step_sync:
+                torch.cuda.synchronize(fabric.device)
             prof.drain()
             prof.begin("next")
             batch = next(data_iter, None)

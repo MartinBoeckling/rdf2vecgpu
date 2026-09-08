@@ -238,8 +238,33 @@ Open items to watch on the first full-scale attempt:
   synchronises the device every step) prints per-rank host ms/step for
   drain / next / join / negatives / forward / backward / log, CUDA-event GPU
   time for forward+backward, and a 20-step `torch.profiler` kernel/collective
-  table on rank 0 (`[torchrec][profile] …` lines). Queued 2026-09-08 on
-  dbpedia2016 with 2 and 4 A100s (`results/dbpedia_d100_e1_prof{2,4}`).
+  table on rank 0 (`[torchrec][profile] …` lines).
+* **Profile result (2026-09-08, dbpedia d100 e1, 2× A100-40GB, 525k
+  pairs/rank):** 68 ms/step; the GPU chain (CUDA events, fwd+bwd) was 65 ms
+  of it, the host loop 16.6 ms (2/3 of that in `.item()` syncs). GPU time:
+  33% `torch.bmm` negative logits (B tiny GEMMs), 14% NCCL all-to-all, 10%
+  torchrec id permute, 8% `index_add_` (index_select backward), ~12% output
+  dist, **3% fbgemm lookup + RowWiseAdagrad** — the tables are not the cost.
+  The `bmm` was replaced by a fused multiply-reduce (loss-identical, in main
+  since 2026-09-08 22:00, gate 14699380). Same-node comparison on `o02c02`:
+  **11.7 → 15.5 steps/s (1.32×)** (jobs 14638968 vs 14697733), consistent
+  with the profiled GPU chain dropping 65 → 42.6 ms. **Node identity is a
+  confound of the same size:** GEMM builds ran 11.7 (`o02c02`) vs 14.5–14.8
+  (`p08c01/p08c02`); the fused build 15.5 (`o02c02`) vs 21.8–22.1 (`o05c01`,
+  fit 57–58 s, jobs 14698160/14698161). A per-step `torch.cuda.synchronize()`
+  (`RDF2VEC_TORCHREC_STEP_SYNC=1`, default off) was A/B-tested on `o05c01`
+  and does nothing (22.1 vs 21.8). Always note the host and A/B on one node.
+* **Rank scaling (fused build, `o05c01`, profiled):** 2 GPUs 22.0 steps/s,
+  GPU chain 42.6 ms at 525k pairs/rank; 4 GPUs **31.6 steps/s**, GPU chain
+  29 ms at 262k pairs/rank (job 14697718) — halving the per-rank work cut the
+  chain by 1.47×, so ~15 ms of it is rank-count-independent (all-to-all +
+  permute latency: with the bmm gone the top CUDA rows are NCCL SendRecv
+  7.6 ms/step and fbgemm permute 4.9 ms/step). The host loop is ~15 ms/step
+  at any rank count (forward 8.4–8.7 ms of torchrec Python), so at 8 ranks
+  × 131k pairs the step is host-bound: the Wikidata e5 run will show how much
+  of the 12.5 ms/step the fused kernel recovers there. Next lever if more is
+  needed: cut host work per step (larger PAIR_BATCH_SIZE, fewer collectives
+  per step, dedup ids before the lookup to shrink the all-to-all).
 * **Quality gate**: dbpedia2016 d100 runs with `EXPORT_KGREAT` queued 2026-09-04
   (`results/dbpedia_d100_e1`, `_e5`; same lr/batch/optimizer as the Wikidata
   run) — rsync the TSVs to dws and score with the GEval harness

@@ -1471,3 +1471,51 @@ def test_step_profiler_attributes_segments_and_gpu_time_only_when_enabled():
     off = _StepProfiler(False, dev, rank=0)
     off.drain(); off.begin("next"); off.end("next"); off.gpu_start(); off.gpu_end(); off.end_step()
     assert off.summary() is None and off.step == 0 and off.host["next"] == []
+
+
+@pytest.mark.gpu
+def test_sharded_skipgram_logits_match_batched_gemm_reference():
+    """The fused multiply-reduce logits must reproduce the batched-GEMM
+    formula they replaced (loss AND gradients), so the kernel swap is
+    invisible to training."""
+    import os
+    import torch
+    import torch.distributed as dist
+    import torch.nn.functional as F
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    try:
+        from rdf2vecgpu.embedders.torchrec_word2vec import ShardedSkipGramModel
+
+        device = torch.device("cuda")
+        torch.manual_seed(0)
+        model = ShardedSkipGramModel(vocab_size=96, embedding_dim=12).to(device)
+        w_in = next(iter(model.in_collection.embeddings.values())).weight
+        w_out = next(iter(model.out_collection.embeddings.values())).weight
+
+        batch, n_neg = 41, 5
+        center = torch.randint(0, 96, (batch,), device=device)
+        context = torch.randint(0, 96, (batch,), device=device)
+        negative = torch.randint(0, 96, (batch, n_neg), device=device)
+
+        loss = model(center, context, negative)
+        loss.backward()
+        got_in, got_out = w_in.grad.clone(), w_out.grad.clone()
+
+        w_in.grad = None
+        w_out.grad = None
+        c, p, n = w_in[center], w_out[context], w_out[negative]      # (B,d) (B,d) (B,neg,d)
+        pos = (c * p).sum(-1)
+        neg = torch.bmm(n, c.unsqueeze(-1)).squeeze(-1)
+        ref = (-F.logsigmoid(pos) - F.logsigmoid(-neg).sum(-1)).sum()
+        ref.backward()
+
+        torch.testing.assert_close(loss, ref, rtol=1e-5, atol=1e-4)
+        torch.testing.assert_close(got_in, w_in.grad, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(got_out, w_out.grad, rtol=1e-4, atol=1e-5)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
