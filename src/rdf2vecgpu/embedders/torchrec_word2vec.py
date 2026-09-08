@@ -14,6 +14,25 @@ import torch
 from torch import nn
 
 
+def _unigram_cdf(token_counts: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Normalised float64 CDF of the f^0.75 unigram distribution, built ONCE.
+
+    float64 is not optional: at a 393M-token vocab the total weight is ~1e9-1e10,
+    and a float32 running sum cannot represent increments below total × 6e-8 —
+    every rare token (weight ~1) would collapse to zero sampling probability.
+    Costs vocab_size × 8 B on the device (3.1 GB at 393M) — cheap next to the
+    embedding shards it sits beside.
+    """
+    import math
+    w = token_counts.to(device=device, dtype=torch.float64).clamp(min=0).pow(0.75)
+    cdf = w.cumsum(0)
+    total = cdf[-1].item()      # one host sync per run; a view would alias the in-place divide below
+    if not math.isfinite(total) or total <= 0:
+        raise ValueError("unigram negative sampling needs at least one token with count > 0")
+    cdf /= total
+    return cdf
+
+
 def _sample_negatives(
     n_rows: int,
     n_neg: int,
@@ -21,6 +40,7 @@ def _sample_negatives(
     device: torch.device,
     strategy: str = "unigram",
     token_counts: torch.Tensor | None = None,
+    cdf: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sample ``(n_rows, n_neg)`` negative token ids.
 
@@ -28,6 +48,14 @@ def _sample_negatives(
     backend (see ``embedders/word2vec.py::_sample_negatives``). Returns
     a flat ``long`` tensor; the caller is responsible for routing
     through the sharded output embedding.
+
+    ``unigram`` draws by inverse-CDF (``searchsorted`` on a cached CDF from
+    :func:`_unigram_cdf`). Pass ``cdf`` from the training loop so the
+    vocab-sized work happens once per run; when only ``token_counts`` is
+    given the CDF is built on the fly (tests / one-off callers). The
+    previous ``torch.multinomial`` on freshly-computed weights re-read and
+    cumsum'd the whole vocab every step — ~6-9 GB of HBM traffic per step
+    at 393M tokens, against ~0.1 GB of actual embedding work.
     """
     if strategy == "uniform":
         return torch.randint(
@@ -36,19 +64,15 @@ def _sample_negatives(
         )
 
     if strategy == "unigram":
-        if token_counts is None:
-            raise ValueError("strategy='unigram' requires token_counts")
-        weights = (
-            token_counts.to(device=device, dtype=torch.float32)
-            .clamp(min=0)
-            .pow(0.75)
-        )
-        # torch.multinomial replaces=True is fine for negative sampling
-        # (rare duplicates within a row are negligible at typical
-        # neg_samples ≤ 25 against vocab_size in the millions).
-        return torch.multinomial(
-            weights, num_samples=n_rows * n_neg, replacement=True,
-        ).view(n_rows, n_neg)
+        if cdf is None:
+            if token_counts is None:
+                raise ValueError("strategy='unigram' requires token_counts (or a prebuilt cdf)")
+            cdf = _unigram_cdf(token_counts, device)
+        u = torch.rand(n_rows * n_neg, device=device, dtype=torch.float64)
+        # right=True -> first index whose cdf exceeds u: zero-weight tokens (flat
+        # cdf steps) are never selected; clamp guards the u == 1.0 edge.
+        idx = torch.searchsorted(cdf, u, right=True).clamp_(max=vocab_size - 1)
+        return idx.view(n_rows, n_neg)
 
     raise ValueError(f"unknown negative-sampling strategy: {strategy!r}")
 
@@ -96,12 +120,17 @@ class _ProgressMeter:
 def _build_sharding_plan(
     model: nn.Module, world_size: int, device: torch.device, pg=None,
 ) -> "ShardingPlan":  # noqa: F821 (lazy import — see body)
-    """Defer to torchrec's planner; no constraints in v1.
+    """Plan with torchrec's planner, with every table pinned to ROW-WISE.
 
-    The planner will pick row-wise sharding automatically for tables
-    that are large enough to benefit from it. Smaller tables may end up
-    table-wise on a single rank, which is fine — the user's reason for
-    choosing this backend is the *large* tables.
+    Left to its cost model the planner places any table that fits one GPU
+    *table-wise* — measured 2026-09-05 on dbpedia2016 d100 (6.3M rows,
+    2×A100): in_embeddings landed on rank 1 and out_embeddings on rank 0.
+    That silently breaks the one-row-block-per-rank layout everything
+    downstream assumes (:func:`_get_in_table_local_shard`,
+    :func:`_local_row_range`, the DCP shard files) and leaves one GPU's HBM
+    idle per table. The constraint fixes the sharding type only; the
+    planner still picks the compute kernel. ``world_size == 1`` has nothing
+    to split and stays unconstrained.
 
     Uses ``collective_plan`` (not the rank-local ``plan``) whenever a
     process group is available: the planner's proposal search is NOT
@@ -129,7 +158,20 @@ def _build_sharding_plan(
         local_world_size=local_world_size,
         compute_device=device.type,  # "cuda"
     )
-    planner = EmbeddingShardingPlanner(topology=topology)
+    constraints = None
+    if world_size > 1:
+        from torchrec.distributed.planner.types import ParameterConstraints
+        from torchrec.distributed.types import ShardingType
+
+        constraints = {
+            cfg.name: ParameterConstraints(
+                sharding_types=[ShardingType.ROW_WISE.value],
+            )
+            for m in model.modules()
+            if hasattr(m, "embedding_configs")
+            for cfg in m.embedding_configs()
+        }
+    planner = EmbeddingShardingPlanner(topology=topology, constraints=constraints)
     sharders: list[ModuleSharder] = [EmbeddingCollectionSharder()]
 
     if pg is None and dist.is_available() and dist.is_initialized():
@@ -151,7 +193,15 @@ class ShardedSkipGramModel(nn.Module):
     IN_TABLE_NAME = "in_embeddings"
     OUT_TABLE_NAME = "out_embeddings"
 
-    def __init__(self, vocab_size: int, embedding_dim: int):
+    def __init__(self, vocab_size: int, embedding_dim: int, device=None):
+        """``device=torch.device("meta")`` builds the tables WITHOUT storage;
+        ``DistributedModelParallel`` then materialises only this rank's shard
+        on its GPU. The trainer always does that: the two tables are
+        ``2 × vocab × dim`` fp32 (314 GB for Wikidata d100), so building
+        them on the default device — as before 2026-09-06 — allocated the
+        full tables in host RAM on EVERY rank (8 × 314 GB) before ``.to(gpu)``
+        and was OOM-killed at 1.5 TB. ``device=None`` (tests, world_size=1
+        experiments) keeps the plain eager allocation."""
         super().__init__()
         from torchrec import EmbeddingCollection, EmbeddingConfig
 
@@ -170,8 +220,8 @@ class ShardedSkipGramModel(nn.Module):
             num_embeddings=vocab_size,
             feature_names=["context_or_negative"],
         )
-        self.in_collection = EmbeddingCollection(tables=[in_cfg])
-        self.out_collection = EmbeddingCollection(tables=[out_cfg])
+        self.in_collection = EmbeddingCollection(tables=[in_cfg], device=device)
+        self.out_collection = EmbeddingCollection(tables=[out_cfg], device=device)
 
     def forward(
         self,
@@ -315,40 +365,82 @@ def _get_in_table_local_shard(model) -> "tuple[torch.Tensor, int]":
     recomputed (see :func:`_local_row_range` for why a recomputed offset
     drifts from torchrec's actual ceil-block split).
 
-    Two paths:
-    1. Post-DMP: the state_dict value is a ``ShardedTensor`` whose single
-       local shard carries both the tensor and its ``shard_offsets`` —
-       return ``(shard.tensor, shard_offsets[0])``.
-    2. Pre-DMP or world_size=1 unwrapped: walk ``in_collection.embeddings``
-       directly and return ``(weight.data, 0)`` — the whole table lives on
+    Paths:
+    1. Post-DMP, ``ShardedTensor`` state_dict value (the default
+       ``ShardingEnv``): ``(shard.tensor, shard_offsets[0])``.
+    2. Post-DMP, ``DTensor`` value (``ShardingEnv.output_dtensor=True``):
+       torchrec wraps this rank's shards in a ``LocalShardsWrapper`` that
+       carries the same offsets.
+    3. Pre-DMP / unwrapped ``EmbeddingCollection``: the whole table lives on
        this rank starting at row 0.
 
-    The two branches are deliberately separate: if torchrec ever ships a
-    state_dict whose value lacks the sharded API, we fall through to direct
-    access rather than mislabel a full tensor as a shard at offset 0.
+    A DMP-wrapped model whose in-table has NO local shard on this rank (the
+    planner placed it table-wise elsewhere) raises instead of falling
+    through to path 3 — on the wrapper that path would either fail
+    (``DistributedModelParallel`` has no ``in_collection``) or mislabel a
+    whole table as a shard at offset 0. :func:`_build_sharding_plan` pins
+    the plan to row-wise precisely so this cannot happen.
     """
-    # Path 1: post-DMP sharded value
     try:
         sd = model.state_dict()
-    except (AttributeError, RuntimeError):
+    except (AttributeError, RuntimeError) as exc:
+        print(f"[torchrec] state_dict() unavailable for extraction "
+              f"({type(exc).__name__}: {exc}); trying direct table access")
         sd = {}
+    matched = "no state_dict key matched"
     for key, val in sd.items():
         if ShardedSkipGramModel.IN_TABLE_NAME in key and "weight" in key:
-            if hasattr(val, "local_shards"):
+            matched = f"{key} -> {type(val).__name__}"
+            if hasattr(val, "local_shards"):                    # ShardedTensor
                 shards = val.local_shards()
                 if shards:
                     shard = shards[0]
                     return shard.tensor, int(shard.metadata.shard_offsets[0])
-            # Key matched but no ShardedTensor shards — this is the pre-DMP
-            # case where the state_dict value IS the full nn.Embedding
-            # weight. Fall through to path 2 rather than returning the full
-            # tensor as a "shard".
+                matched += " with no local shard on this rank"
+            elif hasattr(val, "to_local"):                      # DTensor
+                local = val.to_local()
+                if hasattr(local, "local_shards"):              # LocalShardsWrapper
+                    shards, offsets = local.local_shards(), local.local_offsets()
+                    if shards:
+                        return shards[0], int(offsets[0][0])
+                    matched += " with no local shard on this rank"
+                else:
+                    from torch.distributed.tensor._utils import (
+                        compute_local_shape_and_global_offset,
+                    )
+                    _, offset = compute_local_shape_and_global_offset(
+                        val.shape, val.device_mesh, val.placements,
+                    )
+                    return local, int(offset[0])
+            # Plain tensor (unwrapped nn.Embedding weight): path 3 below.
             break
 
-    # Path 2: pre-DMP direct access to nn.Embedding weights (start row 0)
-    for table in model.in_collection.embeddings.values():
-        return table.weight.data, 0
-    raise RuntimeError("could not locate in-embedding table on this rank")
+    # Path 3: unwrapped EmbeddingCollection — the whole table, offset 0.
+    inner = _unwrap_dmp(model)
+    collection = getattr(inner, "in_collection", None)
+    tables = getattr(collection, "embeddings", None)
+    if tables is not None and not _is_sharded_module(collection):
+        for table in tables.values():
+            return table.weight.data, 0
+    raise RuntimeError(
+        "could not locate a local shard of the in-embedding table on this "
+        f"rank ({matched}). Extraction needs the plan to be row-wise so every "
+        "rank owns one contiguous row block — see _build_sharding_plan."
+    )
+
+
+def _unwrap_dmp(model):
+    """``DistributedModelParallel`` keeps the (sharded) user module behind
+    ``.module``; a bare :class:`ShardedSkipGramModel` is returned as is."""
+    return getattr(model, "module", model)
+
+
+def _is_sharded_module(module) -> bool:
+    try:
+        from torchrec.distributed.types import ShardedModule
+    except ImportError:  # pragma: no cover - torchrec absent
+        return False
+    return isinstance(module, ShardedModule)
 
 
 def _save_checkpoint(
@@ -622,10 +714,13 @@ def train_torchrec_word2vec(rdf2vec, walks_path, vocab_path) -> None:
     #    generation, no dask, no cuGraph here — see the function docstring
     #    for why those cannot run under torchrun. ``vocab_path`` doubles as
     #    the DCP resume identity key.
+    #    load_frame=False: training never touches the entity strings, and at
+    #    Wikidata scale the frame is 393M IRIs (~20 GB of GPU memory and a
+    #    7.4 GB parquet read PER RANK). transform() reads it lazily instead.
     vocab_df, token_counts, vocab_path = rdf2vec._load_corpus_vocab(
-        walks_path, vocab_path
+        walks_path, vocab_path, load_frame=False,
     )
-    vocab_size = len(vocab_df)
+    vocab_size = int(token_counts.numel())
 
     # 2. Fabric. Under torchrun, WORLD_SIZE spans all nodes while devices="auto"
     #    resolves to the per-node GPU count (LOCAL_WORLD_SIZE); Fabric defaults
@@ -642,10 +737,14 @@ def train_torchrec_word2vec(rdf2vec, walks_path, vocab_path) -> None:
     )
     fabric.launch()
 
-    # 3. Build the sharded model.
+    # 3. Build the sharded model ON THE META DEVICE (no storage). DMP below
+    #    materialises only this rank's row block directly on the GPU
+    #    (init_parameters=True, its default). See ShardedSkipGramModel.__init__
+    #    for why eager construction cannot work at Wikidata scale.
     model = ShardedSkipGramModel(
         vocab_size=vocab_size, embedding_dim=cfg.vector_size,
-    ).to(fabric.device)
+        device=torch.device("meta"),
+    )
 
     # 4. Attach fused optimizer via apply_optimizer_in_backward BEFORE
     #    wrapping in DistributedModelParallel. This is the torchrec
@@ -704,8 +803,12 @@ def train_torchrec_word2vec(rdf2vec, walks_path, vocab_path) -> None:
         every_n_steps=cfg.progress_log_every_n_steps,
         enabled=cfg.progress_print or _env_progress_enabled(),
     )
-    token_counts_dev = (
-        token_counts.to(fabric.device) if hasattr(token_counts, "to") else None
+    # Unigram negatives: build the f^0.75 CDF ONCE on the device; every step then
+    # only pays a searchsorted over its own samples instead of a vocab-sized pass.
+    neg_cdf = (
+        _unigram_cdf(token_counts, fabric.device)
+        if cfg.negative_sampling == "unigram" and hasattr(token_counts, "to")
+        else None
     )
     for epoch in range(start_epoch, cfg.epochs):
         data_iter = iter(loader)
@@ -721,7 +824,7 @@ def train_torchrec_word2vec(rdf2vec, walks_path, vocab_path) -> None:
             negative = _sample_negatives(
                 n_rows=center.size(0), n_neg=cfg.negative_samples,
                 vocab_size=vocab_size, device=fabric.device,
-                strategy=cfg.negative_sampling, token_counts=token_counts_dev,
+                strategy=cfg.negative_sampling, cdf=neg_cdf,
             )
             loss = model(center, context, negative)
             fabric.backward(loss)
@@ -786,7 +889,9 @@ def train_torchrec_word2vec(rdf2vec, walks_path, vocab_path) -> None:
 
     # 9. Stash for transform() — consumed by GPU_RDF2Vec.transform() in Task 12.
     rdf2vec._torchrec_model = model
-    rdf2vec._torchrec_vocab_df = vocab_df
+    rdf2vec._torchrec_vocab_df = vocab_df      # None → transform() reads the parquet lazily
+    rdf2vec._torchrec_vocab_path = vocab_path
+    rdf2vec._torchrec_vocab_size = vocab_size
 
 
 def _fabric_precision_from_config(cfg) -> str:

@@ -1,4 +1,6 @@
 import glob
+import queue
+import threading
 import lightning as L
 import numpy as np
 import pyarrow.parquet as pq
@@ -377,8 +379,39 @@ class _WalkSeqIterable(IterableDataset):
     because DDP all_reduces gradients every step)."""
 
     def __init__(self, walks_dir, *, emit_batch_size, read_chunk_size=262_144,
-                 shuffle=True, seed=0, rank=0, world_size=1):
+                 shuffle=True, seed=0, rank=0, world_size=1,
+                 pair_batch_size=None, window=5, drop_stubs=None):
         super().__init__()
+        # Optional PAIR-BUDGET mode (torchrec path): cut batches by cumulative
+        # skip-gram pair count instead of a fixed row count, so every batch
+        # carries ~pair_batch_size pairs however short the walks are. Measured
+        # 2026-09-05: Wikidata walks yield 17 of the nominal 60 pairs (40% are
+        # single-vertex stubs), dbpedia2016 19 — so a fixed row count delivered
+        # under a third of the configured batch and 3.5× the steps. Cut points
+        # depend only on the (rank-independent) row stream, so ranks that stride
+        # rows afterwards (see _PairsFromWalks) keep identical batch counts.
+        # Not combinable with the in-iterable DDP striding (world_size > 1):
+        # there the rows are rank-strided BEFORE batching and the cut points
+        # would differ per rank.
+        self.pair_batch_size = int(pair_batch_size) if pair_batch_size else None
+        self.window = int(window)
+        if self.pair_batch_size and int(world_size) > 1:
+            raise ValueError(
+                "pair_batch_size batching needs world_size=1 in the iterable; "
+                "stride rows per rank afterwards (see _PairsFromWalks)"
+            )
+        # drop_stubs: discard walks with fewer than two valid vertices right
+        # after decode. They yield no skip-gram pairs, so the pairs and the batch
+        # count are unchanged (with shuffle on, the within-chunk permutation then
+        # runs over the surviving rows — a different, equally valid shuffle); but stubs
+        # are ~40% of Wikidata's rows and would otherwise ride through the
+        # shuffle, the batch concatenation and the pair expansion. Applied on
+        # the same rank-independent stream as the pair cuts, hence the same
+        # world_size=1 restriction; defaults to on in pair-budget mode and off
+        # otherwise (row-count consumers expect every row).
+        self.drop_stubs = bool(self.pair_batch_size) if drop_stubs is None else bool(drop_stubs)
+        if self.drop_stubs and int(world_size) > 1:
+            raise ValueError("drop_stubs needs world_size=1 in the iterable (see pair_batch_size)")
         files = sorted(set(
             glob.glob(f"{walks_dir}/*.parquet")
             + glob.glob(f"{walks_dir}/**/*.parquet", recursive=True)
@@ -431,6 +464,10 @@ class _WalkSeqIterable(IterableDataset):
     def _iter_single(self, n_w, w_id):
         """Single-rank streaming: files split across DataLoader workers, all rows."""
         eb = self.emit_batch_size
+        batcher = (
+            _PairBudgetBatcher(self.pair_batch_size, self.window)
+            if self.pair_batch_size else None
+        )
         my = [f for k, f in enumerate(self.files) if k % n_w == w_id]
         for f_idx, f in enumerate(my):
             pf = pq.ParquetFile(f)
@@ -439,11 +476,20 @@ class _WalkSeqIterable(IterableDataset):
             ):
                 v = _flat_list_array_to_2d(b.column("vertices"))
                 p = _flat_list_array_to_2d(b.column("predicates"))
+                if self.drop_stubs and v.shape[0]:
+                    keep = _walk_valid_len(v) >= 3      # < 2 valid vertices → 0 pairs
+                    if not keep.all():
+                        v, p = v[keep], p[keep]
                 if v.shape[0] == 0:
                     continue
                 v, p = self._maybe_shuffle(v, p, shard_id=w_id, f_idx=f_idx, c_idx=c_idx)
-                for s in range(0, v.shape[0], eb):
-                    yield v[s:s + eb], p[s:s + eb]
+                if batcher is not None:
+                    yield from batcher.push(v, p)
+                else:
+                    for s in range(0, v.shape[0], eb):
+                        yield v[s:s + eb], p[s:s + eb]
+        if batcher is not None:
+            yield from batcher.flush()
 
     def _iter_ddp_strided(self, n_w, w_id):
         """DDP streaming: each (rank, worker) owns a disjoint global row-stride and
@@ -497,6 +543,194 @@ class _WalkSeqIterable(IterableDataset):
 def _walkseq_collate(item):
     v, p = item  # already a (vertices_np, predicates_np) tuple from _WalkSeqIterable
     return torch.from_numpy(v), torch.from_numpy(p)
+
+
+# --------------------------------------------------------------------------- #
+# Skip-gram pair accounting + torchrec pair loader stages
+# --------------------------------------------------------------------------- #
+
+
+def _pairs_by_valid_len(seq_len: int, window: int) -> np.ndarray:
+    """``table[L]`` = skip-gram pairs a walk yields when the first ``L`` of its
+    ``seq_len`` interleaved (vertex, predicate, …) tokens are valid and the
+    rest are ``-1``: pairs ``(i, j)`` with ``0 < |i - j| <= window`` and both
+    ``< L``. Mirrors :class:`_PairsFromWalks`' template exactly, and
+    ``table[seq_len] == skipgram_pairs_per_walk(depth, window)``."""
+    table = np.zeros(seq_len + 1, dtype=np.int64)
+    for L in range(seq_len + 1):
+        table[L] = sum(min(L, i + window + 1) - max(0, i - window) - 1 for i in range(L))
+    return table
+
+
+def _walk_valid_len(v: np.ndarray) -> np.ndarray:
+    """Per-row valid length of the interleaved sequence: index of the first
+    ``-1`` vertex, doubled, minus the trailing predicate (``v``: ``(n,
+    depth+1)`` with cuGraph's ``-1`` sentinels for short walks)."""
+    depth_p1 = v.shape[1]
+    seq_len = 2 * depth_p1 - 1
+    is_sent = v == -1
+    first_sent = np.where(is_sent.any(axis=1), is_sent.argmax(axis=1), depth_p1)
+    return np.clip(2 * first_sent - 1, 0, seq_len)
+
+
+def _walk_pair_counts(v: np.ndarray, window: int) -> np.ndarray:
+    """Skip-gram pairs each walk row of ``v`` yields under ``window``."""
+    return _pairs_by_valid_len(2 * v.shape[1] - 1, window)[_walk_valid_len(v)]
+
+
+class _PairBudgetBatcher:
+    """Re-cuts a stream of walk rows into batches holding ~``pair_batch_size``
+    skip-gram pairs. The walk that crosses the budget is included, so a batch
+    overshoots by less than one walk's pairs; rows are never reordered or
+    dropped. Cut points depend only on the row stream — never on a rank — so
+    DDP ranks that later take disjoint row strides of every batch still see
+    identical batch counts."""
+
+    def __init__(self, pair_batch_size: int, window: int):
+        self.budget = int(pair_batch_size)
+        self.window = int(window)
+        self._v, self._p, self._pairs = [], [], 0
+
+    def push(self, v, p):
+        counts = _walk_pair_counts(v, self.window)
+        cum = np.cumsum(counts)
+        start = 0
+        while True:
+            base = int(cum[start - 1]) if start > 0 else 0
+            need = self.budget - self._pairs
+            k = int(np.searchsorted(cum, base + need, side="left"))  # cum[k] >= base+need
+            if k >= len(cum):
+                break
+            self._v.append(v[start:k + 1])
+            self._p.append(p[start:k + 1])
+            yield self._pop()
+            start = k + 1
+        if start < len(counts):
+            self._v.append(v[start:])
+            self._p.append(p[start:])
+            self._pairs += int(cum[-1]) - (int(cum[start - 1]) if start > 0 else 0)
+
+    def _pop(self):
+        v = self._v[0] if len(self._v) == 1 else np.concatenate(self._v)
+        p = self._p[0] if len(self._p) == 1 else np.concatenate(self._p)
+        self._v, self._p, self._pairs = [], [], 0
+        return v, p
+
+    def flush(self):
+        if self._v:
+            yield self._pop()
+
+
+class _PairsFromWalks(IterableDataset):
+    """Expand each (vertices, predicates) walk batch into a flat (center,
+    context) int64 pair batch on the CPU.
+
+    In DDP every rank consumes the SAME inner stream and keeps a disjoint row
+    stride of every batch, so all ranks yield the same number of batches —
+    torchrec's sharded forward issues an all_to_all every step and deadlocks
+    otherwise. An empty stride (tiny tail batch) is still yielded: the SUM
+    loss contributes 0 but the rank joins the collective.
+    """
+
+    def __init__(self, inner, *, window, rank=0, world_size=1):
+        super().__init__()
+        self.inner = inner
+        self.window = int(window)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self._templates = {}
+
+    def _template(self, seq_len):
+        t = self._templates.get(seq_len)
+        if t is None:
+            w = self.window
+            ii, jj = [], []
+            for i in range(seq_len):
+                for j in range(max(0, i - w), min(seq_len, i + w + 1)):
+                    if j != i:
+                        ii.append(i)
+                        jj.append(j)
+            t = (np.asarray(ii, dtype=np.int64), np.asarray(jj, dtype=np.int64))
+            self._templates[seq_len] = t
+        return t
+
+    @staticmethod
+    def expand(v_np, p_np, ii, jj):
+        n, depth_p1 = v_np.shape
+        seq_len = 2 * depth_p1 - 1
+        seq = np.full((n, seq_len), -1, dtype=np.int64)
+        seq[:, 0::2] = v_np
+        seq[:, 1::2] = p_np
+        valid_len = _walk_valid_len(v_np)
+        keep = (
+            (ii[None, :] < valid_len[:, None]) & (jj[None, :] < valid_len[:, None])
+        ).reshape(-1)
+        return seq[:, ii].reshape(-1)[keep], seq[:, jj].reshape(-1)[keep]
+
+    def __iter__(self):
+        for v_np, p_np in self.inner:
+            if self.world_size > 1:
+                v_np = v_np[self.rank::self.world_size]
+                p_np = p_np[self.rank::self.world_size]
+            ii, jj = self._template(2 * v_np.shape[1] - 1)
+            c, x = self.expand(v_np, p_np, ii, jj)
+            yield torch.from_numpy(c), torch.from_numpy(x)
+
+
+class _PrefetchError:
+    def __init__(self, exc):
+        self.exc = exc
+
+
+class _ThreadPrefetch(IterableDataset):
+    """Run ``inner``'s iterator in a daemon thread, ``depth`` items ahead, so
+    the parquet decode + pair expansion overlap the GPU step. Same items, same
+    order; an exception in the producer is re-raised in the consumer; a
+    consumer that stops early releases the producer. A thread rather than a
+    DataLoader worker process: the consumer has CUDA + NCCL initialised
+    (fork-unsafe), and the heavy parts (pyarrow decode, large numpy copies)
+    release the GIL."""
+
+    def __init__(self, inner, *, depth=4):
+        super().__init__()
+        self.inner = inner
+        self.depth = int(depth)
+
+    def __iter__(self):
+        q = queue.Queue(maxsize=self.depth)
+        stop = threading.Event()
+        done = object()
+
+        def put(item):
+            while not stop.is_set():
+                try:
+                    q.put(item, timeout=0.5)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def produce():
+            try:
+                for item in self.inner:
+                    if not put(item):
+                        return
+                put(done)
+            except BaseException as exc:  # noqa: BLE001 - forwarded to the consumer
+                put(_PrefetchError(exc))
+
+        t = threading.Thread(target=produce, name="rdf2vec-prefetch", daemon=True)
+        t.start()
+        try:
+            while True:
+                item = q.get()
+                if item is done:
+                    return
+                if isinstance(item, _PrefetchError):
+                    raise item.exc
+                yield item
+        finally:
+            stop.set()
 
 
 class WalkSequenceDataModule(L.LightningDataModule):
@@ -623,3 +857,90 @@ class InMemoryWalkSeqDataModule(L.LightningDataModule):
             num_workers=0,          # CUDA tensors can't cross worker processes
             pin_memory=False,       # already on GPU
         )
+
+
+# --------------------------------------------------------------------------- #
+# Walk-corpus token counts (unigram negative-sampling weights) + on-disk cache
+# --------------------------------------------------------------------------- #
+
+
+def _file_token_uniques(fp):
+    """One walks shard -> ``(unique token ids, counts)`` over the ``vertices`` +
+    ``predicates`` list columns, ``-1`` cuGraph sentinels dropped. Module-level
+    (not a closure) so it pickles into ProcessPool workers."""
+    tbl = pq.read_table(fp, columns=["vertices", "predicates"])
+    parts = []
+    for col in ("vertices", "predicates"):
+        flat = tbl.column(col).combine_chunks().flatten().to_numpy(zero_copy_only=False)
+        # A list-flattened column can come back float64 (NaN for nulls) when the
+        # chunked array carries any null handling; bincount-style code needs ints.
+        if np.issubdtype(flat.dtype, np.floating):
+            flat = flat[~np.isnan(flat)]
+        flat = flat.astype(np.int64, copy=False)
+        parts.append(flat[flat >= 0])
+    flat = np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
+    if flat.size == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    return np.unique(flat, return_counts=True)
+
+
+def token_counts_from_walk_parquet(walks_parquet, vocab_size, *, workers=1):
+    """Token occurrence counts over a walk-sequences parquet dir -> int64 array of
+    length ``vocab_size`` (token id -> count). Feeds the f^0.75 unigram negative
+    sampler and the walked-coverage mask.
+
+    Per file: ``np.unique(return_counts=True)`` then a scatter-add into the
+    vocab-sized accumulator. The previous ``np.bincount(minlength=vocab_size)``
+    per column per file allocated a fresh vocab-sized array every call — at a
+    393M vocab that is a 3 GB alloc + add ×2 per file, ~3.4 s/file → 10 h over
+    the 11k-shard Wikidata corpus. This form is ~4× faster single-threaded
+    (identical result, verified on real shards) and parallelises over files.
+    ``workers > 1`` uses a spawn-context ProcessPool (safe to call from a
+    process that already initialised CUDA, unlike fork).
+    """
+    counts = np.zeros(vocab_size, dtype=np.int64)
+    files = sorted(glob.glob(f"{walks_parquet}/*.parquet")) or [walks_parquet]
+
+    def _accumulate(u, c):
+        keep = u < vocab_size
+        counts[u[keep]] += c[keep]          # u is unique per file, so no add.at needed
+
+    if workers <= 1 or len(files) == 1:
+        for fp in files:
+            _accumulate(*_file_token_uniques(fp))
+        return counts
+
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+    ctx = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=int(workers), mp_context=ctx) as ex:
+        for u, c in ex.map(_file_token_uniques, files, chunksize=4):
+            _accumulate(u, c)
+    return counts
+
+
+def token_counts_cache_path(vocab_path):
+    """``token_counts.npy`` next to the corpus vocab — the cache key is the vocab
+    file, since token ids only mean anything relative to it."""
+    import os
+    return os.path.join(os.path.dirname(os.path.abspath(vocab_path)), "token_counts.npy")
+
+
+def load_token_counts_cache(path, vocab_size):
+    """Cached counts, or ``None`` if absent / not int64 / wrong length (a stale
+    cache from a different vocab must never be silently reused)."""
+    import os
+    if not os.path.exists(path):
+        return None
+    arr = np.load(path)
+    if arr.ndim != 1 or arr.shape[0] != vocab_size or arr.dtype != np.int64:
+        return None
+    return arr
+
+
+def save_token_counts_cache(path, counts):
+    """Atomic write (tmp + rename) so a reader never sees a half-written file."""
+    import os
+    tmp = f"{path}.{os.getpid()}.tmp.npy"      # .npy suffix so np.save doesn't append one
+    np.save(tmp, np.ascontiguousarray(counts, dtype=np.int64))
+    os.replace(tmp, path)

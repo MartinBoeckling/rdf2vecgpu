@@ -183,6 +183,39 @@ def test_sample_negatives_unigram_uses_token_counts():
     assert torch.all(out == 7)
 
 
+def test_unigram_cdf_is_float64_normalised_and_skips_zero_weight():
+    import torch
+    from rdf2vecgpu.embedders.torchrec_word2vec import _unigram_cdf
+
+    # f^0.75 of [0, 1, 16, 81, 0] = [0, 1, 8, 27, 0] -> p = [0, 1, 8, 27, 0] / 36
+    counts = torch.tensor([0, 1, 16, 81, 0])
+    cdf = _unigram_cdf(counts, torch.device("cpu"))
+    assert cdf.dtype == torch.float64
+    assert torch.allclose(cdf, torch.tensor([0, 1, 9, 36, 36], dtype=torch.float64) / 36)
+    with pytest.raises(ValueError, match="count > 0"):
+        _unigram_cdf(torch.zeros(4), torch.device("cpu"))
+
+
+def test_sample_negatives_unigram_cdf_path_matches_counts_path_and_distribution():
+    import torch
+    from rdf2vecgpu.embedders.torchrec_word2vec import _sample_negatives, _unigram_cdf
+
+    counts = torch.tensor([0, 1, 16, 81, 0])
+    cdf = _unigram_cdf(counts, torch.device("cpu"))
+    kw = dict(n_rows=20_000, n_neg=5, vocab_size=5, device=torch.device("cpu"), strategy="unigram")
+
+    torch.manual_seed(0)
+    via_cdf = _sample_negatives(**kw, cdf=cdf)
+    torch.manual_seed(0)
+    via_counts = _sample_negatives(**kw, token_counts=counts)
+    assert via_cdf.shape == (20_000, 5) and via_cdf.dtype == torch.long
+    assert torch.equal(via_cdf, via_counts)          # same RNG stream -> identical draws
+
+    freq = torch.bincount(via_cdf.flatten(), minlength=5).double() / via_cdf.numel()
+    assert freq[0] == 0 and freq[4] == 0             # zero-count tokens are never negatives
+    assert torch.allclose(freq[1:4], torch.tensor([1, 8, 27], dtype=torch.float64) / 36, atol=0.01)
+
+
 def test_sample_negatives_unigram_without_token_counts_raises():
     import torch
     from rdf2vecgpu.embedders.torchrec_word2vec import _sample_negatives
@@ -881,7 +914,7 @@ def test_torchrec_end_to_end_smoke_world_size_2(torchrun_pg):
     # _local_row_range tiles [0, vocab_size) across ranks by construction,
     # every rank matching its own range proves the shards tile the vocab
     # exactly once — verified per-rank, no cross-rank collective needed.
-    vocab_size = len(model._torchrec_vocab_df)
+    vocab_size = model._torchrec_vocab_size
     start, end = _local_row_range(
         vocab_size, dist.get_world_size(), dist.get_rank()
     )
@@ -1020,6 +1053,8 @@ def test_save_then_reload_preserves_embeddings_bit_equal(torchrun_pg):
 
     ckpt = os.path.join(base, "ckpt")
     cfg = RDF2VecConfig(
+        # torchrec rejects the default optimizer='sgd' (fused clip is a no-op)
+        optimizer="rowwiseadagrad",
         backend="torchrec", embedding_model="skipgram", multi_gpu=True,
         walk_strategy="random", walk_depth=3, walk_number=5,
         vector_size=8, epochs=2,
@@ -1066,6 +1101,8 @@ def test_overwrite_starts_fresh(torchrun_pg):
 
     ckpt = os.path.join(base, "ckpt")
     cfg = RDF2VecConfig(
+        # torchrec rejects the default optimizer='sgd' (fused clip is a no-op)
+        optimizer="rowwiseadagrad",
         backend="torchrec", embedding_model="skipgram", multi_gpu=True,
         walk_strategy="random", walk_depth=3, walk_number=5,
         vector_size=8, epochs=1, checkpoint_dir=ckpt,
@@ -1105,6 +1142,8 @@ def test_keep_last_prunes_excess_step_dirs(torchrun_pg):
 
     ckpt = os.path.join(base, "ckpt")
     cfg = RDF2VecConfig(
+        # torchrec rejects the default optimizer='sgd' (fused clip is a no-op)
+        optimizer="rowwiseadagrad",
         backend="torchrec", embedding_model="skipgram", multi_gpu=True,
         walk_strategy="random", walk_depth=3, walk_number=20,
         vector_size=8, epochs=5,
@@ -1116,3 +1155,167 @@ def test_keep_last_prunes_excess_step_dirs(torchrun_pg):
     # Shared checkpoint_dir → assert on all ranks (symmetric).
     step_dirs = sorted(p for p in os.listdir(ckpt) if p.startswith("step_"))
     assert len(step_dirs) == 2, step_dirs
+
+
+# ───────────── Sharding-plan layout guard (added 2026-09-05) ─────────────
+# Left to its cost model, the planner placed dbpedia2016's 6.3M×100 tables
+# TABLE-WISE on 2×A100 (in_embeddings on rank 1, out_embeddings on rank 0):
+# the DCP checkpoint held one full-table chunk per file, and at export time
+# rank 0 found no local shard of the in-table and crashed with
+# "'DistributedModelParallel' object has no attribute 'in_collection'".
+# Every consumer in the module assumes each rank owns one row block.
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("world_size", [2, 8])
+def test_build_sharding_plan_pins_row_wise_with_ceil_block_ranges(world_size):
+    import os
+    import torch
+    import torch.distributed as dist
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    from rdf2vecgpu.embedders.torchrec_word2vec import (
+        ShardedSkipGramModel,
+        _build_sharding_plan,
+        _local_row_range,
+    )
+    device = torch.device("cuda")
+    # 100_003 rows: divisible by neither 2 nor 8, so the ceil-block remainder
+    # lands on the last rank — the case a naive floor split gets wrong.
+    vocab = 100_003
+    model = ShardedSkipGramModel(vocab_size=vocab, embedding_dim=16).to(device)
+    plan = _build_sharding_plan(model, world_size=world_size, device=device)
+
+    seen: set[str] = set()
+    for module_plan in plan.plan.values():
+        for table_name, ps in module_plan.items():
+            seen.add(table_name)
+            assert ps.sharding_type == "row_wise", (table_name, ps.sharding_type)
+            shards = ps.sharding_spec.shards
+            assert len(shards) == world_size, (table_name, len(shards))
+            for rank, shard in enumerate(shards):
+                start, end = _local_row_range(vocab, world_size, rank)
+                assert shard.shard_offsets[0] == start, (table_name, rank, shard.shard_offsets)
+                assert shard.shard_sizes[0] == end - start, (table_name, rank, shard.shard_sizes)
+    assert seen == {
+        ShardedSkipGramModel.IN_TABLE_NAME, ShardedSkipGramModel.OUT_TABLE_NAME,
+    }, seen
+
+
+@pytest.mark.gpu
+def test_get_in_table_local_shard_raises_when_rank_holds_no_shard():
+    """A DMP-wrapped model whose in-table has no local shard on this rank
+    (table-wise placement elsewhere) must fail loudly — never fall through
+    to the unwrapped-module path, which does not exist on the wrapper."""
+    from rdf2vecgpu.embedders.torchrec_word2vec import _get_in_table_local_shard
+
+    class _NoLocalShards:               # ShardedTensor API, empty on this rank
+        def local_shards(self):
+            return []
+
+    class _FakeDMP:
+        module = object()               # DistributedModelParallel.module
+
+        def state_dict(self):
+            return {"in_collection.embeddings.in_embeddings.weight": _NoLocalShards()}
+
+    with pytest.raises(RuntimeError, match="row-wise"):
+        _get_in_table_local_shard(_FakeDMP())
+
+
+# ───────────── Meta-device construction guard (added 2026-09-06) ─────────────
+# The first full-Wikidata run (job 14593196, 8× H200) was OOM-killed at 1.5 TB
+# of host RAM before step 0: every rank built the full 2 × 393M × 100 fp32
+# tables (314 GB) on the CPU and only then moved them to its GPU. The trainer
+# now builds on the meta device and lets DMP allocate just the local shard.
+
+
+@pytest.mark.gpu
+def test_sharded_skipgram_meta_construction_materialises_only_under_dmp():
+    import os
+    import torch
+    import torch.distributed as dist
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    from torchrec.distributed.model_parallel import DistributedModelParallel
+    from torchrec.optim import apply_optimizer_in_backward
+    from rdf2vecgpu.embedders.torchrec_word2vec import (
+        ShardedSkipGramModel,
+        _build_sharding_plan,
+        _fused_optimizer_from_config,
+        _get_in_table_local_shard,
+    )
+    device = torch.device("cuda")
+    vocab, dim = 4096, 16
+    model = ShardedSkipGramModel(vocab_size=vocab, embedding_dim=dim, device=torch.device("meta"))
+    params = list(model.parameters())
+    assert params and all(p.device.type == "meta" for p in params), [p.device for p in params]
+
+    # Same order as the trainer: fused optimizer on the meta params, then DMP.
+    cfg = RDF2VecConfig(backend="torchrec", embedding_model="skipgram", multi_gpu=True,
+                        optimizer="rowwiseadagrad")
+    fused_cls, fused_kwargs = _fused_optimizer_from_config(cfg)
+    apply_optimizer_in_backward(fused_cls, model.parameters(), fused_kwargs)
+    plan = _build_sharding_plan(model, world_size=1, device=device)
+    dmp = DistributedModelParallel(module=model, device=device, plan=plan, init_data_parallel=False)
+
+    shard, start = _get_in_table_local_shard(dmp)
+    assert shard.device.type == "cuda" and tuple(shard.shape) == (vocab, dim) and start == 0
+    assert torch.isfinite(shard).all() and float(shard.abs().sum()) > 0.0   # initialised on device
+    assert all(p.device.type != "meta" for p in dmp.parameters())
+
+    g = torch.Generator(device="cpu").manual_seed(0)
+    center = torch.randint(0, vocab, (64,), generator=g)
+    context = torch.randint(0, vocab, (64,), generator=g)
+    negative = torch.randint(0, vocab, (64, 5), generator=g, device="cpu").to(device)
+    loss = dmp(center.to(device), context.to(device), negative)
+    assert torch.isfinite(loss), loss
+
+
+@pytest.mark.gpu
+def test_build_walk_pair_loader_delivers_configured_pair_budget(tmp_path):
+    """End-to-end loader: parquet walks with cuGraph sentinels → batches whose
+    pair count tracks ``pair_batch_size`` (not a row count assuming full walks),
+    all pairs delivered exactly once, prefetch thread transparent."""
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from rdf2vecgpu.embedders.word2vec_loader import _walk_pair_counts
+
+    d = tmp_path / "walks"; d.mkdir()
+    rng = np.random.default_rng(1)
+    n, depth_p1 = 5000, 5
+    v = rng.integers(0, 300, size=(n, depth_p1)).astype(np.int64)
+    p = rng.integers(300, 320, size=(n, depth_p1 - 1)).astype(np.float64)
+    first = rng.integers(1, depth_p1 + 1, size=n)
+    for r in range(n):
+        v[r, first[r]:] = -1
+        p[r, first[r] - 1:] = -1
+    for k in range(2):                                    # two files: batches span files
+        sl = slice(k * n // 2, (k + 1) * n // 2)
+        pq.write_table(pa.table({
+            "vertices": pa.array(list(v[sl]), type=pa.list_(pa.int64())),
+            "predicates": pa.array(list(p[sl]), type=pa.list_(pa.float64())),
+        }), d / f"part.{k}.parquet")
+
+    cfg = RDF2VecConfig(backend="torchrec", embedding_model="skipgram", multi_gpu=True,
+                        optimizer="rowwiseadagrad", walk_depth=4, window_size=5,
+                        pair_batch_size=4000, random_state=0)
+    m = GPU_RDF2Vec(config=cfg)
+    batches = list(m._build_walk_pair_loader(str(d), None))
+    sizes = [int(c.numel()) for c, _ in batches]
+    total = int(_walk_pair_counts(v.astype(np.int32), 5).sum())
+    assert sum(sizes) == total and total > 0
+    assert all(4000 <= s < 4060 for s in sizes[:-1]) and 0 < sizes[-1] < 4060, sizes[:5]
+    # batches overshoot by < one walk (60 pairs), so the count sits between the
+    # two bounds rather than at ceil(total / budget)
+    assert total // 4060 <= len(sizes) <= total // 4000 + 1, (len(sizes), total)
+    import torch
+    c0, x0 = batches[0]
+    assert c0.dtype == torch.int64 and x0.dtype == torch.int64 and not ((c0 == -1) | (x0 == -1)).any()

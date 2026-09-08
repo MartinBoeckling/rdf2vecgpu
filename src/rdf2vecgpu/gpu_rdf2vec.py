@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 from cugraph import MultiGraph
 import cugraph
@@ -7,7 +8,11 @@ import dask
 from lightning.pytorch.tuner import Tuner
 from .helper.functions import _generate_vocab, cudf_to_torch_tensor
 from .embedders.word2vec import SkipGram, CBOW
-from .embedders.word2vec_loader import SkipGramDataModule, CBOWDataModule, ParquetSkipGramDataModule, WalkSequenceDataModule, walks_per_pair_batch
+from .embedders.word2vec_loader import (
+    SkipGramDataModule, CBOWDataModule, ParquetSkipGramDataModule, WalkSequenceDataModule,
+    walks_per_pair_batch, token_counts_from_walk_parquet, token_counts_cache_path,
+    load_token_counts_cache, save_token_counts_cache,
+)
 from .reader.kg_file_reader import KGFileReader
 from .corpus.walk_corpus import SingleGPUWalkCorpus, MultiGPUWalkCorpus
 from .logger import build_tracker
@@ -16,36 +21,17 @@ from loguru import logger
 from .config import RDF2VecConfig
 
 
-def _token_counts_from_walk_parquet(walks_parquet: str, vocab_size: int):
+def _token_counts_from_walk_parquet(walks_parquet: str, vocab_size: int, workers: int = 1):
     """Count token occurrences over a walk-sequences parquet dir → numpy int64
     array of length ``vocab_size`` (token id → count). Used to build the
     subsampling keep-probabilities and the f^0.75 unigram negative distribution
-    for the PyTorch skip-gram path. Streams the parquet with pyarrow on CPU (the
-    dask cluster is already torn down by the time we train), summing a bincount of
-    the ``vertices`` and ``predicates`` list columns; ``-1`` (cuGraph walk
-    sentinels) are skipped, the ``0`` predicate padding on short walks is left in
-    (a tiny over-count of token 0, immaterial for sampling weights)."""
-    import glob
-    import numpy as np
-    import pyarrow.parquet as pq
-
-    counts = np.zeros(vocab_size, dtype=np.int64)
-    files = sorted(glob.glob(f"{walks_parquet}/*.parquet")) or [walks_parquet]
-    for fp in files:
-        tbl = pq.read_table(fp, columns=["vertices", "predicates"])
-        for col in ("vertices", "predicates"):
-            flat = tbl.column(col).combine_chunks().flatten().to_numpy(zero_copy_only=False)
-            # pyarrow.to_numpy(zero_copy_only=False) on a list-flattened column may
-            # return float64 (with NaN for nulls) instead of the underlying int type
-            # when the chunked array has any null-handling. bincount requires ints
-            # and chokes on NaN — drop NaNs first, then coerce to int64.
-            if np.issubdtype(flat.dtype, np.floating):
-                flat = flat[~np.isnan(flat)]
-            flat = flat.astype(np.int64, copy=False)
-            flat = flat[flat >= 0]
-            if flat.size:
-                counts += np.bincount(flat, minlength=vocab_size)[:vocab_size]
-    return counts
+    for the PyTorch skip-gram path, and the unigram sampler of the torchrec path.
+    Thin alias of :func:`embedders.word2vec_loader.token_counts_from_walk_parquet`
+    (kept here for the existing call sites); ``workers > 1`` parallelises over
+    shards. ``-1`` (cuGraph walk sentinels) are skipped, the ``0`` predicate
+    padding on short walks is left in (a tiny over-count of token 0, immaterial
+    for sampling weights)."""
+    return token_counts_from_walk_parquet(walks_parquet, vocab_size, workers=workers)
 
 
 def _token_counts_from_cudf_walks(cudf_df, vocab_size: int):
@@ -921,8 +907,10 @@ class GPU_RDF2Vec:
             finally:
                 shutil.rmtree(walk_dir, ignore_errors=True)
 
-    def _load_corpus_vocab(self, walks_path: str, vocab_path: str):
+    def _load_corpus_vocab(self, walks_path: str, vocab_path: str, *, load_frame: bool = True):
         """Load ``(vocab_df, token_counts, vocab_path)`` from a prepared corpus.
+        With ``load_frame=False`` ``vocab_df`` is ``None`` and only the row
+        count is read (from the parquet footer).
 
         The decoupled torchrec flow: the vocabulary is READ from the
         on-disk parquet produced by :meth:`prepare_corpus` — it is NOT
@@ -952,13 +940,37 @@ class GPU_RDF2Vec:
             Echoed back unchanged; it is the DCP resume identity key (see
             ``torchrec_word2vec._maybe_resume_checkpoint``).
         """
-        vocab_df = cudf.read_parquet(vocab_path)
+        if load_frame:
+            vocab_df = cudf.read_parquet(vocab_path)
+            vocab_size = vocab_df.shape[0]
+        else:
+            # Only the row count is needed (torchrec training never touches the
+            # entity strings — 393M IRIs, ~20 GB of GPU memory per rank at
+            # Wikidata scale); it comes from the parquet footer, no data read.
+            import pyarrow.parquet as pq
+            vocab_df = None
+            vocab_size = int(pq.read_metadata(vocab_path).num_rows)
 
         # Token-frequency counts over the walk parquet → torch.LongTensor.
-        # Streamed with pyarrow on CPU — no dask cluster needed.
-        counts_np = _token_counts_from_walk_parquet(
-            walks_path, vocab_df.shape[0]
-        )
+        # Prefer the on-disk cache next to the vocab: counting means streaming
+        # the whole walks corpus on CPU, and under torchrun EVERY rank would do
+        # it before a single training step (10 h per rank at Wikidata scale).
+        # Precompute once with performance/helix/make_token_counts.py.
+        cache = token_counts_cache_path(vocab_path)
+        counts_np = load_token_counts_cache(cache, vocab_size)
+        if counts_np is None:
+            logger.warning(
+                f"token-count cache {cache} missing or stale — counting over "
+                f"{walks_path} in-process (every rank repeats this; precompute it "
+                f"once with performance/helix/make_token_counts.py)"
+            )
+            counts_np = _token_counts_from_walk_parquet(
+                walks_path, vocab_size, workers=min(self.config.cpu_count, 8)
+            )
+            if os.environ.get("RANK", "0") == "0":
+                save_token_counts_cache(cache, counts_np)
+        else:
+            logger.info(f"token counts: loaded cache {cache} ({vocab_size:,} tokens)")
         token_counts = torch.from_numpy(counts_np).to(torch.long)
 
         return vocab_df, token_counts, vocab_path
@@ -988,13 +1000,11 @@ class GPU_RDF2Vec:
         path, and the f^0.75 unigram negatives in
         :func:`_sample_negatives` already de-bias hot tokens.
 
-        TODO(refactor): there is unavoidable duplication of the windowing
-        templates between this loader and ``SkipGram._expand_skipgram``.
-        Once the torchrec path matures, factor the pair-template builder
-        into ``embedders/word2vec_loader.py`` and share. Keeping it local
-        for now per the Task 11 plan note ("don't rewrite unrelated code").
+        The pair-template builder now lives in ``embedders/word2vec_loader``
+        (:class:`_PairsFromWalks`); ``SkipGram._expand_skipgram`` still has
+        its own copy of the windowing template.
         """
-        from torch.utils.data import DataLoader, IterableDataset
+        from torch.utils.data import DataLoader
         from .embedders.word2vec_loader import walks_per_pair_batch
 
         cfg = self.config
@@ -1008,13 +1018,25 @@ class GPU_RDF2Vec:
         # files visible to all ranks. Skip the DataModule entirely and
         # use the underlying iterable directly; emulate the rank-shard
         # logic via torch.distributed below.
-        from .embedders.word2vec_loader import _WalkSeqIterable
+        from .embedders.word2vec_loader import (
+            _PairsFromWalks,
+            _ThreadPrefetch,
+            _WalkSeqIterable,
+        )
+        # pair_batch_size: cut walk batches by their actual skip-gram pair
+        # count, not by a row count derived from full-length walks. Real walks
+        # are short (Wikidata: 17 of the nominal 60 pairs per walk, dbpedia2016:
+        # 19), so the row-count batches carried under a third of the configured
+        # pairs and cost 3.5x the steps. emit_batch_size is the fallback when
+        # pair_batch_size is unset.
         ds = _WalkSeqIterable(
             walks_path,
             emit_batch_size=walks_per_batch,
             read_chunk_size=262_144,
             shuffle=True,
             seed=cfg.random_state,
+            pair_batch_size=cfg.pair_batch_size,
+            window=cfg.window_size,
         )
         # Rank-shard at the ROW level, not the file level. torchrec's
         # sharded forward issues an all_to_all on EVERY step, so every rank
@@ -1035,86 +1057,21 @@ class GPU_RDF2Vec:
         rank = dist.get_rank() if dist.is_initialized() else 0
         world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-        window = cfg.window_size
-
-        class _PairsFromWalks(IterableDataset):
-            """Expand each (vertices, predicates) walk batch into a flat
-            (center, context) long-tensor pair batch on CPU.
-
-            On-GPU expansion would shave a couple % off the dataloader
-            time, but the CPU path keeps this loader pickleable across
-            DataLoader workers and matches the torchrec contract of
-            "yields (center, context) long tensors".
-            """
-
-            def __init__(self, inner, window, rank, world_size):
-                super().__init__()
-                self.inner = inner
-                self.window = int(window)
-                self.rank = int(rank)
-                self.world_size = int(world_size)
-
-            def __iter__(self):
-                import numpy as np
-                w = self.window
-                for v_np, p_np in self.inner:
-                    # Disjoint, ~equal row stride per rank. Both ranks
-                    # iterate the same inner stream, so this yields the same
-                    # number of batches on every rank (no all_to_all
-                    # desync); an empty stride from a tiny tail batch is
-                    # fine — the loss is a SUM so an empty batch contributes
-                    # 0 yet still joins the collective, keeping ranks in
-                    # lockstep.
-                    if self.world_size > 1:
-                        v_np = v_np[self.rank::self.world_size]
-                        p_np = p_np[self.rank::self.world_size]
-                    # v_np: (n, depth+1), p_np: (n, depth) — int32 with
-                    # cuGraph's -1 sentinels for short walks.
-                    n, depth_p1 = v_np.shape
-                    Lint = 2 * depth_p1 - 1
-                    seq = np.full((n, Lint), -1, dtype=np.int64)
-                    seq[:, 0::2] = v_np
-                    seq[:, 1::2] = p_np
-                    # Per-row valid length: index of the first -1 in
-                    # vertices, doubled (minus the trailing predicate).
-                    is_sent = v_np == -1
-                    has_sent = is_sent.any(axis=1)
-                    first_sent = np.where(
-                        has_sent, is_sent.argmax(axis=1), depth_p1
-                    )
-                    valid_len = np.clip(2 * first_sent - 1, a_min=0, a_max=Lint)
-                    # Build the (ii, jj) template once per Lint.
-                    ii, jj = [], []
-                    for i in range(Lint):
-                        for j in range(max(0, i - w), min(Lint, i + w + 1)):
-                            if j != i:
-                                ii.append(i)
-                                jj.append(j)
-                    ii_arr = np.asarray(ii, dtype=np.int64)
-                    jj_arr = np.asarray(jj, dtype=np.int64)
-                    center = seq[:, ii_arr]
-                    context = seq[:, jj_arr]
-                    keep = (
-                        (ii_arr[None, :] < valid_len[:, None])
-                        & (jj_arr[None, :] < valid_len[:, None])
-                    )
-                    keep_flat = keep.reshape(-1)
-                    c_flat = center.reshape(-1)[keep_flat]
-                    x_flat = context.reshape(-1)[keep_flat]
-                    yield torch.from_numpy(c_flat).long(), torch.from_numpy(x_flat).long()
-
-        pair_ds = _PairsFromWalks(ds, window=window, rank=rank, world_size=world_size)
-        # num_workers=0 is REQUIRED here, not just a default. This loader runs
-        # inside the torchrec training process, which has already initialised
-        # CUDA + the NCCL process group. DataLoader workers are forked from
-        # that process, and CUDA cannot be re-used across a fork — a worker
-        # touching CUDA aborts with cudaErrorInitializationError. (The 'spawn'
-        # start method would avoid the fork, but it can't pickle the nested
-        # _PairsFromWalks dataset.) Loading inline also makes iteration
-        # deterministic, so every rank yields the same batch COUNT — a
-        # prerequisite for the per-step all_to_all in the sharded forward
-        # (the training loop additionally min-reduces a continue flag as a
-        # backstop). The CPU pair-expansion is cheap relative to the GPU step.
+        # Pair expansion (module-level _PairsFromWalks: rank-strides each walk
+        # batch, expands to (center, context) int64 on the CPU), then a
+        # thread prefetch that runs decode + expansion a few batches ahead of
+        # the GPU step. num_workers stays 0: this loader runs inside the
+        # torchrec training process, which has CUDA + NCCL initialised, and a
+        # forked DataLoader worker touching CUDA aborts with
+        # cudaErrorInitializationError — a thread has no such problem and the
+        # heavy parts (pyarrow decode, numpy copies) release the GIL. Iteration
+        # stays deterministic and identical across ranks, so every rank yields
+        # the same batch COUNT (the training loop min-reduces a continue flag
+        # as a backstop).
+        pair_ds = _ThreadPrefetch(
+            _PairsFromWalks(ds, window=cfg.window_size, rank=rank, world_size=world_size),
+            depth=4,
+        )
         return DataLoader(
             pair_ds,
             batch_size=None,         # iterable yields already-batched pairs
@@ -1784,9 +1741,12 @@ class GPU_RDF2Vec:
             from rdf2vecgpu.embedders.torchrec_word2vec import (
                 extract_embeddings_to_dask_cudf,
             )
-            return extract_embeddings_to_dask_cudf(
-                self._torchrec_model, self._torchrec_vocab_df,
-            )
+            vocab_df = self._torchrec_vocab_df
+            if vocab_df is None:
+                # Training loads only the vocab size; the entity strings are
+                # read here, once, when they are actually joined.
+                vocab_df = cudf.read_parquet(self._torchrec_vocab_path)
+            return extract_embeddings_to_dask_cudf(self._torchrec_model, vocab_df)
         # Check if model is fitted and word2idx is available
         with self.tracker.stage("Embedding_Extraction"):
             if self.word2vec_model is None or self.word2idx is None:

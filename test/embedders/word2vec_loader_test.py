@@ -188,3 +188,151 @@ def test_inmemory_walkseq_yields_gpu_tensors_of_right_shape():
     # Round-trips the data unchanged (shuffle=False).
     assert v0[0].tolist() == [0, 1, 2, 3]
     assert p0[0].tolist() == [10, 11, 12]
+
+
+# ───────── pair-budget batching + prefetch (torchrec loader, 2026-09-06) ─────────
+
+
+def test_pairs_by_valid_len_matches_full_walk_formula():
+    from rdf2vecgpu.embedders.word2vec_loader import _pairs_by_valid_len, skipgram_pairs_per_walk
+    t = _pairs_by_valid_len(9, 5)                       # depth 4 → 9 tokens, window 5
+    assert t[9] == skipgram_pairs_per_walk(4, 5) == 60
+    assert list(t[:4]) == [0, 0, 2, 6]                  # stub, 1 vertex, v-p, v-p-v
+    assert list(_pairs_by_valid_len(5, 2)) == [0, 0, 2, 6, 10, 14]
+    assert _pairs_by_valid_len(5, 2)[5] == skipgram_pairs_per_walk(2, 2)
+
+
+def _walks_with_sentinels(n=600, depth_p1=5, seed=0):
+    """cuGraph-style walks: row r keeps its first `first[r]` vertices (1..depth+1)
+    and `first[r]-1` predicates; the rest are -1 sentinels."""
+    rng = np.random.default_rng(seed)
+    v = rng.integers(0, 50, size=(n, depth_p1)).astype(np.int32)
+    p = rng.integers(100, 150, size=(n, depth_p1 - 1)).astype(np.int32)
+    first = rng.integers(1, depth_p1 + 1, size=n)
+    for r in range(n):
+        v[r, first[r]:] = -1
+        p[r, first[r] - 1:] = -1
+    return v, p
+
+
+def test_walk_pair_counts_match_pair_expansion():
+    import torch
+    from rdf2vecgpu.embedders.word2vec_loader import _PairsFromWalks, _walk_pair_counts
+    v, p = _walks_with_sentinels()
+    counts = _walk_pair_counts(v, window=5)
+    assert counts.min() == 0 and counts.max() == 60            # stubs and full walks both present
+    (c, x), = list(_PairsFromWalks([(v, p)], window=5))
+    assert c.dtype == torch.int64 and c.numel() == x.numel() == int(counts.sum())
+    assert not ((c == -1) | (x == -1)).any()                    # sentinels never leak into pairs
+    for r in range(0, len(v), 41):                              # per-row agreement
+        (cr, _), = list(_PairsFromWalks([(v[r:r + 1], p[r:r + 1])], window=5))
+        assert cr.numel() == counts[r], r
+    # rank striding: the union over ranks is exactly the single-rank output
+    parts = [list(_PairsFromWalks([(v, p)], window=5, rank=k, world_size=3))[0] for k in range(3)]
+    assert sum(cp.numel() for cp, _ in parts) == c.numel()
+
+
+def test_pair_budget_batching_preserves_rows_and_hits_budget(walk_seq_dir):
+    from rdf2vecgpu.embedders.word2vec_loader import _WalkSeqIterable, _walk_pair_counts
+    rows_mode = list(_WalkSeqIterable(walk_seq_dir, emit_batch_size=128, read_chunk_size=256, shuffle=False))
+    pair_mode = list(_WalkSeqIterable(walk_seq_dir, emit_batch_size=128, read_chunk_size=256, shuffle=False,
+                                      pair_batch_size=1000, window=5))
+    # same rows, same order (batches may span read chunks)
+    for col in (0, 1):
+        np.testing.assert_array_equal(np.concatenate([b[col] for b in pair_mode]),
+                                      np.concatenate([b[col] for b in rows_mode]))
+    per_walk = int(_walk_pair_counts(rows_mode[0][0][:1], 5)[0])       # fixture walks are full: 40
+    assert per_walk == 40
+    counts = [int(_walk_pair_counts(b[0], 5).sum()) for b in pair_mode]
+    assert len(counts) == 40 and all(1000 <= c < 1000 + per_walk for c in counts[:-1])
+    assert 0 < counts[-1] <= 1000 + per_walk
+    # rows-mode batch count (8) != pair-mode batch count (40): the budget rules
+
+
+def test_pair_budget_batcher_handles_stubs_and_chunk_boundaries():
+    from rdf2vecgpu.embedders.word2vec_loader import _PairBudgetBatcher, _walk_pair_counts
+    v, p = _walks_with_sentinels(n=1000, seed=3)
+    b = _PairBudgetBatcher(pair_batch_size=333, window=5)
+    out = []
+    for s in range(0, 1000, 70):                                   # ragged pushes
+        out += list(b.push(v[s:s + 70], p[s:s + 70]))
+    out += list(b.flush())
+    np.testing.assert_array_equal(np.concatenate([o[0] for o in out]), v)
+    np.testing.assert_array_equal(np.concatenate([o[1] for o in out]), p)
+    counts = [int(_walk_pair_counts(o[0], 5).sum()) for o in out]
+    assert all(333 <= c < 333 + 60 for c in counts[:-1]) and 0 <= counts[-1] < 333 + 60
+
+
+def test_pair_budget_rejects_in_iterable_ddp_striding(walk_seq_dir):
+    from rdf2vecgpu.embedders.word2vec_loader import _WalkSeqIterable
+    with pytest.raises(ValueError, match="world_size=1"):
+        _WalkSeqIterable(walk_seq_dir, emit_batch_size=8, pair_batch_size=100, world_size=2, rank=0)
+
+
+def test_thread_prefetch_preserves_order_and_propagates_errors():
+    from rdf2vecgpu.embedders.word2vec_loader import _ThreadPrefetch
+    items = [(np.full((2, 2), i, dtype=np.int32), np.full((2, 1), i, dtype=np.int32)) for i in range(50)]
+    out = list(_ThreadPrefetch(items, depth=3))
+    assert len(out) == 50 and [int(o[0][0, 0]) for o in out] == list(range(50))
+
+    class _Bad:
+        def __iter__(self):
+            yield items[0]
+            raise RuntimeError("boom")
+
+    it = iter(_ThreadPrefetch(_Bad(), depth=2))
+    next(it)
+    with pytest.raises(RuntimeError, match="boom"):
+        next(it)
+    it2 = iter(_ThreadPrefetch(items, depth=2))                  # early stop must not hang
+    next(it2)
+    it2.close()
+
+
+def _write_walks(d, v, p):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    d.mkdir(exist_ok=True)
+    pq.write_table(pa.table({
+        "vertices": pa.array(list(v), type=pa.list_(pa.int32())),
+        "predicates": pa.array(list(p), type=pa.list_(pa.int32())),
+    }), d / "part.0.parquet")
+    return str(d)
+
+
+def test_pair_mode_drops_stubs_without_changing_the_pair_stream(tmp_path):
+    """Stubs (walks with < 2 valid vertices) yield no pairs. Dropping them at
+    decode must remove exactly those rows, keep the order of the rest, and
+    leave the batch sequence (pairs per batch, batch count) identical."""
+    from rdf2vecgpu.embedders.word2vec_loader import (
+        _PairsFromWalks, _WalkSeqIterable, _walk_pair_counts, _walk_valid_len,
+    )
+    v, p = _walks_with_sentinels(n=800, seed=5)          # ~20% stubs (1 valid vertex)
+    d = _write_walks(tmp_path / "walks", v, p)
+    stubs = _walk_valid_len(v) < 3
+    assert 100 < stubs.sum() < 250
+
+    kw = dict(emit_batch_size=64, read_chunk_size=256, shuffle=False, pair_batch_size=500, window=5)
+    keep_it = _WalkSeqIterable(d, drop_stubs=False, **kw)
+    drop_it = _WalkSeqIterable(d, **kw)                   # default: on in pair-budget mode
+    assert drop_it.drop_stubs and not keep_it.drop_stubs
+    keep_b, drop_b = list(keep_it), list(drop_it)
+
+    np.testing.assert_array_equal(np.concatenate([b[0] for b in keep_b]), v)
+    np.testing.assert_array_equal(np.concatenate([b[0] for b in drop_b]), v[~stubs])
+    np.testing.assert_array_equal(np.concatenate([b[1] for b in drop_b]), p[~stubs])
+    assert all((_walk_valid_len(b[0]) >= 3).all() for b in drop_b)
+    # same batch sequence: stubs contribute 0 pairs, so the cut points coincide
+    assert [int(_walk_pair_counts(b[0], 5).sum()) for b in keep_b] == \
+           [int(_walk_pair_counts(b[0], 5).sum()) for b in drop_b]
+    # and the expanded pairs are identical batch by batch
+    for (ck, xk), (cd, xd) in zip(_PairsFromWalks(keep_b, window=5), _PairsFromWalks(drop_b, window=5)):
+        np.testing.assert_array_equal(ck.numpy(), cd.numpy())
+        np.testing.assert_array_equal(xk.numpy(), xd.numpy())
+
+
+def test_drop_stubs_is_off_in_row_count_mode_and_rejects_ddp(walk_seq_dir):
+    from rdf2vecgpu.embedders.word2vec_loader import _WalkSeqIterable
+    assert not _WalkSeqIterable(walk_seq_dir, emit_batch_size=128).drop_stubs
+    with pytest.raises(ValueError, match="world_size=1"):
+        _WalkSeqIterable(walk_seq_dir, emit_batch_size=8, drop_stubs=True, world_size=2, rank=1)
