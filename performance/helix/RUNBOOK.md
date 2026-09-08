@@ -142,9 +142,12 @@ WS=$WS sbatch --gres=gpu:A100:8 --cpus-per-task=48 --mem=1500G --time=48:00:00 \
 ```
 
 `--gres=gpu:H200:8` is the same job on the H200 gpu8 node (141 GB/GPU, ~2.4×
-the HBM bandwidth of A100 — this workload is bandwidth-bound, ~0.5 FLOP/byte,
-so that is the number that matters). Queue both with the same `RACE_GROUP`
-and the script keeps whichever gets *past start-up* first: a job claims the race
+the HBM bandwidth of A100; the measured Wikidata epoch used ~1.3% of it, see
+the throughput notes below, so the H200 advantage is smaller than that ratio).
+Queue both with the same `RACE_GROUP` — sibling job names MUST be
+`<RACE_GROUP>_<suffix>`; a job that merely starts with the group string is not
+a sibling (2026-09-08: `dbpx_prof2` was cancelled by group `dbpx`) — and the
+script keeps whichever gets *past start-up* first: a job claims the race
 (atomic winner file under `$WS/results`) only after its first progress line, then
 cancels the pending sibling; a start-up failure leaves the sibling queued (validated
 2026-09-06 with two dbpedia siblings: claim logged right after `step 0`, sibling
@@ -152,10 +155,28 @@ cancelled one minute after the winner started) — no
 external watcher. Helix has no B200. Chain the pair behind a validation job
 with `--dependency=afterok:<id>` so they release the moment it passes.
 
-Leave `EXPORT_KGREAT` unset on the full run: the exporter writes *all* 393M
-entities (~40 GB TSV per rank, then a ~320 GB rank-0 concatenation). Resubmit
-the finished job later — it resumes at epoch 1, skips training and exports —
-ideally after adding a vocab filter to `_export_kgreat_tsv`.
+**Full-Wikidata d100, 1 epoch (2026-09-08, job 14636218, 8× H200 `o09c02` —
+won the race, the A100 sibling was cancelled while still pending): 671,187
+steps at 79.8 steps/s (1.05M pairs/step), fit 9,353 s = 2.6 h, loss 551k →
+~80k, peak VRAM 28.5 GiB/GPU, job MaxRSS 1.12 TB (`--mem=1500G`), wall
+2 h 38 min. Two kept checkpoints in `results/wikidata_d100_e1_h200/ckpt`
+(293 GB each). So 5 epochs ≈ 13 h on the H200 node (A100-80GB: expect
+1.5–2×, the step is bandwidth-bound); the queue wait was 37 h both times.**
+
+Leave `EXPORT_KGREAT` unset on a long training run and export afterwards with
+an **export-only resubmit**: the same submit line plus
+`EXPORT_KGREAT=$OUT/entities.tsv,EXPORT_ENTITY_REGEX=^http://www.wikidata.org/entity/Q`
+(same `OUT`, so `CHECKPOINT_DIR` resolves to the finished run's `ckpt`). It
+resumes at the epoch boundary, trains nothing, prints `[torchrec] resumed …`
+(what the race claim keys on in that case) and streams the filtered table to
+the TSV. The exporter (`bench_backends.py --export-kgreat`) streams each rank's
+row block through `GPU_RDF2Vec.iter_local_embeddings` in 1M-row chunks: no
+device-side vocab join (the `transform()` path needs ~110 GB/GPU at 393M
+tokens — more than an A100-80GB) and no whole-shard pandas frame; the vocab
+slice comes from the row groups of `vocab.parquet` that cover the block.
+`--export-entity-regex` (RE2) and `--export-entity-list <file>` (one IRI per
+line, e.g. the GEval gold entities) filter rows before writing — unfiltered,
+the Wikidata TSV would be ~320 GB.
 
 d200 → same but `--gres=gpu:H200:8`, `VECTOR_SIZE=200` (A100/80 is too tight:
 79 GB/GPU of tables before activations).

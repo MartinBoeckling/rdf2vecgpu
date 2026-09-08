@@ -1319,3 +1319,126 @@ def test_build_walk_pair_loader_delivers_configured_pair_budget(tmp_path):
     import torch
     c0, x0 = batches[0]
     assert c0.dtype == torch.int64 and x0.dtype == torch.int64 and not ((c0 == -1) | (x0 == -1)).any()
+
+
+# ───────────────────── streaming export (iter_local_embedding_chunks) ─────────────────────
+
+
+def _write_vocab_parquet(path, entities, *, row_group_size=None, order=None):
+    """``vocab.parquet`` in the prepare_corpus layout (token_id, entity); ``order``
+    permutes / drops rows to build unsorted or gapped files."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    ids = list(range(len(entities)))
+    if order is not None:
+        ids = [ids[i] for i in order]
+        entities = [entities[i] for i in order]
+    pq.write_table(
+        pa.table({"token_id": pa.array(ids, pa.int64()), "entity": pa.array(entities, pa.string())}),
+        path, row_group_size=row_group_size,
+    )
+
+
+def test_read_vocab_slice_returns_contiguous_block_from_row_groups(tmp_path):
+    from rdf2vecgpu.embedders.torchrec_word2vec import _read_vocab_slice
+
+    ents = [f"http://x/e{i}" for i in range(40)]
+    path = str(tmp_path / "vocab.parquet")
+    _write_vocab_parquet(path, ents, row_group_size=7)          # 6 row groups
+    assert _read_vocab_slice(path, 10, 25).to_pylist() == ents[10:25]
+    assert _read_vocab_slice(path, 0, 40).to_pylist() == ents
+    assert _read_vocab_slice(path, 40, 40).to_pylist() == []
+
+
+def test_read_vocab_slice_sorts_unordered_rows_and_rejects_gaps(tmp_path):
+    import numpy as np
+    from rdf2vecgpu.embedders.torchrec_word2vec import _read_vocab_slice
+
+    ents = [f"e{i}" for i in range(30)]
+    shuffled = str(tmp_path / "shuffled.parquet")
+    _write_vocab_parquet(shuffled, ents, row_group_size=8,
+                         order=np.random.default_rng(0).permutation(30))
+    assert _read_vocab_slice(shuffled, 5, 20).to_pylist() == ents[5:20]
+    gap = str(tmp_path / "gap.parquet")
+    _write_vocab_parquet(gap, ents, row_group_size=8, order=[i for i in range(30) if i != 12])
+    with pytest.raises(RuntimeError, match="contiguous"):
+        _read_vocab_slice(gap, 5, 20)
+
+
+def test_iter_local_embedding_chunks_streams_unsharded_table_in_order(tmp_path):
+    import numpy as np
+    from rdf2vecgpu.embedders.torchrec_word2vec import (
+        ShardedSkipGramModel,
+        iter_local_embedding_chunks,
+    )
+
+    vocab = 23
+    ents = [f"http://x/e{i}" for i in range(vocab)]
+    path = str(tmp_path / "vocab.parquet")
+    _write_vocab_parquet(path, ents, row_group_size=5)
+    model = ShardedSkipGramModel(vocab_size=vocab, embedding_dim=4)
+    table = next(iter(model.in_collection.embeddings.values())).weight.data
+
+    chunks = list(iter_local_embedding_chunks(model, path, chunk_rows=10))
+    assert [c[2].shape[0] for c in chunks] == [10, 10, 3]
+    assert np.concatenate([c[0] for c in chunks]).tolist() == list(range(vocab))
+    assert sum((c[1].to_pylist() for c in chunks), []) == ents
+    vec = np.concatenate([c[2] for c in chunks])
+    assert vec.dtype == np.float32
+    np.testing.assert_array_equal(vec, table.detach().cpu().numpy())
+    with pytest.raises(ValueError):
+        next(iter_local_embedding_chunks(model, path, chunk_rows=0))
+
+
+@pytest.mark.multigpu
+def test_iter_local_embeddings_tiles_vocab_and_matches_transform(torchrun_pg):
+    """The streaming export path must yield exactly this rank's row block —
+    the same ids and vectors as transform()'s cudf shard — carrying the
+    entity strings of vocab.parquet, so per-rank TSV shards concatenate to
+    the whole vocabulary exactly once."""
+    import numpy as np
+    import pyarrow.parquet as pq
+    import torch.distributed as dist
+
+    from rdf2vecgpu.config import RDF2VecConfig
+    from rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+    from rdf2vecgpu.embedders.torchrec_word2vec import _local_row_range
+
+    base = _shared_base("stream_export")
+    walks_path, vocab_path = _prepare_corpus_fs(
+        base,
+        make_triples=lambda: _connected_string_triples(
+            8_000, seed=3, n_entities=250, n_predicates=10
+        ),
+        walk_depth=3, walk_number=5,
+    )
+    cfg = RDF2VecConfig(
+        backend="torchrec", embedding_model="skipgram", multi_gpu=True,
+        walk_strategy="random", walk_depth=3, walk_number=5,
+        vector_size=8, epochs=1,
+        learning_rate=0.025, negative_samples=5, optimizer="sparseadam",
+    )
+    model = GPU_RDF2Vec(config=cfg)
+    model.fit_from_walks(walks_path, vocab_path)
+
+    chunks = list(model.iter_local_embeddings(chunk_rows=37))
+    ids = np.concatenate([c[0] for c in chunks])
+    ents = sum((c[1].to_pylist() for c in chunks), [])
+    vec = np.concatenate([c[2] for c in chunks])
+
+    start, end = _local_row_range(
+        model._torchrec_vocab_size, dist.get_world_size(), dist.get_rank()
+    )
+    assert ids.tolist() == list(range(start, end))
+    assert len(chunks) == -(-(end - start) // 37) and all(len(c[2]) <= 37 for c in chunks)
+
+    vocab = pq.read_table(vocab_path).to_pandas().set_index("token_id")["entity"]
+    assert ents == [vocab.loc[i] for i in range(start, end)]
+
+    ref = model.transform().compute().to_pandas().sort_values("token_id")
+    assert ref["token_id"].tolist() == ids.tolist()
+    np.testing.assert_array_equal(
+        vec, ref[[str(d) for d in range(8)]].to_numpy(dtype=np.float32)
+    )
+

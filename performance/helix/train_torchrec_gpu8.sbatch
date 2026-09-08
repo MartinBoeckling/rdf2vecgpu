@@ -15,6 +15,11 @@
 # ~39 GB/GPU), d200 needs the H200 flavor (629 GB -> ~79 GB/GPU):
 #   sbatch --gres=gpu:A100:8 --cpus-per-task=48 --mem=800G --time=96:00:00 \
 #     --export=ALL,GPUS=8,CORPUS=$WS/corpus/wikidata_v100,EPOCHS=5,... this-file
+# Export-only resubmit (KGrEAT TSV from a finished run's checkpoint): same OUT
+# and EPOCHS as the finished run plus EXPORT_KGREAT=$OUT/entities.tsv and
+# EXPORT_ENTITY_REGEX='^http://www.wikidata.org/entity/Q' — it resumes at the
+# epoch boundary, trains nothing, and streams the filtered table to the TSV
+# (~1 h at Wikidata scale; the race claim keys on the "resumed" line then).
 # Single node => torchrun --standalone, NO multi-node rendezvous, and the
 # all-to-all stays on NVLink/NVSwitch. Do NOT set NCCL_P2P_DISABLE here (that
 # flag is the dws-A6000 PCIe workaround; on NVLink boxes it disables the fast
@@ -33,9 +38,11 @@ export GPUS=${GPUS:-2}
 WS="${WS:-$(ws_find rdf2vec_resource 2>/dev/null || echo "$HOME")}"
 
 # ── RACE_GROUP: "whoever gets past start-up first wins", no external watcher ──
-# Queue the same run on two GPU types (job names sharing this prefix). A job
+# Queue the same run on two GPU types (job names <RACE_GROUP>_<suffix>; any
+# other job whose name merely starts with the group string is left alone). A job
 # claims the race only once its torchrun has printed the first progress line
-# (model built, sharded, step 0 done — the phase that OOM-killed 14593196 six
+# (model built, sharded, step 0 done — or "resumed" on an export-only run: the
+# phase that OOM-killed 14593196 six
 # minutes in, after it had already cancelled its A100 sibling); only then does
 # it cancel every PENDING sibling. Until then siblings stay queued, so a
 # start-up failure hands the slot to the other GPU type instead of emptying the
@@ -72,7 +79,7 @@ export CHECKPOINT_DIR=${CHECKPOINT_DIR-$OUT/ckpt}
 export CHECKPOINT_INTERVAL_MIN=${CHECKPOINT_INTERVAL_MIN:-120}
 mkdir -p "$OUT"
 
-echo "[gpu8] host=$(hostname -s) gpus=$GPUS corpus=$CORPUS epochs=$EPOCHS batch=$PAIR_BATCH_SIZE lr=$LR ckpt=${CHECKPOINT_DIR:-off}"
+echo "[gpu8] host=$(hostname -s) gpus=$GPUS corpus=$CORPUS epochs=$EPOCHS batch=$PAIR_BATCH_SIZE lr=$LR ckpt=${CHECKPOINT_DIR:-off} export=${EXPORT_KGREAT:-off} regex=${EXPORT_ENTITY_REGEX:-none} list=${EXPORT_ENTITY_LIST:-none}"
 [ -f "$CORPUS/token_counts.npy" ] || echo "[gpu8] WARN: $CORPUS/token_counts.npy missing — every rank will count tokens before step 0 (see performance/helix/token_counts.sbatch)"
 nvidia-smi topo -m | sed -n "1,$((GPUS+2))p"
 
@@ -108,19 +115,21 @@ torchrun --standalone --nproc_per_node="$GPUS" \
     --epochs "$EPOCHS" --negative-samples 5 --min-count 1 \
     --learning-rate "$LR" --optimizer rowwiseadagrad --pair-batch-size "$PAIR_BATCH_SIZE" \
     ${CHECKPOINT_DIR:+--checkpoint-dir "$CHECKPOINT_DIR" --checkpoint-interval-minutes "$CHECKPOINT_INTERVAL_MIN"} \
-    ${EXPORT_KGREAT:+--export-kgreat "$EXPORT_KGREAT"} &
+    ${EXPORT_KGREAT:+--export-kgreat "$EXPORT_KGREAT"} \
+    ${EXPORT_ENTITY_REGEX:+--export-entity-regex "$EXPORT_ENTITY_REGEX"} \
+    ${EXPORT_ENTITY_LIST:+--export-entity-list "$EXPORT_ENTITY_LIST"} &
 TR_PID=$!
 
 # Race claim: poll this job's own log until torchrun prints its first progress
 # line, then claim atomically and cancel the PENDING siblings.
 if [ -n "${RACE_GROUP:-}" ]; then
   while kill -0 "$TR_PID" 2>/dev/null; do
-    if tail -n +"$((LOG_START + 1))" "$LOG" 2>/dev/null | grep -q "\[torchrec\] epoch"; then
+    if tail -n +"$((LOG_START + 1))" "$LOG" 2>/dev/null | grep -qE "\[torchrec\] (epoch|resumed)"; then
       if ( set -o noclobber; echo "$SLURM_JOB_ID" > "$WIN" ) 2>/dev/null; then
         echo "[gpu8] race: past start-up — claimed $RACE_GROUP, cancelling pending siblings"
         while read -r jid jname jstate; do
           [ "$jid" = "$SLURM_JOB_ID" ] && continue
-          case "$jname" in "$RACE_GROUP"*) ;; *) continue ;; esac
+          case "$jname" in "${RACE_GROUP}_"*) ;; *) continue ;; esac   # siblings are <group>_<suffix>
           echo "[gpu8] race: cancelling sibling $jid ($jname, $jstate)"; scancel "$jid" || true
         done < <(squeue -u "$USER" -h -o "%i %j %T")
         break

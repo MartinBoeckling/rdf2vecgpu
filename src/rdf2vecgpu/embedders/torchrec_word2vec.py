@@ -443,6 +443,88 @@ def _is_sharded_module(module) -> bool:
     return isinstance(module, ShardedModule)
 
 
+def _read_vocab_slice(vocab_path: str, start: int, end: int):
+    """Host-side ``entity`` strings for token ids ``[start, end)`` of the
+    corpus ``vocab.parquet``, in token-id order, as a ``pyarrow`` ChunkedArray.
+
+    Reads only the row groups whose ``token_id`` statistics overlap the range
+    (``prepare_corpus`` writes the vocab in token-id order, so that is one
+    contiguous run of row groups) and scans any row group that carries no
+    statistics. The result is verified to be exactly ``range(start, end)``:
+    a gap or duplicate would silently mislabel every row after it.
+    """
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    pf = pq.ParquetFile(vocab_path)
+    tid_idx = pf.schema_arrow.get_field_index("token_id")
+    parts = []
+    for rg in range(pf.metadata.num_row_groups):
+        st = pf.metadata.row_group(rg).column(tid_idx).statistics
+        if st is not None and st.has_min_max and (st.max < start or st.min >= end):
+            continue
+        t = pf.read_row_group(rg, columns=["token_id", "entity"])
+        tid = t.column("token_id")
+        t = t.filter(pc.and_(pc.greater_equal(tid, start), pc.less(tid, end)))
+        if t.num_rows:
+            parts.append(t)
+    table = pa.concat_tables(parts) if parts else pa.table(
+        {"token_id": pa.array([], pa.int64()), "entity": pa.array([], pa.string())}
+    )
+    ids = table.column("token_id").to_numpy()
+    if ids.shape[0] and not np.all(np.diff(ids) == 1):
+        table = table.take(pc.sort_indices(table, sort_keys=[("token_id", "ascending")]))
+        ids = table.column("token_id").to_numpy()
+    expected = end - start
+    contiguous = ids.shape[0] == expected and (
+        expected == 0
+        or (int(ids[0]) == start and int(ids[-1]) == end - 1 and bool(np.all(np.diff(ids) == 1)))
+    )
+    if not contiguous:
+        raise RuntimeError(
+            f"vocab slice [{start}, {end}) of {vocab_path} is not the contiguous token-id "
+            f"range expected for this shard (got {ids.shape[0]} rows, expected {expected}); "
+            "the checkpoint and vocab.parquet do not belong together"
+        )
+    return table.column("entity")
+
+
+def iter_local_embedding_chunks(model, vocab_path: str, *, chunk_rows: int = 1_000_000):
+    """Stream this rank's row block of the in-embedding table to the host.
+
+    Yields ``(token_ids, entities, vectors)`` in token-id order, at most
+    ``chunk_rows`` rows per item: an int64 numpy array, a ``pyarrow``
+    ChunkedArray of entity strings and a float32 ``(rows, dim)`` numpy array.
+
+    This is the export path for vocabularies where
+    :func:`extract_embeddings_to_dask_cudf` — a cudf copy of the shard joined
+    with the full vocab frame on the device — does not fit next to the sharded
+    tables (at 393M Wikidata tokens that join needs ~110 GB per rank, more
+    than an A100-80GB holds). Here the device holds nothing beyond the model;
+    host memory is the block's entity strings (~2.5 GB for 49M IRIs) plus one
+    chunk. The row offset comes from the shard metadata
+    (:func:`_get_in_table_local_shard`), so the ids are exact under torchrec's
+    ceil-block row-wise split.
+    """
+    import numpy as np
+
+    if chunk_rows < 1:
+        raise ValueError(f"chunk_rows must be >= 1, got {chunk_rows}")
+    in_param, start = _get_in_table_local_shard(model)
+    local_rows = int(in_param.shape[0])
+    entities = _read_vocab_slice(vocab_path, start, start + local_rows)
+    for i in range(0, local_rows, chunk_rows):
+        n = min(chunk_rows, local_rows - i)
+        vectors = in_param[i:i + n].detach().to(torch.float32).cpu().numpy()
+        yield (
+            np.arange(start + i, start + i + n, dtype=np.int64),
+            entities.slice(i, n),
+            vectors,
+        )
+
+
 def _save_checkpoint(
     model,
     optimizer,
@@ -652,6 +734,15 @@ def _maybe_resume_checkpoint(
     if dist.is_initialized():
         dist.barrier()
 
+    if rank == 0:
+        # Also the marker an export-only resubmit's race claim keys on
+        # (performance/helix/train_torchrec_gpu8.sbatch): the checkpoint is
+        # loaded, so the memory-critical start-up is behind us.
+        print(
+            f"[torchrec] resumed from {step_dir.name}: epoch={int(meta['epoch'])} "
+            f"global_step={int(meta['global_step'])}",
+            flush=True,
+        )
     return int(meta["epoch"]), int(meta["global_step"])
 
 

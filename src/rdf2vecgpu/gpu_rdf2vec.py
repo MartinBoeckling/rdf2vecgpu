@@ -1765,6 +1765,30 @@ class GPU_RDF2Vec:
                 )
             return embedding_df
 
+    def iter_local_embeddings(self, *, chunk_rows: int = 1_000_000):
+        """Stream this rank's block of the trained embedding table to the host.
+
+        torchrec backend only. Yields ``(token_ids, entities, vectors)`` chunks
+        in token-id order (see
+        :func:`rdf2vecgpu.embedders.torchrec_word2vec.iter_local_embedding_chunks`).
+        Unlike :meth:`transform`, nothing beyond the sharded model is
+        materialised on the device, which is what lets a full-Wikidata export
+        fit on 80 GB GPUs. Every rank yields a disjoint block; the union over
+        ranks is the whole vocabulary exactly once.
+        """
+        if self.config.backend != "torchrec":
+            raise RuntimeError("iter_local_embeddings() is only available on backend='torchrec'")
+        if not hasattr(self, "_torchrec_model"):
+            raise RuntimeError(
+                "iter_local_embeddings() must be called within the same distributed "
+                "launch as fit(); the sharded model is rank-local."
+            )
+        from rdf2vecgpu.embedders.torchrec_word2vec import iter_local_embedding_chunks
+
+        return iter_local_embedding_chunks(
+            self._torchrec_model, self._torchrec_vocab_path, chunk_rows=chunk_rows
+        )
+
     def _extract_embeddings_pytorch(self) -> cudf.DataFrame:
         """Pull `[token, word, embedding_0..n]` cudf DataFrame from the
         PyTorch trainer's in-embeddings weight matrix.

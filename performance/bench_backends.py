@@ -111,13 +111,64 @@ def _is_leader() -> bool:
     return os.environ.get("RANK", "0") == "0" and os.environ.get("LOCAL_RANK", "0") == "0"
 
 
-def _export_kgreat_tsv(emb, path: str) -> None:
-    """Write entity embeddings as a KGrEAT embedding TSV: tab-separated, NO header,
-    column 0 = entity (the `word`/IRI), remaining columns = the L1-normalized
-    vector. Mirrors KGrEAT's embedding-rdf2vec `_serialize_embeddings` (unit
-    L1 norm, 6 decimals) so the file drops straight into kg/<id>/embedding/."""
+def _load_entity_set(path: str):
+    """Entities to keep for ``--export-entity-list`` (one IRI per line, blank
+    lines ignored); ``None`` when no list is given."""
+    if not path:
+        return None
+    with open(path) as fh:
+        return {line.strip() for line in fh if line.strip()}
+
+
+def _kgreat_keep_mask(entities, entity_regex: str, entity_set):
+    """Boolean numpy keep-mask over ``entities`` (a pyarrow array / chunked
+    array or a numpy object array) for the optional regex and explicit-list
+    filters (AND-ed); ``None`` when no filter is active."""
+    if not entity_regex and entity_set is None:
+        return None
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    arr = entities if isinstance(entities, (pa.Array, pa.ChunkedArray)) else pa.array(
+        np.asarray(entities, dtype=object), type=pa.string()
+    )
+    mask = None
+    if entity_regex:
+        mask = pc.match_substring_regex(arr, entity_regex)
+    if entity_set is not None:
+        in_set = pc.is_in(arr, value_set=pa.array(sorted(entity_set), type=arr.type))
+        mask = in_set if mask is None else pc.and_(mask, in_set)
+    return pc.fill_null(mask, False).to_numpy(zero_copy_only=False).astype(bool)
+
+
+def _write_kgreat_rows(entities, M, fh, *, entity_regex: str = "", entity_set=None) -> int:
+    """Append ``entities`` / ``M`` to the open text handle ``fh`` in KGrEAT's
+    embedding layout: tab-separated, NO header, column 0 = entity (the IRI),
+    then the L1-normalised vector rounded to 6 decimals — KGrEAT's own
+    embedding-rdf2vec ``_serialize_embeddings``, so the file drops straight into
+    ``kg/<id>/embedding/``. Returns the number of rows written after the
+    optional entity filters (``--export-entity-regex`` / ``--export-entity-list``)."""
     import numpy as np
     import pandas as pd
+    keep = _kgreat_keep_mask(entities, entity_regex, entity_set)
+    ents = (entities.to_numpy(zero_copy_only=False) if hasattr(entities, "to_numpy")
+            else np.asarray(entities, dtype=object))
+    M = np.asarray(M, dtype="float64")
+    if keep is not None:
+        if not keep.any():
+            return 0
+        ents, M = ents[keep], M[keep]
+    norms = np.abs(M).sum(axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    pd.DataFrame(np.round(M / norms, 6), index=ents).to_csv(fh, sep="\t", header=False)
+    return int(M.shape[0])
+
+
+def _export_kgreat_tsv(emb, path: str, *, entity_regex: str = "", entity_set=None) -> int:
+    """Write an in-memory embedding frame (gensim / pytorch: ``word`` + vector
+    columns; torchrec ``transform()``: ``entity``) as a KGrEAT TSV at ``path``.
+    Returns the number of rows written."""
+    import numpy as np
     if hasattr(emb, "to_pandas"):
         emb = emb.to_pandas()
     # entity column is "word" (gensim/pytorch) or "entity" (torchrec); the id
@@ -125,13 +176,29 @@ def _export_kgreat_tsv(emb, path: str) -> None:
     ent_col = "word" if "word" in emb.columns else "entity"
     id_like = {"token", "word", "token_id", "entity"}
     vec_cols = [c for c in emb.columns if c not in id_like]
-    M = emb[vec_cols].to_numpy(dtype="float64")
-    norms = np.abs(M).sum(axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    M = np.round(M / norms, 6)
-    out = pd.DataFrame(M, index=np.asarray(emb[ent_col]))
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-    out.to_csv(path, sep="\t", header=False)
+    with open(path, "w") as fh:
+        return _write_kgreat_rows(
+            np.asarray(emb[ent_col]), emb[vec_cols].to_numpy(dtype="float64"), fh,
+            entity_regex=entity_regex, entity_set=entity_set,
+        )
+
+
+def _export_kgreat_tsv_sharded(model, path: str, *, entity_regex: str = "",
+                               entity_set=None, chunk_rows: int = 1_000_000) -> tuple[int, int]:
+    """torchrec: stream this rank's table block through
+    ``GPU_RDF2Vec.iter_local_embeddings`` into ``path`` — no device-side vocab
+    join and no whole-shard pandas frame, so a full-Wikidata block fits next
+    to the sharded tables on an 80 GB GPU. Returns ``(rows_written,
+    rows_in_block)``."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    written = total = 0
+    with open(path, "w") as fh:
+        for _ids, entities, vectors in model.iter_local_embeddings(chunk_rows=chunk_rows):
+            total += int(vectors.shape[0])
+            written += _write_kgreat_rows(entities, vectors, fh,
+                                          entity_regex=entity_regex, entity_set=entity_set)
+    return written, total
 
 
 def _concat_rank_shards(path: str, world_size: int) -> None:
@@ -143,7 +210,9 @@ def _concat_rank_shards(path: str, world_size: int) -> None:
     truncated embedding. This happens e.g. on a MULTI-NODE run where the export
     path is node-local — rank 0 then sees only its own node's shards. Fail loud
     and leave the surviving shards on disk for diagnosis rather than concatenating
-    a partial result."""
+    a partial result. Shards are streamed, never read into memory whole (a
+    full-Wikidata shard is tens of GB)."""
+    import shutil
     shards = [f"{path}.rank{r}" for r in range(world_size)]
     missing = [s for s in shards if not os.path.exists(s)]
     if missing:
@@ -153,10 +222,10 @@ def _concat_rank_shards(path: str, world_size: int) -> None:
             "On multi-node runs the --export-kgreat path must be on a SHARED "
             "filesystem visible to every rank."
         )
-    with open(path, "w") as out:
+    with open(path, "wb") as out:
         for shard in shards:
-            with open(shard) as fh:
-                out.write(fh.read())
+            with open(shard, "rb") as fh:
+                shutil.copyfileobj(fh, out, 64 << 20)
             os.remove(shard)
 
 
@@ -234,7 +303,8 @@ def run_from_corpus(args) -> dict:
             emb = emb.compute()
     metrics["peak_vram_gib"] = _peak_vram_gib()
     if args.export_kgreat:
-        _export_kgreat_tsv(emb, args.export_kgreat)
+        _export_kgreat_tsv(emb, args.export_kgreat, entity_regex=args.export_entity_regex,
+                           entity_set=_load_entity_set(args.export_entity_list))
     return metrics
 
 
@@ -347,16 +417,30 @@ def run_torchrec(args) -> dict | None:
     with _timed(metrics, "t_fit_from_walks_s"):
         m.fit_from_walks(walks_path, vocab_path)
     metrics["peak_vram_gib"] = _peak_vram_gib()
-    # KGrEAT export: transform() is rank-local (sharded model), so it MUST run
-    # inside the launch. Each rank writes its disjoint shard; rank 0 concatenates.
+    # KGrEAT export: the sharded model is rank-local, so this MUST run inside
+    # the launch. Each rank streams its disjoint table block to <path>.rank<r>
+    # (filtered by --export-entity-regex / --export-entity-list); rank 0
+    # concatenates. Nothing beyond the model is materialised on the device, so
+    # full-Wikidata blocks fit on 80 GB GPUs; host memory is one chunk per rank.
     if args.export_kgreat:
-        emb = m.transform()
-        if hasattr(emb, "compute"):
-            emb = emb.compute()
-        _export_kgreat_tsv(emb, f"{args.export_kgreat}.rank{rank}")
-        dist.barrier()
-        if rank == 0:
-            _concat_rank_shards(args.export_kgreat, world_size)
+        entity_set = _load_entity_set(args.export_entity_list)
+        with _timed(metrics, "t_export_s"):
+            written, total = _export_kgreat_tsv_sharded(
+                m, f"{args.export_kgreat}.rank{rank}",
+                entity_regex=args.export_entity_regex, entity_set=entity_set,
+                chunk_rows=args.export_chunk_rows,
+            )
+            print(f"[bench] export rank {rank}: {written:,} of {total:,} block rows "
+                  f"-> {args.export_kgreat}.rank{rank}", flush=True)
+            counts = torch.tensor([written, total], device="cuda", dtype=torch.int64)
+            dist.all_reduce(counts)
+            dist.barrier()
+            if rank == 0:
+                _concat_rank_shards(args.export_kgreat, world_size)
+                print(f"[bench] export: {int(counts[0]):,} of {int(counts[1]):,} vocab rows "
+                      f"-> {args.export_kgreat}", flush=True)
+        metrics["export_rows"] = int(counts[0])
+        metrics["export_vocab_rows"] = int(counts[1])
     dist.barrier()
     dist.destroy_process_group()
 
@@ -383,6 +467,15 @@ def main() -> None:
     p.add_argument("--export-kgreat", default="", dest="export_kgreat",
                    help="also write entity embeddings as a KGrEAT TSV (tab-sep, no header, "
                         "L1-normalized) to this path, for downstream-task evaluation")
+    p.add_argument("--export-entity-regex", default="", dest="export_entity_regex",
+                   help="only export entities whose IRI matches this (RE2) regex, e.g. "
+                        "'^http://www.wikidata.org/entity/Q' keeps Wikidata items and drops "
+                        "properties/literals; applied per rank before writing")
+    p.add_argument("--export-entity-list", default="", dest="export_entity_list",
+                   help="only export entities listed in this text file (one IRI per line); "
+                        "AND-ed with --export-entity-regex")
+    p.add_argument("--export-chunk-rows", type=int, default=1_000_000, dest="export_chunk_rows",
+                   help="torchrec: table rows per host-side export chunk (bounds host memory per rank)")
     # ── legacy / torchrec options ──
     p.add_argument("--nproc", type=int, default=0, help="pytorch-mg: Dask-CUDA workers (0=auto). torchrec uses torchrun --nproc_per_node.")
     p.add_argument("--corpus-dir", default="", help="torchrec full-pipeline fallback: where to write the prepared corpus (default: alongside --out)")
