@@ -180,6 +180,10 @@ def _config(backend: str, multi_gpu: bool, args) -> "RDF2VecConfig":  # noqa: F8
         grad_clip_value=args.grad_clip_value,
         optimizer=args.optimizer,
         pair_batch_size=args.pair_batch_size,
+        # torchrec-only; the other backends ignore these.
+        checkpoint_dir=args.checkpoint_dir or None,
+        checkpoint_interval_minutes=args.checkpoint_interval_minutes,
+        checkpoint_keep_last=args.checkpoint_keep_last,
     )
 
 
@@ -383,6 +387,11 @@ def main() -> None:
     p.add_argument("--nproc", type=int, default=0, help="pytorch-mg: Dask-CUDA workers (0=auto). torchrec uses torchrun --nproc_per_node.")
     p.add_argument("--corpus-dir", default="", help="torchrec full-pipeline fallback: where to write the prepared corpus (default: alongside --out)")
     p.add_argument("--prep-timeout-s", type=int, default=3600)
+    p.add_argument("--checkpoint-dir", default="", dest="checkpoint_dir",
+                   help="torchrec: DCP checkpoint dir (time-based + epoch-end saves, auto-resume "
+                        "from <dir>/latest). Empty = no checkpointing.")
+    p.add_argument("--checkpoint-interval-minutes", type=int, default=120, dest="checkpoint_interval_minutes")
+    p.add_argument("--checkpoint-keep-last", type=int, default=2, dest="checkpoint_keep_last")
     for k, v in DEFAULTS.items():
         argtype = type(v)
         p.add_argument(f"--{k.replace('_', '-')}", dest=k, type=argtype, default=v)
