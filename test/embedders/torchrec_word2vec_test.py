@@ -6,6 +6,10 @@ Layers 2+ require either the `gpu` or `multigpu` marker.
 """
 from __future__ import annotations
 
+import os
+import shutil
+from pathlib import Path
+
 import pytest
 
 from rdf2vecgpu.config import RDF2VecConfig
@@ -1359,11 +1363,71 @@ def test_read_vocab_slice_sorts_unordered_rows_and_rejects_gaps(tmp_path):
     shuffled = str(tmp_path / "shuffled.parquet")
     _write_vocab_parquet(shuffled, ents, row_group_size=8,
                          order=np.random.default_rng(0).permutation(30))
-    assert _read_vocab_slice(shuffled, 5, 20).to_pylist() == ents[5:20]
+    got = _read_vocab_slice(shuffled, 5, 20)
+    assert got.to_pylist() == ents[5:20]
+    # int64 offsets, whatever the file holds: the sort materialises the whole
+    # block as one array, and a full-Wikidata rank block is > 2 GiB of IRIs.
+    import pyarrow as pa
+    assert got.type == pa.large_string()
+    assert _read_vocab_slice(shuffled, 30, 30).type == pa.large_string()
     gap = str(tmp_path / "gap.parquet")
     _write_vocab_parquet(gap, ents, row_group_size=8, order=[i for i in range(30) if i != 12])
     with pytest.raises(RuntimeError, match="contiguous"):
         _read_vocab_slice(gap, 5, 20)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("RDF2VEC_BIG_TESTS"),
+    reason="writes a ~2.3 GB parquet and holds ~5 GB; set RDF2VEC_BIG_TESTS=1 (or =<dir>)",
+)
+def test_read_vocab_slice_survives_a_block_over_2gib_of_strings(tmp_path):
+    """Regression for 2026-09-14 job 14697728: a full-Wikidata rank block is
+    49M IRIs ≈ 2.3 GB of entity bytes, over the 2 GiB cap of a ``string``
+    array's int32 offsets, and the Wikidata vocab's row groups are not in
+    token-id order — so the reader's sort/take materialised the block as one
+    ``string`` array and died with ``ArrowInvalid: offset overflow``. Two
+    out-of-order row groups of 1.15 GB each reproduce both conditions."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+    from rdf2vecgpu.embedders.torchrec_word2vec import _read_vocab_slice
+
+    big = os.environ["RDF2VEC_BIG_TESTS"]
+    base = tmp_path if big == "1" else Path(big) / f"vocab_slice_big_{os.getpid()}"
+    base.mkdir(parents=True, exist_ok=True)
+    path = str(base / "vocab.parquet")
+    n, width = 1_150_000, 2_000                      # 2.3e9 bytes > 2**31
+    half = n // 2
+    # second half first, so the reader has to sort — and every value unique,
+    # so a wrong ``take`` would be caught by the spot checks below.
+    ids = pa.array(list(range(half, n)) + list(range(0, half)), pa.int64())
+    ents = pc.utf8_lpad(pc.cast(ids, pa.large_string()), width, "x")
+    # store_schema=False: read back as plain ``string`` (what prepare_corpus /
+    # make_vocab_parquet.py write), not as the large_string we built it from.
+    pq.write_table(pa.table({"token_id": ids, "entity": ents}), path,
+                   row_group_size=half, store_schema=False)
+    del ids, ents
+    pf = pq.ParquetFile(path)
+    assert pf.metadata.num_row_groups == 2
+    assert pf.schema_arrow.field("entity").type == pa.string()
+
+    # the failure mode the reader must avoid: one int32-offset array of the block
+    t = pa.concat_tables([pf.read_row_group(i, columns=["token_id", "entity"]) for i in (0, 1)])
+    with pytest.raises(pa.ArrowInvalid, match="offset overflow"):
+        t.take(pc.sort_indices(t, sort_keys=[("token_id", "ascending")]))
+    del t
+
+    got = _read_vocab_slice(path, 0, n)
+    assert got.type == pa.large_string() and len(got) == n
+    for i in (0, 1, half - 1, half, n - 1):
+        assert got[i].as_py() == str(i).rjust(width, "x")
+    del got
+    got = _read_vocab_slice(path, half - 3, half + 3)
+    assert [s.as_py()[-8:] for s in got] == [str(i).rjust(8, "x") for i in range(half - 3, half + 3)]
+    try:
+        shutil.rmtree(base)
+    except OSError:
+        pass
 
 
 def test_iter_local_embedding_chunks_streams_unsharded_table_in_order(tmp_path):

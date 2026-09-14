@@ -178,6 +178,25 @@ slice comes from the row groups of `vocab.parquet` that cover the block.
 line, e.g. the GEval gold entities) filter rows before writing — unfiltered,
 the Wikidata TSV would be ~320 GB.
 
+First full-scale export attempt (2026-09-14, job 14697728, 8× H200): rank 0
+died in `_read_vocab_slice` with `ArrowInvalid: offset overflow while
+concatenating arrays` two minutes in. A rank block is 49,113,786 IRIs =
+2.6 GiB of entity bytes — over the 2 GiB cap of a pyarrow `string` array —
+and the Wikidata `vocab.parquet` row groups are *not* in token-id order
+(dbpedia2016's are), so the reader's sort materialised the whole block as one
+`string` array. dbpedia2016 never hit it: 0.04 GiB per rank. The reader now
+promotes the column to `large_string` on read (verified on the real rank-0
+block: 10 s, 10 GB RSS); `RDF2VEC_BIG_TESTS=1 pytest -k over_2gib` runs the
+2.3 GB regression. The e5 sibling (14697730) failed differently the same
+night: three of eight ranks never produced their first batch inside the NCCL
+watchdog's 10 min (nothing in the log from them), so `bench_backends.py` now
+opens the process group with a 30 min timeout
+(`RDF2VEC_TORCHREC_PG_TIMEOUT_MIN`) + `device_id`, every rank logs
+`first batch of epoch N ready after S s`, and a rank still waiting after
+5 min dumps its thread stacks (`[torchrec] STALL …`). The A100 siblings were
+still pending, so the two H200 jobs were resubmitted with the same
+`RACE_GROUP`s behind a fresh `gpu_tests.sbatch` gate.
+
 d200 → same but `--gres=gpu:H200:8`, `VECTOR_SIZE=200` (A100/80 is too tight:
 79 GB/GPU of tables before activations).
 

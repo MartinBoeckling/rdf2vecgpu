@@ -378,7 +378,20 @@ def run_torchrec(args) -> dict | None:
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    # This is THE process group of the run — Fabric finds it initialised and
+    # keeps it, so its timeout (not Lightning's 30 min default) is what the
+    # NCCL watchdog enforces. torch's NCCL default is 10 min, which 2026-09-14
+    # job 14697730 tripped while three ranks were still producing their first
+    # batch (start-up on a full-Wikidata node: 11k walk files on GPFS, 3 GB of
+    # token counts, ~300 GB of tables). 30 min of start-up slack; a real
+    # deadlock still dies, half an hour later. device_id pins each rank's NCCL
+    # communicator to its own GPU instead of guessing it from the global rank.
+    from datetime import timedelta
+    dist.init_process_group(
+        backend="nccl", rank=rank, world_size=world_size,
+        timeout=timedelta(minutes=int(os.environ.get("RDF2VEC_TORCHREC_PG_TIMEOUT_MIN", "30"))),
+        device_id=torch.device("cuda", local_rank),
+    )
 
     metrics = _common_metrics(args, "torchrec")
     metrics["world_size"] = world_size

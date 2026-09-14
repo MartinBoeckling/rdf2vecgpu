@@ -242,6 +242,45 @@ def _env_progress_enabled() -> bool:
     )
 
 
+def _start_stall_reporter(label: str, *, after_s: float = 300.0, every_s: float = 300.0):
+    """Daemon thread that prints every Python thread's stack of this process,
+    tagged ``label``, if the returned ``threading.Event`` is still clear after
+    ``after_s`` seconds — and again every ``every_s`` until it is set. Setting
+    the event ends the thread; a set event before the deadline costs nothing.
+
+    Wrapped around the first ``next()`` of an epoch: 2026-09-14 job 14697730
+    lost ranks 1, 2 and 5 there for over ten minutes — the other five ranks
+    reached the first-batch all_reduce, the NCCL watchdog fired, and the log
+    held nothing at all from the three stalled ranks. A rank that stalls
+    there now says where it sits (loader thread included) before the
+    process group gives up on it.
+    """
+    import sys
+    import threading
+    import time
+    import traceback
+
+    stop = threading.Event()
+    t0 = time.monotonic()
+
+    def run():
+        wait = after_s
+        while not stop.wait(wait):
+            me = threading.get_ident()
+            names = {t.ident: t.name for t in threading.enumerate()}
+            out = [f"[torchrec] STALL {label}: {time.monotonic() - t0:.0f} s and counting; thread stacks:"]
+            for tid, frame in sys._current_frames().items():
+                if tid == me:
+                    continue
+                out.append(f"  --- thread {names.get(tid, '?')} ({tid})")
+                out.extend("  " + line.rstrip("\n") for line in traceback.format_stack(frame))
+            print("\n".join(out), flush=True)
+            wait = every_s
+
+    threading.Thread(target=run, name="torchrec-stall-reporter", daemon=True).start()
+    return stop
+
+
 class _ProgressMeter:
     """Decides when to emit a torchrec training-progress point and formats it.
 
@@ -606,13 +645,22 @@ def _is_sharded_module(module) -> bool:
 
 def _read_vocab_slice(vocab_path: str, start: int, end: int):
     """Host-side ``entity`` strings for token ids ``[start, end)`` of the
-    corpus ``vocab.parquet``, in token-id order, as a ``pyarrow`` ChunkedArray.
+    corpus ``vocab.parquet``, in token-id order, as a ``pyarrow`` ChunkedArray
+    of ``large_string``.
 
     Reads only the row groups whose ``token_id`` statistics overlap the range
     (``prepare_corpus`` writes the vocab in token-id order, so that is one
     contiguous run of row groups) and scans any row group that carries no
     statistics. The result is verified to be exactly ``range(start, end)``:
     a gap or duplicate would silently mislabel every row after it.
+
+    The entity column is promoted to ``large_string`` (int64 offsets) as soon
+    as it is read: a ``string`` array caps at 2 GiB of bytes, and a
+    full-Wikidata rank block (49M IRIs ≈ 2.3 GB) crosses that the moment the
+    sort below materialises the block as one array — 2026-09-14 job 14697728
+    died there with ``ArrowInvalid: offset overflow while concatenating
+    arrays``. The Wikidata vocab's row groups are not in token-id order, so
+    the sort path is the normal path at that scale, not a fallback.
     """
     import numpy as np
     import pyarrow as pa
@@ -630,9 +678,11 @@ def _read_vocab_slice(vocab_path: str, start: int, end: int):
         tid = t.column("token_id")
         t = t.filter(pc.and_(pc.greater_equal(tid, start), pc.less(tid, end)))
         if t.num_rows:
+            ent_idx = t.schema.get_field_index("entity")
+            t = t.set_column(ent_idx, "entity", t.column("entity").cast(pa.large_string()))
             parts.append(t)
     table = pa.concat_tables(parts) if parts else pa.table(
-        {"token_id": pa.array([], pa.int64()), "entity": pa.array([], pa.string())}
+        {"token_id": pa.array([], pa.int64()), "entity": pa.array([], pa.large_string())}
     )
     ids = table.column("token_id").to_numpy()
     if ids.shape[0] and not np.all(np.diff(ids) == 1):
@@ -1066,14 +1116,34 @@ def train_torchrec_word2vec(rdf2vec, walks_path, vocab_path) -> None:
     step_sync = _env_step_sync_enabled() and not prof.enabled   # the profiler drains itself
     if fabric.is_global_zero:
         print(f"[torchrec] per-step device sync: {'on' if step_sync or prof.enabled else 'off'}", flush=True)
+    who = f"rank {fabric.global_rank}/{fabric.world_size}"
     for epoch in range(start_epoch, cfg.epochs):
         data_iter = iter(loader)
+        first_pending = True
         while True:
             if step_sync:
                 torch.cuda.synchronize(fabric.device)
             prof.drain()
             prof.begin("next")
+            if first_pending:
+                # Every rank reports its first batch (not just rank 0): the
+                # first ``next()`` reads the first walk file and starts the
+                # prefetch thread, and a rank that never gets past it is
+                # otherwise invisible until the NCCL watchdog kills the job.
+                # NB: the gpu8 race claim greps "[torchrec] epoch|resumed" —
+                # this line must not start with either word.
+                t_first = time.monotonic()
+                stall = _start_stall_reporter(f"{who} waiting for the first batch of epoch {epoch}")
             batch = next(data_iter, None)
+            if first_pending:
+                stall.set()
+                first_pending = False
+                print(
+                    f"[torchrec] {who}: first batch of epoch {epoch} "
+                    f"{'ready' if batch is not None else 'ABSENT (loader yielded nothing)'} "
+                    f"after {time.monotonic() - t_first:.1f} s",
+                    flush=True,
+                )
             prof.end("next")
             prof.begin("join")
             have = torch.ones(1, device=fabric.device, dtype=torch.int32)
