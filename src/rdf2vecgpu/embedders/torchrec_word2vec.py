@@ -233,6 +233,27 @@ def _env_step_sync_enabled() -> bool:
     )
 
 
+def _host_mem_gib() -> tuple[float, float]:
+    """This process's current and peak resident host memory in GiB
+    (``VmRSS`` / ``VmHWM`` from ``/proc/self/status``; ``(nan, nan)`` where
+    procfs is absent). Logged per rank at checkpoints and first batches:
+    2026-09-21 job 14697729 (8x A100, 1500G) was OOM-killed writing its
+    epoch-end checkpoint at 1.57 TB total, 450 GB above what the same epoch
+    peaked at on the H200 node two weeks earlier, with nothing in the log to
+    say whether that was growth over the epoch or a spike in the save."""
+    cur = peak = float("nan")
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    cur = int(line.split()[1]) / 2**20
+                elif line.startswith("VmHWM:"):
+                    peak = int(line.split()[1]) / 2**20
+    except OSError:
+        pass
+    return cur, peak
+
+
 def _env_progress_enabled() -> bool:
     """Convenience override so the SLURM harness can flip the progress print
     without touching config plumbing: RDF2VEC_TORCHREC_PROGRESS=1."""
@@ -306,9 +327,12 @@ class _ProgressMeter:
             dt = now - self._last_time
             sps = (step - self._last_step) / dt if dt > 0 else 0.0
         self._last_step, self._last_time = step, now
+        # rank 0's own resident host memory: a slow climb over an epoch is
+        # visible here long before a checkpoint's spike lands on top of it.
+        rss, _ = _host_mem_gib()
         return (
             f"[torchrec] epoch {epoch} | step {step:,} | "
-            f"loss {loss:.4f} | {sps:.1f} steps/s"
+            f"loss {loss:.4f} | {sps:.1f} steps/s | rss {rss:.1f} GiB"
         )
 
 
@@ -789,6 +813,7 @@ def _save_checkpoint(
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     # DCP save into the .tmp directory: all ranks participate.
+    rss0, hwm0 = _host_mem_gib()
     state_dict = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -796,6 +821,12 @@ def _save_checkpoint(
     dcp.save(
         state_dict=state_dict,
         storage_writer=dcp.FileSystemWriter(str(tmp_dir)),
+    )
+    rss1, hwm1 = _host_mem_gib()
+    print(
+        f"[torchrec] rank {rank}: checkpoint {final_name} written; host RSS "
+        f"{rss0:.1f} -> {rss1:.1f} GiB, peak {hwm0:.1f} -> {hwm1:.1f} GiB",
+        flush=True,
     )
 
     # Barrier so every rank has finished writing into .tmp before
@@ -1138,10 +1169,11 @@ def train_torchrec_word2vec(rdf2vec, walks_path, vocab_path) -> None:
             if first_pending:
                 stall.set()
                 first_pending = False
+                rss, hwm = _host_mem_gib()
                 print(
                     f"[torchrec] {who}: first batch of epoch {epoch} "
                     f"{'ready' if batch is not None else 'ABSENT (loader yielded nothing)'} "
-                    f"after {time.monotonic() - t_first:.1f} s",
+                    f"after {time.monotonic() - t_first:.1f} s; host RSS {rss:.1f} GiB, peak {hwm:.1f} GiB",
                     flush=True,
                 )
             prof.end("next")
