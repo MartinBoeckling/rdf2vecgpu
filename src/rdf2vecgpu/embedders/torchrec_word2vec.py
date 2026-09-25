@@ -372,10 +372,20 @@ def _build_sharding_plan(
     # is physically cuda:0). Derive it from the elastic env; falls back to
     # world_size for a single-node job (unchanged behaviour).
     local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "0")) or world_size
+    # hbm_cap: the planner's default is a 32 GB GPU (torchrec HBM_CAP). A
+    # full-Wikidata d100 rank block is 2 x 18.3 GiB of tables, so under that
+    # default the planner could place only ONE table device-resident and put
+    # the other on a UVM-caching kernel: 18.3 GiB per rank of pinned HOST
+    # memory behind a 4 GiB GPU cache (probe 2026-09-25, job 14908855). That
+    # is where the training's ~140 GB host RSS per rank came from, and every
+    # cache miss on the in-table crossed PCIe — 48 steps/s on A100 vs 80 on
+    # H200. Telling the planner the real per-GPU memory puts both tables on
+    # the device (36.6 GiB per rank; fits A100-80GB and H200-141GB).
     topology = Topology(
         world_size=world_size,
         local_world_size=local_world_size,
         compute_device=device.type,  # "cuda"
+        hbm_cap=_planner_hbm_cap(device),
     )
     constraints = None
     if world_size > 1:
@@ -396,8 +406,50 @@ def _build_sharding_plan(
     if pg is None and dist.is_available() and dist.is_initialized():
         pg = dist.group.WORLD
     if pg is not None:
-        return planner.collective_plan(model, sharders, pg)
-    return planner.plan(model, sharders=sharders)
+        plan = planner.collective_plan(model, sharders, pg)
+    else:
+        plan = planner.plan(model, sharders=sharders)
+    _print_plan_kernels(plan, pg)
+    return plan
+
+
+def _planner_hbm_cap(device: torch.device) -> int | None:
+    """Per-GPU memory in bytes to hand the torchrec planner as ``hbm_cap``.
+
+    ``RDF2VEC_TORCHREC_HBM_CAP_GB`` overrides (a small value forces the UVM
+    kernels on purpose — the 2026-09-25 kernel-swap test used 2 GB on
+    dbpedia); otherwise the real capacity of the compute device; ``None``
+    (the planner's own 32 GB default) off-CUDA, where no table is placed on
+    a device anyway.
+    """
+    env = os.environ.get("RDF2VEC_TORCHREC_HBM_CAP_GB", "").strip()
+    if env:
+        return int(float(env) * 1024**3)
+    if device.type == "cuda" and torch.cuda.is_available():
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        return int(torch.cuda.get_device_properties(idx).total_memory)
+    return None
+
+
+def _print_plan_kernels(plan, pg) -> None:
+    """One line per table on rank 0: sharding type, compute kernel, ranks.
+    The kernel decides where the table lives (``fused`` = device,
+    ``fused_uvm*`` = host memory) — the log never said, and it took a
+    separate probe to learn the in-table had been host-resident all along."""
+    import torch.distributed as dist
+
+    if pg is not None and dist.is_initialized() and dist.get_rank(pg) != 0:
+        return
+    try:
+        for module_path, tables in plan.plan.items():
+            for name, ps in tables.items():
+                print(
+                    f"[torchrec] plan: {module_path}/{name}: sharding={ps.sharding_type} "
+                    f"kernel={ps.compute_kernel} ranks={ps.ranks}",
+                    flush=True,
+                )
+    except AttributeError as exc:  # a plan type without .plan (tests may stub it)
+        print(f"[torchrec] plan: (not printable: {exc})", flush=True)
 
 
 class ShardedSkipGramModel(nn.Module):

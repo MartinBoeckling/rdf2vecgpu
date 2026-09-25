@@ -323,6 +323,34 @@ def test_sharded_skipgram_forward_loss_closed_form_with_zero_embeddings():
             dist.destroy_process_group()
 
 
+def test_planner_hbm_cap_env_override_and_cpu_default(monkeypatch):
+    """The planner must be told the real per-GPU memory: its own default is
+    32 GB, under which a 2 x 18.3 GiB Wikidata rank block gets one table on a
+    host-resident UVM kernel (job 14908855's probe). Env override first, the
+    planner default (None) off-CUDA."""
+    import torch
+    from rdf2vecgpu.embedders.torchrec_word2vec import _planner_hbm_cap
+
+    monkeypatch.setenv("RDF2VEC_TORCHREC_HBM_CAP_GB", "2")
+    assert _planner_hbm_cap(torch.device("cuda")) == 2 * 1024**3
+    assert _planner_hbm_cap(torch.device("cpu")) == 2 * 1024**3
+    monkeypatch.setenv("RDF2VEC_TORCHREC_HBM_CAP_GB", "0.5")
+    assert _planner_hbm_cap(torch.device("cpu")) == 512 * 1024**2
+    monkeypatch.delenv("RDF2VEC_TORCHREC_HBM_CAP_GB")
+    assert _planner_hbm_cap(torch.device("cpu")) is None
+    assert _planner_hbm_cap(torch.device("meta")) is None
+
+
+@pytest.mark.gpu
+def test_planner_hbm_cap_is_the_device_memory():
+    import torch
+    from rdf2vecgpu.embedders.torchrec_word2vec import _planner_hbm_cap
+
+    cap = _planner_hbm_cap(torch.device("cuda"))
+    assert cap == torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+    assert cap > 32 * 1024**3 or cap == torch.cuda.get_device_properties(0).total_memory
+
+
 @pytest.mark.gpu
 def test_build_sharding_plan_returns_plan_with_both_tables():
     import os
