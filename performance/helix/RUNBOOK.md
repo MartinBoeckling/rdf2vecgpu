@@ -199,8 +199,15 @@ OOM-killed at its epoch-0 checkpoint at the 1500G ceiling where the H200 e1 run
    caching *pinned* allocator (`to("cpu", non_blocking=True)`), which rounds each
    block up to a power of two and keeps it. The A100 run wrote three checkpoints
    before its epoch end where the H200 run wrote two — the "extra 450 GB".
-   Fixed in 0ca2364: `_checkpoint_writer` sets `per_thread_copy_ahead=0` (serial
-   loader, pageable `.cpu()`); `RDF2VEC_DCP_COPY_AHEAD_BYTES` restores the default.
+   Fixed in two steps. 0ca2364: `_checkpoint_writer` sets `per_thread_copy_ahead=0`
+   (serial loader, pageable `.cpu()`; `RDF2VEC_DCP_COPY_AHEAD_BYTES` restores the
+   default) — that turned the +8 GiB of pinned memory per save into +4.7 GiB of
+   anonymous heap per save, still never returned. `performance/helix/probe_dcp_memory.py`
+   (job 14920067) then showed `gc.collect()` + `malloc_trim(0)` after each save keeps
+   RSS flat (0.59 GiB over four saves; the staged CPU tensors sit in reference
+   cycles and glibc keeps the freed arenas), so `_save_checkpoint` now calls
+   `_release_host_memory()` after `dcp.save` and logs `host RSS before -> saved ->
+   released`. Verified on dbpedia, 1 GPU: `memprobe/ckptfix2_*` logs.
 
 The loader is not involved: `performance/helix/probe_loader_memory.py` streamed a
 full Wikidata epoch (671,187 batches) on cpu-single at a flat 0.8 GiB RSS, at
