@@ -178,6 +178,37 @@ slice comes from the row groups of `vocab.parquet` that cover the block.
 line, e.g. the GEval gold entities) filter rows before writing — unfiltered,
 the Wikidata TSV would be ~320 GB.
 
+**Host memory (2026-09-25/26).** The 8× A100 e5 run (14697729) was
+OOM-killed at its epoch-0 checkpoint at the 1500G ceiling where the H200 e1 run
+(14636218) had peaked at 1.12 TB. Two independent causes, both fixed:
+
+1. *Planner HBM default.* `torchrec.Topology` assumes a 32 GB GPU unless told
+   otherwise, and the trainer never told it. A full-Wikidata d100 rank block is
+   2 × 18.3 GiB, so the planner put the in-table on `fused_uvm_caching`: 18.3 GiB
+   per rank of pinned host memory behind a 4 GiB GPU cache
+   (`performance/helix/probe_sharding_plan.py`, job 14908855; with hbm_cap 80 or
+   141 GB both tables are `fused`). That is also the A100/H200 step-rate gap (48 vs
+   80 steps/s — in-table cache misses crossed PCIe). Fixed in 9e12b0b:
+   `_planner_hbm_cap` passes the device's real memory (`RDF2VEC_TORCHREC_HBM_CAP_GB`
+   overrides) and rank 0 logs `[torchrec] plan: ... kernel=...`. A checkpoint
+   written under the UVM plan resumes under the fused plan unchanged (dbpedia,
+   1 GPU, jobs 14912432 → 14919655: loss continuous, 1.5 → 22.5 steps/s).
+2. *Checkpoint writer.* Every `dcp.save` added host RSS that never came back
+   (+8 GiB per save for two 2.35 GiB tables, under either kernel): torch's
+   `FileSystemWriter` with one write thread stages device tensors through the
+   caching *pinned* allocator (`to("cpu", non_blocking=True)`), which rounds each
+   block up to a power of two and keeps it. The A100 run wrote three checkpoints
+   before its epoch end where the H200 run wrote two — the "extra 450 GB".
+   Fixed in 0ca2364: `_checkpoint_writer` sets `per_thread_copy_ahead=0` (serial
+   loader, pageable `.cpu()`); `RDF2VEC_DCP_COPY_AHEAD_BYTES` restores the default.
+
+The loader is not involved: `performance/helix/probe_loader_memory.py` streamed a
+full Wikidata epoch (671,187 batches) on cpu-single at a flat 0.8 GiB RSS, at
+~84 batches/s per rank — which also means the H200 run's 80 steps/s was
+loader-bound; that is the next throughput target now that the tables are fused.
+Every rank prints its RSS/HWM at checkpoints and first batches and rank 0's
+progress line carries its RSS (4d26e32), so a rerun shows the curve directly.
+
 First full-scale export attempt (2026-09-14, job 14697728, 8× H200): rank 0
 died in `_read_vocab_slice` with `ArrowInvalid: offset overflow while
 concatenating arrays` two minutes in. A rank block is 49,113,786 IRIs =
