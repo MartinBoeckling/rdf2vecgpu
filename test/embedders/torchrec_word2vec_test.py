@@ -323,6 +323,23 @@ def test_sharded_skipgram_forward_loss_closed_form_with_zero_embeddings():
             dist.destroy_process_group()
 
 
+def test_checkpoint_writer_disables_pinned_copy_ahead(tmp_path, monkeypatch):
+    """torch's default copy-ahead stages device tensors through the caching
+    pinned allocator (power-of-two blocks, never released): +8 GiB of host
+    RSS per checkpoint for two 2.35 GiB tables, measured 2026-09-26. Off by
+    default here; the env knob restores torch's behaviour for comparison."""
+    from rdf2vecgpu.embedders.torchrec_word2vec import _checkpoint_writer
+
+    monkeypatch.delenv("RDF2VEC_DCP_COPY_AHEAD_BYTES", raising=False)
+    w = _checkpoint_writer(tmp_path / "ckpt")
+    assert w.per_thread_copy_ahead == 0
+    assert w.thread_count == 1
+    monkeypatch.setenv("RDF2VEC_DCP_COPY_AHEAD_BYTES", "10000000")
+    assert _checkpoint_writer(tmp_path / "ckpt").per_thread_copy_ahead == 10_000_000
+    monkeypatch.setenv("RDF2VEC_DCP_COPY_AHEAD_BYTES", "")
+    assert _checkpoint_writer(tmp_path / "ckpt").per_thread_copy_ahead == 0
+
+
 def test_planner_hbm_cap_env_override_and_cpu_default(monkeypatch):
     """The planner must be told the real per-GPU memory: its own default is
     32 GB, under which a 2 x 18.3 GiB Wikidata rank block gets one table on a

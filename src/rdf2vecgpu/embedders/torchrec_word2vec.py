@@ -812,6 +812,29 @@ def iter_local_embedding_chunks(model, vocab_path: str, *, chunk_rows: int = 1_0
         )
 
 
+def _checkpoint_writer(tmp_dir):
+    """``FileSystemWriter`` for :func:`_save_checkpoint` with the GPU->host
+    copy-ahead turned OFF (``per_thread_copy_ahead=0``; env
+    ``RDF2VEC_DCP_COPY_AHEAD_BYTES`` restores torch's 10 MB default).
+
+    With copy-ahead on (torch's default for a single write thread) the
+    writer stages every device tensor with ``to("cpu", non_blocking=True)``,
+    i.e. through the caching *pinned* host allocator, which rounds each
+    block up to a power of two and keeps it. Measured 2026-09-26 (jobs
+    14912432 / 14919655, dbpedia on one A100, tables 2 x 2.35 GiB): host RSS
+    rose by exactly 8 GiB = 2 x 4 GiB at EVERY checkpoint and never came
+    back, under both the UVM and the fused kernel, until the 64G job was
+    OOM-killed. At Wikidata scale that is 2 x 32 GiB per rank per save —
+    what killed the 8x A100 run (14697729) at its third checkpoint. With
+    copy-ahead off the writer's serial loader copies with a blocking
+    ``.cpu()`` into pageable memory that is freed after the write.
+    """
+    import torch.distributed.checkpoint as dcp
+
+    ahead = int(os.environ.get("RDF2VEC_DCP_COPY_AHEAD_BYTES", "0") or 0)
+    return dcp.FileSystemWriter(str(tmp_dir), per_thread_copy_ahead=ahead)
+
+
 def _save_checkpoint(
     model,
     optimizer,
@@ -872,7 +895,7 @@ def _save_checkpoint(
     }
     dcp.save(
         state_dict=state_dict,
-        storage_writer=dcp.FileSystemWriter(str(tmp_dir)),
+        storage_writer=_checkpoint_writer(tmp_dir),
     )
     rss1, hwm1 = _host_mem_gib()
     print(
