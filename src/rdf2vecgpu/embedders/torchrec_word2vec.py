@@ -835,6 +835,30 @@ def _checkpoint_writer(tmp_dir):
     return dcp.FileSystemWriter(str(tmp_dir), per_thread_copy_ahead=ahead)
 
 
+def _release_host_memory() -> None:
+    """Give the host copies a checkpoint leaves behind back to the OS.
+
+    Measured 2026-09-26 (``performance/helix/probe_dcp_memory.py``, job
+    14920067, 2 x 2.35 GiB device tensors saved four times on one A100): with
+    the copy-ahead-free writer every ``dcp.save`` still left +4.7 GiB of
+    *anonymous* RSS behind (5.3 -> 10.0 -> 14.7 -> 19.4 GiB); a
+    ``gc.collect()`` plus ``malloc_trim(0)`` after each save kept it flat at
+    0.59 GiB. Two mechanisms, both benign on their own: the writer's staged
+    CPU tensors sit in reference cycles until a collector pass, and glibc
+    keeps the freed arenas. At Wikidata scale the uncollected copies are
+    36.6 GiB per rank per save. ``malloc_trim`` is glibc-only; elsewhere the
+    collector pass alone still runs.
+    """
+    import ctypes
+    import gc
+
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
 def _save_checkpoint(
     model,
     optimizer,
@@ -897,10 +921,14 @@ def _save_checkpoint(
         state_dict=state_dict,
         storage_writer=_checkpoint_writer(tmp_dir),
     )
+    rss_saved, _ = _host_mem_gib()
+    del state_dict
+    _release_host_memory()
     rss1, hwm1 = _host_mem_gib()
     print(
         f"[torchrec] rank {rank}: checkpoint {final_name} written; host RSS "
-        f"{rss0:.1f} -> {rss1:.1f} GiB, peak {hwm0:.1f} -> {hwm1:.1f} GiB",
+        f"{rss0:.1f} -> {rss_saved:.1f} -> {rss1:.1f} GiB after release, "
+        f"peak {hwm0:.1f} -> {hwm1:.1f} GiB",
         flush=True,
     )
 

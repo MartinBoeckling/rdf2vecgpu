@@ -340,6 +340,25 @@ def test_checkpoint_writer_disables_pinned_copy_ahead(tmp_path, monkeypatch):
     assert _checkpoint_writer(tmp_path / "ckpt").per_thread_copy_ahead == 0
 
 
+def test_release_host_memory_returns_freed_heap():
+    """After a large CPU tensor is dropped, the release step must bring RSS
+    back down (the checkpoint writer leaves its staged copies in exactly this
+    state); it must also be a harmless no-op when there is nothing to free."""
+    import torch
+    from rdf2vecgpu.embedders.torchrec_word2vec import _host_mem_gib, _release_host_memory
+
+    _release_host_memory()
+    base, _ = _host_mem_gib()
+    t = torch.ones(256 * 2**20 // 4, dtype=torch.float32)   # 256 MiB, touched
+    high, _ = _host_mem_gib()
+    assert high - base > 0.2
+    del t
+    _release_host_memory()
+    low, _ = _host_mem_gib()
+    assert low - base < 0.05, (base, high, low)
+    _release_host_memory()   # nothing to free: no error
+
+
 def test_planner_hbm_cap_env_override_and_cpu_default(monkeypatch):
     """The planner must be told the real per-GPU memory: its own default is
     32 GB, under which a 2 x 18.3 GiB Wikidata rank block gets one table on a
