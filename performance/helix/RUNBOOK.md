@@ -178,6 +178,18 @@ slice comes from the row groups of `vocab.parquet` that cover the block.
 line, e.g. the GEval gold entities) filter rows before writing — unfiltered,
 the Wikidata TSV would be ~320 GB.
 
+**Full-Wikidata d100, 5 epochs (2026-09-28, job 14881669, 8× H200 `o09c01`, won
+the race; the A100 sibling was cancelled while pending): resumed the 09-21
+checkpoint (step 624,453; the loader has no batch offset, so epoch 0 re-ran from
+its start — 5.93 epochs of data in total, step numbering offset by 624,453),
+fit 44,225 s = 12.3 h at 82.6 steps/s mean / 87 steady (2.07 h per epoch,
+loader-bound), peak VRAM 42.8 GiB/GPU with both tables `fused`, host RSS
+5.1 GiB per rank flat with every checkpoint a transient 5.1 → 41.7 → 5.1 GiB
+(11 checkpoints), job MaxRSS 347 GB (`--mem=2000G` — 1500G would have done),
+export of 124,936,230 Q-entities = 122 GB TSV in 15 min; wall 12 h 35 min.
+Results in `results/wikidata_d100_e5/` (`entities.tsv`, `run.jsonl`, two 293 GB
+checkpoints). The tree was a4089f9.**
+
 **Host memory (2026-09-25/26).** The 8× A100 e5 run (14697729) was
 OOM-killed at its epoch-0 checkpoint at the 1500G ceiling where the H200 e1 run
 (14636218) had peaked at 1.12 TB. Two independent causes, both fixed:
