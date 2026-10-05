@@ -190,6 +190,40 @@ export of 124,936,230 Q-entities = 122 GB TSV in 15 min; wall 12 h 35 min.
 Results in `results/wikidata_d100_e5/` (`entities.tsv`, `run.jsonl`, two 293 GB
 checkpoints). The tree was a4089f9.**
 
+**Full-Wikidata d200, 5 epochs (2026-10-04/05, job 14984051, 8× H200 `o08c02`;
+H200 only — 73.2 GiB of tables per rank would not fit `fused` on A100-80GB):
+3,355,935 steps at 57.1 steps/s mean / 58.6 median, i.e. 3.2 h per epoch — at
+d200 the step is bound by the cross-GPU exchange, not the loader (see below) —
+loss 388k → 63k, both tables `fused`, host RSS 5.2 GiB per rank with every one of
+13 checkpoints a transient 5.2 → 78.4 → 5.2 GiB, job MaxRSS 671 GB (`--mem=1500G`),
+GPU memory 718 GB over the 8 cards. The final checkpoint `step_03355935` was
+written at 17 h 34 min; the 18 h limit then cut the in-job export (TIMEOUT).
+The TSV was written from the checkpoint on CPU nodes instead
+(`export_from_checkpoint.py`, eight cpu-single jobs of 35–41 min + concat):
+`results/wikidata_d200_e5/entities_cpu.tsv`, 124,936,230 Q-entities, 201
+columns, 239 GB; its first 26 GB are byte-identical to the truncated GPU shard.
+For a d200 rerun use `--time=24:00:00`.**
+
+**CPU export from a checkpoint.** `performance/helix/export_from_checkpoint.py
+--ckpt <step dir or ckpt root> --vocab <vocab.parquet> --out <tsv> --rank R`
+writes one rank's block (one job per rank, ~2.2× the block size in RAM: 18.3 GiB
+blocks at d100, 36.6 GiB at d200; ~21 / ~37 min per rank), `--concat` joins the
+shards. Same filter options and the same `_write_kgreat_rows` as the trainer —
+byte-identical output (checked at d100 for ranks 0 and 1 and at d200 for 26 GB of
+rank 0). Use it for re-exports with a different entity filter too: no GPU queue.
+
+**Why d200 is slower per step (dbpedia probes, 2× A100, 131,072 pairs per rank,
+jobs 15184165–68):** d100 55.8 steps/s with 17.7 ms of GPU work per step, d200
+32.9 steps/s with 30.2 ms (×1.70; loader wait 0.4 ms in both). Rank 0's kernel
+table: `nccl:all_to_all` 40 % → 43 % and exactly doubling (10 calls per step),
+`fbgemm::permute_1D_sparse_data` 11 %, gradient scatter (`index_add_`) 8–10 %,
+element-wise logit math 8–9 %; the embedding-table kernels are not among the top
+entries. So the step is dominated by moving looked-up vectors and gradients
+between GPUs. Applying ×1.70 to the H200 d200 step (17.1 ms) puts the d100 GPU
+work at ~10 ms, just under the loader's 11.7 ms period: d100 was mildly
+loader-bound, d200 is exchange-bound. Untested levers: `EmbeddingCollectionSharder(
+use_index_dedup=True)` (negatives repeat frequent tokens), batch-shared negatives.
+
 **Host memory (2026-09-25/26).** The 8× A100 e5 run (14697729) was
 OOM-killed at its epoch-0 checkpoint at the 1500G ceiling where the H200 e1 run
 (14636218) had peaked at 1.12 TB. Two independent causes, both fixed:
