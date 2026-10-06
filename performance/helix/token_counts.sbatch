@@ -23,4 +23,4 @@ WS="${WS:-$(ws_find rdf2vec_resource 2>/dev/null || echo "$HOME")}"
 CORPUS=${CORPUS:-$WS/corpus/wikidata_v100}
 echo "[token_counts] host=$(hostname -s) job=${SLURM_JOB_ID:-NA} corpus=$CORPUS cpus=${SLURM_CPUS_PER_TASK:-?}"
 
-python performance/helix/make_token_counts.py "$CORPUS" --workers "${SLURM_CPUS_PER_TASK:-8}"
+python performance/helix/make_token_counts.py "$CORPUS"   # workers fitted to --mem (see --workers 0)

@@ -865,57 +865,116 @@ class InMemoryWalkSeqDataModule(L.LightningDataModule):
 
 
 def _file_token_uniques(fp):
-    """One walks shard -> ``(unique token ids, counts)`` over the ``vertices`` +
-    ``predicates`` list columns, ``-1`` cuGraph sentinels dropped. Module-level
-    (not a closure) so it pickles into ProcessPool workers."""
-    tbl = pq.read_table(fp, columns=["vertices", "predicates"])
+    """One whole walks shard -> ``(unique token ids, counts)``; see
+    :func:`_chunk_token_uniques` for the bounded-memory form the corpus
+    pass uses. Kept for callers that hand in small files."""
+    md = pq.ParquetFile(fp).metadata
+    return _chunk_token_uniques(fp, 0, md.num_row_groups)
+
+
+def _chunk_token_uniques(fp, rg_lo, rg_hi):
+    """Row groups ``[rg_lo, rg_hi)`` of one walks shard -> ``(unique token ids,
+    counts)`` over the ``vertices`` + ``predicates`` list columns, ``-1``
+    cuGraph sentinels dropped. Module-level (not a closure) so it pickles into
+    worker processes. Reading row groups rather than whole files is what keeps
+    memory bounded: the 2026-10-06 dedup corpus ships 1.3 GB shards (47.5M
+    walks each), and a whole-file read plus flatten/unique peaked at several
+    GB per worker — 48 workers were OOM-killed at 120G in one minute."""
+    pf = pq.ParquetFile(fp)
     parts = []
-    for col in ("vertices", "predicates"):
-        flat = tbl.column(col).combine_chunks().flatten().to_numpy(zero_copy_only=False)
-        # A list-flattened column can come back float64 (NaN for nulls) when the
-        # chunked array carries any null handling; bincount-style code needs ints.
-        if np.issubdtype(flat.dtype, np.floating):
-            flat = flat[~np.isnan(flat)]
-        flat = flat.astype(np.int64, copy=False)
-        parts.append(flat[flat >= 0])
+    for rg in range(rg_lo, rg_hi):
+        tbl = pf.read_row_group(rg, columns=["vertices", "predicates"])
+        for col in ("vertices", "predicates"):
+            flat = tbl.column(col).combine_chunks().flatten().to_numpy(zero_copy_only=False)
+            # A list-flattened column can come back float64 (NaN for nulls) when the
+            # chunked array carries any null handling; bincount-style code needs ints.
+            if np.issubdtype(flat.dtype, np.floating):
+                flat = flat[~np.isnan(flat)]
+            flat = flat.astype(np.int64, copy=False)
+            parts.append(flat[flat >= 0])
     flat = np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
     if flat.size == 0:
         return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
     return np.unique(flat, return_counts=True)
 
 
-def token_counts_from_walk_parquet(walks_parquet, vocab_size, *, workers=1):
+def _plan_token_count_chunks(files, rows_per_chunk):
+    """``(file, rg_lo, rg_hi)`` work items covering every row group of every
+    file, each holding about ``rows_per_chunk`` walks (a single oversized row
+    group is its own item). Parquet metadata only — no data is read."""
+    items = []
+    for fp in files:
+        md = pq.ParquetFile(fp).metadata
+        n, lo = md.num_row_groups, 0
+        while lo < n:
+            hi, rows = lo, 0
+            while hi < n and (rows == 0 or rows + md.row_group(hi).num_rows <= rows_per_chunk):
+                rows += md.row_group(hi).num_rows
+                hi += 1
+            items.append((fp, lo, hi))
+            lo = hi
+    return items
+
+
+def _count_chunks_into(items, vocab_size, out_path=None):
+    """Accumulate ``items`` (see :func:`_plan_token_count_chunks`) into one
+    vocab-sized int64 array; save it to ``out_path`` when given (worker
+    processes hand their partial back through a file, not a 3 GB pickle).
+    ``u`` is unique within a chunk, so a plain fancy-index add is exact."""
+    counts = np.zeros(vocab_size, dtype=np.int64)
+    for fp, lo, hi in items:
+        u, c = _chunk_token_uniques(fp, lo, hi)
+        keep = u < vocab_size
+        counts[u[keep]] += c[keep]
+    if out_path is not None:
+        np.save(out_path, counts)
+        return None
+    return counts
+
+
+def token_counts_from_walk_parquet(walks_parquet, vocab_size, *, workers=1, rows_per_chunk=4_000_000):
     """Token occurrence counts over a walk-sequences parquet dir -> int64 array of
     length ``vocab_size`` (token id -> count). Feeds the f^0.75 unigram negative
     sampler and the walked-coverage mask.
 
-    Per file: ``np.unique(return_counts=True)`` then a scatter-add into the
-    vocab-sized accumulator. The previous ``np.bincount(minlength=vocab_size)``
-    per column per file allocated a fresh vocab-sized array every call — at a
-    393M vocab that is a 3 GB alloc + add ×2 per file, ~3.4 s/file → 10 h over
-    the 11k-shard Wikidata corpus. This form is ~4× faster single-threaded
-    (identical result, verified on real shards) and parallelises over files.
-    ``workers > 1`` uses a spawn-context ProcessPool (safe to call from a
-    process that already initialised CUDA, unlike fork).
+    The corpus is cut into row-group chunks of about ``rows_per_chunk`` walks
+    (:func:`_plan_token_count_chunks`); each chunk is read, flattened and
+    ``np.unique``-counted, then added into a vocab-sized accumulator. With
+    ``workers > 1`` the chunk list is dealt round-robin to that many spawned
+    processes, each with its OWN accumulator written to a temp file at the end
+    and summed here — so peak memory is ``workers x (8 B x vocab_size + a
+    chunk's working set)``, independent of shard size: ~4.5 GB per worker at
+    the 393M Wikidata vocab, versus the per-file form that read 1.3 GB shards
+    whole and was OOM-killed. (The earlier per-file ``np.unique`` replaced a
+    per-file ``bincount(minlength=vocab_size)`` that allocated 3 GB per call.)
     """
-    counts = np.zeros(vocab_size, dtype=np.int64)
     files = sorted(glob.glob(f"{walks_parquet}/*.parquet")) or [walks_parquet]
-
-    def _accumulate(u, c):
-        keep = u < vocab_size
-        counts[u[keep]] += c[keep]          # u is unique per file, so no add.at needed
-
-    if workers <= 1 or len(files) == 1:
-        for fp in files:
-            _accumulate(*_file_token_uniques(fp))
-        return counts
+    items = _plan_token_count_chunks(files, int(rows_per_chunk))
+    workers = max(1, min(int(workers), len(items)))
+    if workers <= 1:
+        return _count_chunks_into(items, vocab_size)
 
     import multiprocessing
-    from concurrent.futures import ProcessPoolExecutor
-    ctx = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(max_workers=int(workers), mp_context=ctx) as ex:
-        for u, c in ex.map(_file_token_uniques, files, chunksize=4):
-            _accumulate(u, c)
+    import os
+    import tempfile
+    ctx = multiprocessing.get_context("spawn")       # safe after CUDA init, unlike fork
+    with tempfile.TemporaryDirectory(prefix="token_counts_") as tmp:
+        procs = []
+        for w in range(workers):
+            out = os.path.join(tmp, f"part_{w}.npy")
+            p = ctx.Process(target=_count_chunks_into, args=(items[w::workers], vocab_size, out), name=f"token-counts-{w}")
+            p.start()
+            procs.append((p, out))
+        counts = np.zeros(vocab_size, dtype=np.int64)
+        failed = []
+        for p, out in procs:
+            p.join()
+            if p.exitcode != 0 or not os.path.exists(out):
+                failed.append((p.name, p.exitcode))
+                continue
+            counts += np.load(out)
+        if failed:
+            raise RuntimeError(f"token count workers failed (name, exitcode): {failed}")
     return counts
 
 

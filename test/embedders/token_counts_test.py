@@ -13,7 +13,7 @@ from rdf2vecgpu.embedders.word2vec_loader import (
 )
 
 
-def _write_walk_shards(walks_dir, rng, *, n_files=3, rows_per_file=400, depth=4, vocab=50):
+def _write_walk_shards(walks_dir, rng, *, n_files=3, rows_per_file=400, depth=4, vocab=50, row_group_size=None):
     """Random fixed-length walks with -1 sentinel tails; returns the expected
     per-token counts computed the naive way (per-element Python loop)."""
     walks_dir.mkdir()
@@ -32,7 +32,7 @@ def _write_walk_shards(walks_dir, rng, *, n_files=3, rows_per_file=400, depth=4,
             "vertices": pa.array(verts, type=pa.list_(pa.int64())),
             "predicates": pa.array(preds, type=pa.list_(pa.float64())),
         })
-        pq.write_table(tbl, walks_dir / f"part.{k}.parquet")
+        pq.write_table(tbl, walks_dir / f"part.{k}.parquet", row_group_size=row_group_size)
     return expected
 
 
@@ -54,6 +54,30 @@ def test_token_counts_parallel_matches_serial(tmp_path):
     expected = _write_walk_shards(walks, rng, n_files=5)
     got = token_counts_from_walk_parquet(str(walks), vocab_size=50, workers=2)
     assert np.array_equal(got, expected)
+
+
+def test_token_counts_chunked_over_many_row_groups_matches(tmp_path):
+    """Shards with many small row groups and a chunk size that cuts across
+    them: every row group is counted exactly once, serially and in parallel.
+    This is the 2026-10-06 dedup-corpus shape (1.3 GB shards of 388 row
+    groups) that the whole-file reader could not hold in memory."""
+    from rdf2vecgpu.embedders.word2vec_loader import _plan_token_count_chunks
+
+    rng = np.random.default_rng(2)
+    walks = tmp_path / "walks"
+    expected = _write_walk_shards(walks, rng, n_files=4, rows_per_file=1000, row_group_size=64)
+    files = sorted(str(f) for f in walks.glob("*.parquet"))
+    items = _plan_token_count_chunks(files, rows_per_chunk=150)
+    assert len(items) > 4 * 3                                     # several chunks per file
+    for fp in files:
+        n = pq.ParquetFile(fp).metadata.num_row_groups
+        covered = sorted((lo, hi) for f, lo, hi in items if f == fp)
+        assert covered[0][0] == 0 and covered[-1][1] == n
+        assert all(a[1] == b[0] for a, b in zip(covered, covered[1:]))   # contiguous, no overlap
+    got = token_counts_from_walk_parquet(str(walks), vocab_size=50, rows_per_chunk=150)
+    assert np.array_equal(got, expected)
+    got_par = token_counts_from_walk_parquet(str(walks), vocab_size=50, workers=3, rows_per_chunk=150)
+    assert np.array_equal(got_par, expected)
 
 
 def test_token_counts_cache_roundtrip_and_stale_rejection(tmp_path):
