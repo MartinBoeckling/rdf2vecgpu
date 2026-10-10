@@ -212,6 +212,17 @@ shards. Same filter options and the same `_write_kgreat_rows` as the trainer —
 byte-identical output (checked at d100 for ranks 0 and 1 and at d200 for 26 GB of
 rank 0). Use it for re-exports with a different entity filter too: no GPU queue.
 
+**Normalisation.** The TSV is L1-normalised (KGrEAT's serialiser); dws
+renormalises the RDF2Vec families to L2 before scoring
+(`tools/export_tsv_embeddings.py --l2`), so keep Helix TSVs L1. The release
+artifact is the raw vectors: `--format parquet` writes float32 as trained to
+`<out>/part-<rank>.parquet` (`token_id`, `entity`, `vector`
+fixed_size_list<float32>), no concat step. Validated 2026-10-10 on d200 rank 0
+(651,233 Q-rows): L1 + 6-decimal rounding of the raw rows reproduces
+`entities_cpu.tsv` exactly, same IRIs in the same order; raw L2 norms 1.4-16,
+median 3.5. ~0.77 KB per d200 row, ~96 GB for all Q-items. The final
+checkpoints are the only source of raw vectors: keep them until exported.
+
 **Why d200 is slower per step (dbpedia probes, 2× A100, 131,072 pairs per rank,
 jobs 15184165–68):** d100 55.8 steps/s with 17.7 ms of GPU work per step, d200
 32.9 steps/s with 30.2 ms (×1.70; loader wait 0.4 ms in both). Rank 0's kernel

@@ -9,6 +9,15 @@ written — same filter, same L1 normalisation, same formatting (it calls
 ``bench_backends._write_kgreat_rows``) — into ``<out>.rank<r>``;
 ``--concat`` then joins the shards in rank order.
 
+``--format parquet`` writes the *raw* vectors instead — float32 exactly as
+trained, no normalisation, no rounding — as one Parquet file per rank,
+``<out>/part-<r>.parquet`` with columns ``token_id`` (int64, the row of the
+table), ``entity`` (IRI) and ``vector`` (``fixed_size_list<float32>[dim]``).
+The directory is the dataset (``pyarrow.dataset`` / ``pandas.read_parquet``
+read it whole); there is nothing to concatenate. This is the release format:
+L1/L2 normalisation is lossy and the TSV's 6 decimals keep only 3-4
+significant digits at d200.
+
 Why: an export needs the whole 8-GPU allocation only because the model is
 sharded there; the 2026-10-04 d200 run (14984051) finished training within
 minutes of its 18 h limit and the alternative to this script was another
@@ -20,6 +29,9 @@ node (236 GB) holds it twice over, and the eight ranks run as eight jobs.
   python performance/helix/export_from_checkpoint.py --ckpt $OUT/ckpt --vocab $CORPUS/vocab.parquet \\
       --out $OUT/entities.tsv --entity-regex '^http://www.wikidata.org/entity/Q' --rank 3
   python performance/helix/export_from_checkpoint.py --ckpt $OUT/ckpt --out $OUT/entities.tsv --concat
+  # raw float32 release files, one job per rank, no concat step:
+  python performance/helix/export_from_checkpoint.py --ckpt $OUT/ckpt --vocab $CORPUS/vocab.parquet \\
+      --out $OUT/entities_raw --format parquet --entity-regex '^http://www.wikidata.org/entity/Q' --rank 3
 """
 from __future__ import annotations
 
@@ -95,6 +107,8 @@ def export_rank(args) -> int:
 
     entities = _read_vocab_slice(args.vocab, start, start + rows_out)
     entity_set = _load_entity_set(args.entity_list)
+    if args.format == "parquet":
+        return _export_rank_parquet(args, block, entities, entity_set, start, rows_out, t0)
     shard = f"{args.out}.rank{args.rank}"
     os.makedirs(os.path.dirname(os.path.abspath(shard)) or ".", exist_ok=True)
     written = 0
@@ -116,6 +130,52 @@ def export_rank(args) -> int:
     return 0
 
 
+def _export_rank_parquet(args, block, entities, entity_set, start: int, rows_out: int, t0: float) -> int:
+    """Raw float32 rows of one rank block -> ``<out>/part-<rank>.parquet``,
+    one row group per ``--chunk-rows`` slice, same filters as the TSV path."""
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import torch
+
+    from bench_backends import _kgreat_keep_mask
+    from rdf2vecgpu.embedders.torchrec_word2vec import _release_host_memory
+
+    dim = int(block.shape[1])
+    schema = pa.schema([("token_id", pa.int64()), ("entity", pa.large_string()),
+                        ("vector", pa.list_(pa.float32(), dim))])
+    os.makedirs(args.out, exist_ok=True)
+    part = os.path.join(args.out, f"part-{args.rank:03d}.parquet")
+    written = 0
+    t1 = time.monotonic()
+    with pq.ParquetWriter(part + ".tmp", schema, compression="zstd") as writer:
+        for i in range(0, rows_out, args.chunk_rows):
+            n = min(args.chunk_rows, rows_out - i)
+            ents = entities.slice(i, n)
+            vectors = block[i:i + n].to(torch.float32).numpy()
+            ids = np.arange(start + i, start + i + n, dtype=np.int64)
+            keep = _kgreat_keep_mask(ents, args.entity_regex, entity_set)
+            if keep is not None:
+                if not keep.any():
+                    continue
+                ents = ents.filter(pa.array(keep))
+                vectors, ids = vectors[keep], ids[keep]
+            vec_col = pa.FixedSizeListArray.from_arrays(pa.array(np.ascontiguousarray(vectors).reshape(-1)), dim)
+            if isinstance(ents, pa.ChunkedArray):
+                ents = ents.combine_chunks()
+            writer.write_table(pa.table([pa.array(ids), ents.cast(pa.large_string()), vec_col], schema=schema))
+            written += len(ids)
+            if (i // args.chunk_rows) % 10 == 0:
+                print(f"[ckpt-export] rank {args.rank}: {i + n:,}/{rows_out:,} block rows, {written:,} written, "
+                      f"{time.monotonic() - t1:.0f} s", flush=True)
+    os.replace(part + ".tmp", part)   # a part only exists once it is complete
+    del block
+    _release_host_memory()
+    print(f"[ckpt-export] rank {args.rank}: {written:,} of {rows_out:,} block rows -> {part} "
+          f"({os.path.getsize(part) / 1e9:.1f} GB) in {time.monotonic() - t0:.0f} s", flush=True)
+    return 0
+
+
 def concat(args) -> int:
     from bench_backends import _concat_rank_shards
 
@@ -130,7 +190,11 @@ def concat(args) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ckpt", required=True, help="step_<N> directory, or the checkpoint root (uses latest)")
-    ap.add_argument("--out", required=True, help="final TSV path; rank shards are <out>.rank<r>")
+    ap.add_argument("--out", required=True, help="final TSV path (rank shards are <out>.rank<r>); "
+                                                 "with --format parquet, the output directory")
+    ap.add_argument("--format", choices=("tsv", "parquet"), default="tsv",
+                    help="tsv: KGrEAT TSV, L1-normalised, 6 decimals (what was scored); "
+                         "parquet: raw float32 vectors, the release format")
     ap.add_argument("--vocab", help="corpus vocab.parquet (required with --rank)")
     ap.add_argument("--rank", type=int, help="export this rank's block to <out>.rank<r>")
     ap.add_argument("--concat", action="store_true", help="join all rank shards into <out>")
@@ -141,6 +205,8 @@ def main() -> int:
     ap.add_argument("--max-rows", type=int, default=0, help="only the first N block rows (validation runs)")
     args = ap.parse_args()
     if args.concat:
+        if args.format == "parquet":
+            ap.error("--format parquet writes a directory of parts; there is nothing to --concat")
         return concat(args)
     if args.rank is None or not args.vocab:
         ap.error("give --rank R --vocab vocab.parquet, or --concat")
