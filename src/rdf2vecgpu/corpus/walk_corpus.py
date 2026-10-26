@@ -1,7 +1,12 @@
 import cupy as cp
 import cudf
 import dask
+import numpy as np
+from cudf.core.column import ListColumn, as_column
+from cudf.core.dtypes import ListDtype
 import dask_cudf as dcudf
+from concurrent.futures import ThreadPoolExecutor
+from dask.distributed import get_worker
 from loguru import logger
 from cugraph import uniform_random_walks, biased_random_walks, filter_unreachable, bfs
 from cugraph import MultiGraph  # supports multiple edges per vertex pair
@@ -15,7 +20,60 @@ import torch
 # (concat, sort_values, merge, groupby, rename, assign) is identical.
 
 
-def _walks_to_lists(vertices_s, edge_attrs_s, walk_length):
+def _fixed_width_lists(mat):
+    """(n, k) cupy matrix → cudf list Series of n rows of length k.
+
+    Assembled on the GPU from an int32 offsets column instead of
+    `cudf.Series(mat.tolist())`, which round-trips every element through a
+    Python object on the host (~36 s per 25 M walks of depth 4, vs ~5 ms).
+    Leaves are widened to int64 / float64, the dtypes the `.tolist()` path
+    produced, so the parquet schema is unchanged.
+    """
+    n, k = mat.shape
+    if n * k >= 2**31:
+        raise ValueError(f"{n} x {k} list leaves exceed cuDF's int32 offsets")
+    wide = "float64" if mat.dtype.kind == "f" else "int64"
+    values = as_column(cp.ascontiguousarray(mat, dtype=wide).ravel())
+    offsets = as_column(cp.arange(0, (n + 1) * k, k, dtype=cp.int32))
+    return cudf.Series._from_column(
+        ListColumn(data=None, size=n, dtype=ListDtype(values.dtype), children=(offsets, values))
+    )
+
+
+def encode_predicates(predicate_s, predicate_tokens):
+    """Vocabulary predicate tokens → compact codes 1..N as float32.
+
+    cuGraph carries an edge attribute in its float32 weight slot, exact only
+    below 2^24; vocabulary tokens of large KGs (hundreds of millions) are
+    rounded there. The graph is therefore built on these codes and walks are
+    decoded with `predicate_code_table`. `predicate_tokens` is the sorted
+    array of distinct predicate tokens.
+    """
+    codes = cp.searchsorted(cp.asarray(predicate_tokens), cp.asarray(predicate_s.values)) + 1
+    return cudf.Series(codes.astype(cp.float32), index=predicate_s.index)
+
+
+def predicate_code_table(predicate_tokens):
+    """code → vocabulary token lookup for `encode_predicates` codes; code 0
+    (cuGraph's padding after a walk's end) stays 0."""
+    if len(predicate_tokens) >= 2**24:
+        raise ValueError(f"{len(predicate_tokens)} predicates do not fit float32-exact codes")
+    return np.concatenate([np.zeros(1, np.int64), np.asarray(predicate_tokens, dtype=np.int64)])
+
+
+def _decode_predicates(edge_attrs, code_to_token):
+    """cuGraph per-step edge attributes → predicate tokens (unchanged when the
+    graph was not built on `encode_predicates` codes, e.g. weighted walks)."""
+    codes = cp.asarray(edge_attrs)
+    if code_to_token is None:
+        return codes
+    ci = cp.rint(codes).astype(cp.int64)
+    if ci.size and (not bool((ci == codes).all()) or int(ci.min()) < 0 or int(ci.max()) >= len(code_to_token)):
+        raise ValueError("predicate codes returned by cuGraph are not valid code indices")
+    return cp.asarray(code_to_token)[ci]
+
+
+def _walks_to_lists(vertices_s, edge_attrs_s, walk_length, code_to_token=None):
     """Reshape cuGraph's flat random-walk output into per-walk list rows.
 
     Sister helper to `_build_walk_steps`: same input contract, but emits one
@@ -32,6 +90,9 @@ def _walks_to_lists(vertices_s, edge_attrs_s, walk_length):
     we keep those `-1` cells in the lists so the gensim walk-streaming
     iterator can trim them at first occurrence (matches the standalone
     tool's behavior).
+
+    With `code_to_token` the per-step predicate codes are decoded to
+    vocabulary tokens (see `encode_predicates`).
     """
     stride_v = walk_length + 1
     stride_p = walk_length
@@ -49,16 +110,16 @@ def _walks_to_lists(vertices_s, edge_attrs_s, walk_length):
             f"walk_length={walk_length})"
         )
     vs = cp.asarray(vertices_s.values).reshape(n_walks, stride_v)
-    ps = cp.asarray(edge_attrs_s.values).reshape(n_walks, stride_p)
+    ps = _decode_predicates(edge_attrs_s.values, code_to_token).reshape(n_walks, stride_p)
     return cudf.DataFrame(
         {
-            "vertices": cudf.Series(vs.tolist()),
-            "predicates": cudf.Series(ps.tolist()),
+            "vertices": _fixed_width_lists(vs),
+            "predicates": _fixed_width_lists(ps),
         }
     )
 
 
-def _build_walk_steps(vertices_s, edge_attrs_s, walk_length, walk_id_offset=0):
+def _build_walk_steps(vertices_s, edge_attrs_s, walk_length, walk_id_offset=0, code_to_token=None):
     """Reshape cuGraph's flat random-walk output into per-step rows.
 
     cuGraph's `uniform_random_walks` / `biased_random_walks` emit two parallel
@@ -77,6 +138,9 @@ def _build_walk_steps(vertices_s, edge_attrs_s, walk_length, walk_id_offset=0):
 
     Walks shorter than `walk_length` are padded with cuGraph's `-1` sentinel;
     we drop steps where any of (src, predicate, dst) is -1.
+
+    With `code_to_token` the predicate codes are decoded to vocabulary tokens
+    (see `encode_predicates`).
     """
     stride_v = walk_length + 1
     stride_p = walk_length
@@ -94,7 +158,7 @@ def _build_walk_steps(vertices_s, edge_attrs_s, walk_length, walk_id_offset=0):
             f"walk_length={walk_length})"
         )
     vs = cp.asarray(vertices_s.values).reshape(n_walks, stride_v)
-    ps = cp.asarray(edge_attrs_s.values).reshape(n_walks, stride_p)
+    ps = _decode_predicates(edge_attrs_s.values, code_to_token).reshape(n_walks, stride_p)
     src = vs[:, :-1].reshape(-1)
     dst = vs[:, 1:].reshape(-1)
     predicate = ps.reshape(-1)
@@ -241,10 +305,13 @@ class SingleGPUWalkCorpus:
     optional frequency threshold `min_count` filters rare tokens.
     """
 
-    def __init__(self, graph: MultiGraph, window_size: int, walk_weighted: bool = False):
+    def __init__(self, graph: MultiGraph, window_size: int, walk_weighted: bool = False,
+                 code_to_token=None):
         self.G = graph
         self.window_size = window_size
         self.walk_weighted = walk_weighted
+        # predicate code → token table when the graph carries `encode_predicates` codes
+        self.code_to_token = code_to_token
 
     def bfs_walk(
         self,
@@ -336,7 +403,7 @@ class SingleGPUWalkCorpus:
             random_state=random_state,
         )
         merged_walks = _build_walk_steps(
-            random_walks, edge_attrs, walk_length=int(max_length)
+            random_walks, edge_attrs, walk_length=int(max_length), code_to_token=self.code_to_token
         )
         # `_build_walk_steps` already drops the cuGraph -1 sentinel rows and
         # emits stride-aligned (walk_id, step) — preserve the legacy explicit
@@ -370,7 +437,8 @@ class SingleGPUWalkCorpus:
             max_depth=walk_depth,
             random_state=random_state,
         )
-        return _walks_to_lists(random_walks, edge_attrs, walk_length=int(max_length))
+        return _walks_to_lists(random_walks, edge_attrs, walk_length=int(max_length),
+                               code_to_token=self.code_to_token)
 
 
 # ── Multi-GPU Walk Corpus ───────────────────────────────────────────────────
@@ -392,6 +460,57 @@ def _ensure_dask_frame(df, nparts=None):
 
 
 
+def _walk_chunk_task(session_id, plc_graph, starts, lo, hi, walk_number, walk_depth, random_state,
+                     weighted, code_to_token, out_dir, file_base, rows_per_file):
+    """One GPU's share of a `write_walk_sequences` chunk, in a single task:
+    walk from ``starts[lo:hi]`` (each repeated `walk_number` times), decode the
+    predicates, build the list columns and hand them to this worker's
+    background parquet writer. Only the walk count goes back to the client."""
+    from cugraph.dask.comms import comms as Comms
+    from pylibcugraph import ResourceHandle, biased_random_walks, uniform_random_walks
+
+    s = cp.asarray(starts.values[lo:hi])
+    if walk_number > 1:
+        s = cp.repeat(s, walk_number)
+    walk_fn = biased_random_walks if weighted else uniform_random_walks
+    vertex_paths, edge_paths, _ = walk_fn(
+        resource_handle=ResourceHandle(Comms.get_handle(session_id).getHandle()),
+        input_graph=plc_graph,
+        start_vertices=cudf.Series(s, dtype=starts.dtype),
+        max_length=walk_depth,
+        random_state=random_state,
+    )
+    walks = _walks_to_lists(cudf.Series(vertex_paths), cudf.Series(edge_paths), walk_depth, code_to_token)
+    del vertex_paths, edge_paths
+    # The write overlaps the next chunk's walk; at most one write is in flight per worker.
+    _flush_writes()
+    get_worker()._walk_write = _writer().submit(_write_parts, walks, out_dir, file_base, rows_per_file)
+    return len(walks)
+
+
+def _write_parts(walks, out_dir, file_base, rows_per_file):
+    for j, a in enumerate(range(0, len(walks), rows_per_file)):
+        walks.iloc[a:a + rows_per_file].to_parquet(
+            f"{out_dir}/part.{file_base + j}.parquet", compression="snappy", index=False
+        )
+
+
+def _writer():
+    w = get_worker()
+    if getattr(w, "_walk_writer", None) is None:
+        w._walk_writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="walk-write")
+    return w._walk_writer
+
+
+def _flush_writes():
+    """Wait for this worker's in-flight parquet write (re-raising its error, if any)."""
+    w = get_worker()
+    pending = getattr(w, "_walk_write", None)
+    if pending is not None:
+        w._walk_write = None
+        pending.result()
+
+
 class MultiGPUWalkCorpus:
     """
     A fully Dask/cuDF/cuGraph implementation of random-walk and BFS
@@ -399,10 +518,13 @@ class MultiGPUWalkCorpus:
     `size_type` overflow.
     """
 
-    def __init__(self, graph: MultiGraph, window_size: int, walk_weighted: bool = False):
+    def __init__(self, graph: MultiGraph, window_size: int, walk_weighted: bool = False,
+                 code_to_token=None):
         self.G = graph
         self.window_size = window_size
         self.walk_weighted = walk_weighted
+        # predicate code → token table when the graph carries `encode_predicates` codes
+        self.code_to_token = code_to_token
 
     def random_walk(
         self,
@@ -475,7 +597,9 @@ class MultiGPUWalkCorpus:
         meta = cudf.DataFrame(
             {
                 "src": cudf.Series([], dtype=walks_s.dtype),
-                "predicate": cudf.Series([], dtype=edge_attrs_s.dtype),
+                "predicate": cudf.Series(
+                    [], dtype="int64" if self.code_to_token is not None else edge_attrs_s.dtype
+                ),
                 "dst": cudf.Series([], dtype=walks_s.dtype),
                 "walk_id": cudf.Series([], dtype="int64"),
                 "step": cudf.Series([], dtype="int64"),
@@ -483,7 +607,7 @@ class MultiGPUWalkCorpus:
         )
         merged_parts = [
             dask.delayed(_build_walk_steps)(
-                walks_delayed[i], edges_delayed[i], walk_length, offsets[i]
+                walks_delayed[i], edges_delayed[i], walk_length, offsets[i], self.code_to_token
             )
             for i in range(len(walks_delayed))
         ]
@@ -557,7 +681,7 @@ class MultiGPUWalkCorpus:
                 f"{len(walks_delayed)} vs {len(edges_delayed)}"
             )
         parts = [
-            dask.delayed(_walks_to_lists)(walks_delayed[i], edges_delayed[i], walk_length)
+            dask.delayed(_walks_to_lists)(walks_delayed[i], edges_delayed[i], walk_length, self.code_to_token)
             for i in range(len(walks_delayed))
         ]
         meta = dask.compute(parts[0])[0].iloc[:0]
@@ -565,6 +689,82 @@ class MultiGPUWalkCorpus:
         sequences = sequences.persist()
         dask_wait(sequences)
         return sequences
+
+    def write_walk_sequences(
+        self,
+        walk_vertices,
+        walk_number: int,
+        walk_depth: int,
+        random_state,
+        out_dir: str,
+        walks_per_worker_chunk: int = 25_000_000,
+        file_mb: float = 300,
+    ) -> int:
+        """Multi-GPU walks written straight to a parquet directory; returns the
+        number of walks.
+
+        Same schema as `random_walk_sequences` (one row per walk, `vertices` /
+        `predicates` list columns, ``part.<n>.parquet`` files), but built for
+        corpora that do not fit in GPU memory at once: the unique start
+        vertices are split across the GPUs once, and each chunk is one task per
+        GPU that walks its share (`walk_number` walks per start vertex), builds
+        the list columns and writes its own parquet files in the background
+        while the next chunk walks. Nothing but walk counts reaches the client.
+        It is several times faster per walk than persisting
+        `random_walk_sequences` and writing it with `to_parquet`.
+
+        `walks_per_worker_chunk` bounds each GPU's output per chunk (cuDF's
+        2^31 row limit applies to walks x (walk_depth + 1)); larger chunks
+        measured slower per walk. `file_mb` is the target in-memory size of
+        one output file.
+        """
+        import math
+        import os
+        from dask.distributed import default_client
+        from cugraph.dask.comms import comms as Comms
+
+        client = default_client()
+        if hasattr(walk_vertices, "compute"):
+            walk_vertices = walk_vertices.compute()
+        walk_vertices = walk_vertices.reset_index(drop=True)
+        plc_graphs = self.G._plc_graph  # worker address -> that worker's pylibcugraph graph
+        workers = list(plc_graphs)
+        bounds = [len(walk_vertices) * r // len(workers) for r in range(len(workers) + 1)]
+        starts = {
+            w: client.scatter(walk_vertices.iloc[bounds[r]:bounds[r + 1]].reset_index(drop=True), workers=[w])
+            for r, w in enumerate(workers)
+        }
+        vertices_per_task = max(1, walks_per_worker_chunk // walk_number)
+        if vertices_per_task * walk_number * (walk_depth + 1) >= 2**31:
+            raise ValueError("walks_per_worker_chunk too large for cuDF's 2^31 row limit")
+        n_chunks = max(1, math.ceil(max(b - a for a, b in zip(bounds, bounds[1:])) / vertices_per_task))
+        # In-memory bytes per walk: 8-byte leaves plus one int32 offset per list column.
+        rows_per_file = max(1, int(file_mb * 10**6) // (8 * (2 * walk_depth + 1) + 8))
+        files_per_task = math.ceil(vertices_per_task * walk_number / rows_per_file)
+        os.makedirs(out_dir, exist_ok=True)
+        session_id = Comms.get_session_id()
+        logger.info(
+            f"Writing {len(walk_vertices):,} x {walk_number} walks to {out_dir} in {n_chunks} chunk(s) "
+            f"on {len(workers)} GPUs"
+        )
+        total = 0
+        for i in range(n_chunks):
+            futures = [
+                client.submit(
+                    _walk_chunk_task, session_id, plc_graphs[w], starts[w],
+                    i * vertices_per_task, (i + 1) * vertices_per_task, walk_number, walk_depth,
+                    # distinct seed per GPU and chunk; None lets cuGraph seed each call
+                    None if random_state is None else random_state + i * len(workers) + r,
+                    self.walk_weighted, self.code_to_token,
+                    out_dir, (i * len(workers) + r) * files_per_task, rows_per_file,
+                    workers=[w], allow_other_workers=False, pure=False,
+                )
+                for r, w in enumerate(workers)
+            ]
+            total += sum(client.gather(futures))
+        client.gather([client.submit(_flush_writes, workers=[w], pure=False) for w in workers])
+        del starts
+        return total
 
     def bfs_walk(
         self,

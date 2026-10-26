@@ -28,7 +28,23 @@ import pytest
 from src.rdf2vecgpu.corpus.walk_corpus import (
     SingleGPUWalkCorpus,
     _build_walk_steps,
+    _walks_to_lists,
+    encode_predicates,
+    predicate_code_table,
 )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("vdtype,pdtype", [("int32", "float32"), ("int64", "int64")])
+def test_walks_to_lists_matches_tolist_reference(vdtype, pdtype):
+    """The offsets-built list columns equal the old `cudf.Series(m.tolist())`
+    output, values and dtypes, including cuGraph's -1 / 0 padding."""
+    rng = cp.random.default_rng(0)
+    v = rng.integers(-1, 1000, size=(257, 5)).astype(vdtype)
+    p = rng.integers(0, 50, size=(257, 4)).astype(pdtype)
+    out = _walks_to_lists(cudf.Series(v.ravel()), cudf.Series(p.ravel()), walk_length=4)
+    assert out["vertices"].to_arrow().equals(cudf.Series(v.tolist()).to_arrow())
+    assert out["predicates"].to_arrow().equals(cudf.Series(p.tolist()).to_arrow())
 
 
 @pytest.mark.gpu
@@ -165,3 +181,34 @@ def test_random_walk_predicate_matches_traversed_edge():
     )
     assert isinstance(pairs, cudf.DataFrame)
     assert {"center", "context"}.issubset(set(pairs.columns))
+
+
+@pytest.mark.gpu
+def test_walks_decode_predicate_tokens_above_float32_range():
+    """Predicate tokens above 2^24 are rounded in cuGraph's float32 edge
+    attribute; on `encode_predicates` codes the walks decode them exactly."""
+    import numpy as np
+    from cugraph import MultiGraph
+
+    big = [16_777_217, 300_000_001, 392_999_999]  # none survive a float32 round trip
+    assert all(int(np.float32(t)) != t for t in big)
+    edge_df = cudf.DataFrame(
+        {
+            "subject": cudf.Series([0, 0, 1, 2], dtype="int32"),
+            "predicate": cudf.Series([big[0], big[1], big[2], 7], dtype="int64"),
+            "object": cudf.Series([1, 1, 2, 0], dtype="int32"),
+        }
+    )
+    tokens = edge_df["predicate"].unique().sort_values().values_host
+    edge_df["pcode"] = encode_predicates(edge_df["predicate"], tokens)
+    graph = MultiGraph(directed=True)
+    graph.from_cudf_edgelist(edge_df, source="subject", destination="object", edge_attr="pcode", renumber=False)
+    corpus = SingleGPUWalkCorpus(graph, window_size=2, code_to_token=predicate_code_table(tokens))
+
+    walks = corpus.random_walk_sequences(cudf.Series([0, 1, 2] * 20, dtype="int32"), walk_depth=3, random_state=0)
+    assert str(walks["predicates"].dtype) == "list"
+    legit = {(int(r.subject), int(r.object), int(r.predicate)) for r in edge_df.to_pandas().itertuples()}
+    V = walks["vertices"].list.leaves.values_host.reshape(len(walks), 4)
+    P = walks["predicates"].list.leaves.values_host.reshape(len(walks), 3)
+    steps = {(int(v), int(o), int(p)) for v, o, p in zip(V[:, :-1].ravel(), V[:, 1:].ravel(), P.ravel()) if o >= 0}
+    assert steps and steps <= legit
