@@ -137,8 +137,11 @@ class CBOWDataModule(L.LightningDataModule):
 class ParquetSkipGramDataModule(L.LightningDataModule):
     """DataModule that reads skip-gram pairs from partitioned parquet.
 
-    Designed for multi-GPU DDP training: each rank reads its own subset
-    of parquet files and loads them onto its local GPU.
+    Designed for multi-GPU DDP training: each rank reads its own disjoint
+    block of ``total_rows // world_size`` rows onto its local GPU. Equal row
+    counts give every rank the same number of batches; with unequal counts
+    the rank that finishes its epoch first leaves the others blocked in the
+    gradient all-reduce.
 
     Parameters
     ----------
@@ -165,19 +168,27 @@ class ParquetSkipGramDataModule(L.LightningDataModule):
             # dask may write to subdirectory "part.0.parquet" etc.
             files = sorted(glob(os.path.join(self.parquet_path, "**", "*.parquet"), recursive=True))
 
-        # Distribute files across DDP ranks
+        import pyarrow.parquet as pq
+
         rank = self.trainer.global_rank if self.trainer else 0
         world_size = self.trainer.world_size if self.trainer else 1
-        my_files = [f for i, f in enumerate(files) if i % world_size == rank]
-
-        if not my_files:
+        sizes = [pq.read_metadata(f).num_rows for f in files]
+        per_rank = sum(sizes) // world_size
+        if per_rank == 0:
             raise RuntimeError(
-                f"Rank {rank}/{world_size} has no parquet files assigned "
-                f"from {len(files)} total files in {self.parquet_path}"
+                f"{sum(sizes)} rows in {self.parquet_path} cannot be split "
+                f"across {world_size} ranks"
             )
 
-        # Read assigned parquet files and convert to GPU tensors
-        parts = [cudf.read_parquet(f) for f in my_files]
+        # Read this rank's row block [lo, hi) from the files it overlaps
+        # (the remainder of fewer than world_size rows is not used).
+        lo, hi = rank * per_rank, (rank + 1) * per_rank
+        parts, start = [], 0
+        for f, n in zip(files, sizes):
+            if start < hi and start + n > lo:
+                part = cudf.read_parquet(f, columns=["center", "context"])
+                parts.append(part.iloc[max(lo - start, 0):min(hi - start, n)])
+            start += n
         df = cudf.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
         self.center = torch.utils.dlpack.from_dlpack(
             df["center"].to_dlpack()

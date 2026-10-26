@@ -905,13 +905,22 @@ class GPU_RDF2Vec:
             if self.config.reproducible:
                 L.seed_everything(self.config.random_state, workers=True)
             self.tracker.log_pytorch()
+            # On one node, Lightning spawns one worker per GPU itself. Inside a
+            # SLURM allocation it would otherwise defer the launch to SLURM and,
+            # under `--ntasks=1`, run DDP as a single rank.
+            if n_gpus > 1 and self.config.num_nodes == 1:
+                from lightning.pytorch.strategies import DDPStrategy
+                from lightning.pytorch.plugins.environments import LightningEnvironment
+                strategy = DDPStrategy(cluster_environment=LightningEnvironment())
+            else:
+                strategy = "ddp" if n_gpus > 1 else "auto"
             trainer = L.Trainer(
                 max_epochs=self.config.epochs,
                 log_every_n_steps=1,
                 accelerator="gpu",
                 precision="16-mixed",
                 devices=n_gpus,
-                strategy="ddp" if n_gpus > 1 else "auto",
+                strategy=strategy,
                 num_nodes=self.config.num_nodes,
                 enable_checkpointing=False,
             )
