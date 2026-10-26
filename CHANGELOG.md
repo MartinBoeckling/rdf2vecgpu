@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-10-26
+
+Walk-generation fixes and a chunked multi-GPU walk writer. 0.4.0 was not
+published to PyPI, so this is the first PyPI release that also contains the
+0.4.0 changes below.
+
+### Added
+
+- `MultiGPUWalkCorpus.write_walk_sequences(...)` — multi-GPU random walks
+  written straight to a walks-as-sequences parquet directory in chunks, for
+  corpora that do not fit in GPU memory at once. Start vertices are split
+  across the GPUs once; each chunk is one task per GPU that walks, builds the
+  list columns and writes its own parquet files in the background while the
+  next chunk walks, so only walk counts reach the client.
+  `walk_generation_sequences(..., out_dir=...)` uses it in multi-GPU mode and
+  returns a `WalkParquet(path, n_walks)`, and the multi-GPU gensim `fit()`
+  trains from the files the GPUs wrote.
+
+### Changed
+
+- Walk list columns (`vertices`, `predicates`) are assembled on the GPU from
+  an offsets column instead of `cudf.Series(matrix.tolist())`, which
+  round-tripped every element through a Python object (~36 s per 25 M walks
+  of depth 4, now ~5 ms). The parquet schema is unchanged.
+- Walk predicates are int64 vocabulary tokens for unweighted walks
+  (previously float, from cuGraph's weight slot).
+
+### Fixed
+
+- Walk predicates were rounded for vocabularies above 2^24 tokens: cuGraph
+  carries the edge attribute in a float32 weight slot, so token 16,777,217
+  came back as 16,777,216. The graph is now built on compact predicate codes
+  1..N (`encode_predicates`) and walk output is decoded back to tokens.
+- Multi-GPU random walks started from only a fraction of the vertices:
+  cuGraph's MG `.nodes()` on a `renumber=False` graph returns a subset of the
+  source vertices, and a `dask_cudf.Series` of start vertices made cuGraph
+  walk only ~1/n_workers of them. Walks now start from the subjects of the
+  edge list (`construct_graph` stores them), passed to cuGraph as one
+  `cudf.Series`.
+- Multi-GPU `random_walk_sequences` failed dask's meta check on newer cuDF
+  (list vs object dtype); the meta is now taken from the first partition.
+- Multi-GPU PyTorch training could hang: `ParquetSkipGramDataModule` gave
+  each DDP rank whole files, so ranks ran different numbers of batches and
+  the gradient all-reduce blocked. Each rank now reads a disjoint block of
+  `total_rows // world_size` rows. On one node, Lightning now spawns the
+  per-GPU workers itself; inside a SLURM allocation with `--ntasks=1` it
+  previously ran DDP as a single rank.
+
 ## [0.4.0] — 2026-04-27
 
 This release bundles a four-PR upstream-port sequence that ports
