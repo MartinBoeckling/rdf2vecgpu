@@ -29,8 +29,10 @@ published to PyPI, so this is the first PyPI release that also contains the
   an offsets column instead of `cudf.Series(matrix.tolist())`, which
   round-tripped every element through a Python object (~36 s per 25 M walks
   of depth 4, now ~5 ms). The parquet schema is unchanged.
-- Walk predicates are int64 vocabulary tokens for unweighted walks
+- Walk predicates are int64 vocabulary tokens, weighted and unweighted
   (previously float, from cuGraph's weight slot).
+- `walk_weighted=True` rejects missing, negative or non-finite edge weights
+  and converts integer weights to float32.
 
 ### Fixed
 
@@ -38,6 +40,33 @@ published to PyPI, so this is the first PyPI release that also contains the
   carries the edge attribute in a float32 weight slot, so token 16,777,217
   came back as 16,777,216. The graph is now built on compact predicate codes
   1..N (`encode_predicates`) and walk output is decoded back to tokens.
+- Weighted walks (`walk_weighted=True`) emitted each step's edge weight as
+  its predicate, so training failed on float token indices (since 0.4.0,
+  which stopped looking predicates up in the edge list as 0.3.0 did).
+  cuGraph's biased walks return only the weight, so the predicate is now
+  recovered from the edge list by (subject, object, weight), drawn uniformly
+  among parallel edges of equal weight. This matches the walker's edge
+  choice exactly, including on parallel edges where 0.3.0 picked an
+  arbitrary predicate. Multi-GPU skip-gram/CBOW walks look predicates up in
+  the distributed edge list; the multi-GPU walk-sequence paths (gensim) keep
+  a copy of the edge list on every GPU, so that list has to fit on one GPU.
+- BFS walks (`walk_strategy="bfs"`) failed with a `TypeError`: cuGraph's
+  `bfs()` only accepts a `cugraph.Graph`, not the `MultiGraph` the walks use.
+  BFS now runs on a `Graph` of the distinct (subject, object) pairs.
+- BFS walks were also out of order and duplicated steps over parallel
+  edges. Each walk's edges were sorted by subject token rather
+  than by depth, so a path whose vertex ids do not increase came out
+  scrambled and did not start at its root; and the predicate was merged back
+  by (subject, object), repeating a step once per parallel edge. Walks now
+  follow BFS-tree depth, and over parallel edges one predicate is drawn
+  uniformly (seeded by `random_state`), one walk per root-to-leaf path.
+- Single-GPU weighted walks crashed (`overall_num_elements must be > 0`,
+  raised by cuGraph's `biased_random_walks`) whenever every walk of a call
+  ended two or more steps before `walk_depth`, e.g. on graphs with many dead
+  ends. Such calls are now walked one step at a time, which gives the same
+  walk distribution. The multi-GPU walker is not affected.
+- Multi-GPU weighted walks dropped the `weights` column during vocabulary
+  encoding and could not build the graph.
 - Multi-GPU random walks started from only a fraction of the vertices:
   cuGraph's MG `.nodes()` on a `renumber=False` graph returns a subset of the
   source vertices, and a `dask_cudf.Series` of start vertices made cuGraph
@@ -46,6 +75,9 @@ published to PyPI, so this is the first PyPI release that also contains the
   `cudf.Series`.
 - Multi-GPU `random_walk_sequences` failed dask's meta check on newer cuDF
   (list vs object dtype); the meta is now taken from the first partition.
+  With pyarrow strings enabled (dask's default) it also failed in
+  `from_delayed` (`issubclass() arg 1 must be a class`), which is now
+  called with string conversion off.
 - Multi-GPU PyTorch training could hang: `ParquetSkipGramDataModule` gave
   each DDP rank whole files, so ranks ran different numbers of batches and
   the gradient all-reduce blocked. Each rank now reads a disjoint block of

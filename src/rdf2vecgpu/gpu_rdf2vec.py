@@ -14,6 +14,7 @@ from .corpus.walk_corpus import (
     MultiGPUWalkCorpus,
     encode_predicates,
     predicate_code_table,
+    weighted_edge_index,
 )
 from .logger import build_tracker
 import cudf
@@ -29,6 +30,20 @@ class WalkParquet:
 
     path: str
     n_walks: int
+
+
+def _checked_weights(kg_data):
+    """`kg_data` with float `weights`, rejecting missing, negative or
+    non-finite weights."""
+    w = kg_data["weights"]
+    if w.dtype.kind != "f":
+        kg_data = kg_data.assign(weights=w.astype("float32"))
+        w = kg_data["weights"]
+    n_bad = (w.isnull() | (w < 0) | ~(w.abs() < float("inf"))).sum()
+    n_bad = int(n_bad.compute() if hasattr(n_bad, "compute") else n_bad)
+    if n_bad:
+        raise ValueError(f"{n_bad} edge weights are missing, negative or not finite")
+    return kg_data
 
 
 class GPU_RDF2Vec:
@@ -177,6 +192,7 @@ class GPU_RDF2Vec:
         self.knowledge_graph = MultiGraph(directed=True)
         self._walk_source_vertices = None  # set during fit (construct_graph); spec 2026-05-15 §1
         self._code_to_token = None  # predicate code -> token table (construct_graph)
+        self._edge_index = None  # weighted walks' predicate lookup table (construct_graph)
         self.word2vec_model = None
         self.word2idx = None
         self.tracker = build_tracker(
@@ -345,9 +361,9 @@ class GPU_RDF2Vec:
 
     def construct_graph(self, kg_data):
         with self.tracker.stage("Graph_Construction"):
-            # cuGraph does not allow edge_attr and weight simultaneously.
-            # Predicates are always looked up via merge in the walk corpus,
-            # so we only need them stored in the graph for unweighted walks.
+            # cuGraph does not allow edge_attr and weight simultaneously, so
+            # weighted walks look their predicates up in `_edge_index` by
+            # (subject, object, weight) instead.
             if self.config.walk_weighted:
                 edge_kwargs = dict(
                     source="subject",
@@ -378,6 +394,10 @@ class GPU_RDF2Vec:
                     kg_data = kg_data.assign(pcode=encode_predicates(kg_data["predicate"], tokens))
             else:
                 self._code_to_token = None
+                kg_data = _checked_weights(kg_data)
+                self._edge_index = weighted_edge_index(kg_data)
+                if self.config.multi_gpu:
+                    self._edge_index = self._edge_index.persist()
             if self.config.multi_gpu:
                 cols = ["subject", "object"]
                 cols.append("weights" if self.config.walk_weighted else "pcode")
@@ -548,6 +568,7 @@ class GPU_RDF2Vec:
                     self.config.window_size,
                     walk_weighted=self.config.walk_weighted,
                     code_to_token=self._code_to_token,
+                    edge_index=self._edge_index,
                 )
             else:
                 walk_instance = SingleGPUWalkCorpus(
@@ -555,6 +576,7 @@ class GPU_RDF2Vec:
                     self.config.window_size,
                     walk_weighted=self.config.walk_weighted,
                     code_to_token=self._code_to_token,
+                    edge_index=self._edge_index,
                 )
             if self.config.walk_strategy == "random":
                 walk_vertices = self._resolve_walk_vertices(walk_vertices)
@@ -624,6 +646,7 @@ class GPU_RDF2Vec:
                     self.config.window_size,
                     walk_weighted=self.config.walk_weighted,
                     code_to_token=self._code_to_token,
+                    edge_index=self._edge_index,
                 )
             else:
                 walk_instance = SingleGPUWalkCorpus(
@@ -631,6 +654,7 @@ class GPU_RDF2Vec:
                     self.config.window_size,
                     walk_weighted=self.config.walk_weighted,
                     code_to_token=self._code_to_token,
+                    edge_index=self._edge_index,
                 )
             if self.config.walk_strategy != "random":
                 raise NotImplementedError(
