@@ -95,13 +95,10 @@ class KGFileReader:
         return renamed_df
 
     def _parquet_reader(self) -> DataFrameLike:
-        columns = [
-            self.col_map["subject"],
-            self.col_map["predicate"],
-            self.col_map["object"],
-        ]
-        if self.walk_weighted:
-            columns.append("weights")
+        # `col_map` maps source column names to the expected ones.
+        source = {target: name for name, target in self.col_map.items()}
+        targets = ["subject", "predicate", "object"] + (["weights"] if self.walk_weighted else [])
+        columns = [source.get(target, target) for target in targets]
         if self.multi_gpu:
             kg_data = dd.read_parquet(
                 self.file_path,
@@ -133,7 +130,9 @@ class KGFileReader:
 
     def _nt_reader(self) -> DataFrameLike:
         if self.multi_gpu:
-            df = dd.read_text(self.file_path).to_dataframe()
+            import dask_cudf
+
+            df = dask_cudf.read_text(str(self.file_path), delimiter="\n").to_frame()
             df.columns = ["raw"]
         else:
             df = cudf.read_text(self.file_path, delimiter="\n").to_frame()

@@ -184,3 +184,37 @@ def test_tensor_to_cudf():
     assert cudf_df.iloc[1, 2] == 5
     with pytest.raises(NotImplementedError) as excinfo:
         multi_gpu_cudf_df = torch_to_cudf(tensor, multi_gpu=True)
+
+
+def _edges_with_missing_word():
+    return cudf.DataFrame(
+        {
+            "subject": cudf.Series(["A", None, "B", "C"]),
+            "predicate": cudf.Series(["p", "p", "q", "p"]),
+            "object": cudf.Series(["B", "C", None, "D"]),
+        }
+    )
+
+
+def _decoded(edge_df, word2idx):
+    w = dict(zip(word2idx["token"].values_host.tolist(), word2idx["word"].to_arrow().to_pylist()))
+    rows = edge_df.to_pandas().sort_values(["subject", "predicate", "object"]).values.tolist()
+    return sorted((w[s], w[p], w[o]) for s, p, o in rows)
+
+
+@pytest.mark.gpu
+def test_generate_vocab_single_gpu_drops_missing_words():
+    """A missing word must not shift the token ↔ word pairs of the words after it."""
+    edge_df, word2idx = _generate_vocab(_edges_with_missing_word(), multi_gpu=False)
+    assert word2idx["word"].isnull().sum() == 0
+    assert sorted(word2idx["token"].values_host.tolist()) == list(range(len(word2idx)))
+    assert _decoded(edge_df, word2idx) == [("A", "p", "B"), ("C", "p", "D")]
+
+
+@pytest.mark.gpu
+def test_generate_vocab_multi_gpu_drops_missing_words():
+    edges = dask_cudf.from_cudf(_edges_with_missing_word(), npartitions=2)
+    edge_df, word2idx = _generate_vocab(edges, multi_gpu=True)
+    word2idx = word2idx.compute()
+    assert word2idx["word"].isnull().sum() == 0
+    assert _decoded(edge_df.compute(), word2idx) == [("A", "p", "B"), ("C", "p", "D")]

@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 from cugraph import MultiGraph
 import cugraph
@@ -32,17 +33,55 @@ class WalkParquet:
     n_walks: int
 
 
+def _ddp_strategy(n_gpus: int, num_nodes: int):
+    """Lightning strategy for training on `n_gpus` GPUs per node.
+
+    On one node, Lightning spawns one worker per GPU itself. Inside a SLURM
+    allocation it would otherwise defer the launch to SLURM and, under
+    `--ntasks=1`, run DDP as a single rank. When SLURM starts several tasks
+    (one per GPU), the launch stays with SLURM."""
+    if n_gpus < 2:
+        return "auto"
+    if num_nodes == 1 and int(os.environ.get("SLURM_NTASKS", "1")) == 1:
+        from lightning.pytorch.strategies import DDPStrategy
+        from lightning.pytorch.plugins.environments import LightningEnvironment
+
+        return DDPStrategy(cluster_environment=LightningEnvironment())
+    return "ddp"
+
+
+def _check_walk_files(walks: WalkParquet) -> None:
+    """Raise unless the parquet files under `walks.path` hold all
+    `walks.n_walks` walks. The dask workers write them, so on a cluster
+    spanning several nodes the files of other nodes are not visible here."""
+    from glob import glob
+    import pyarrow.parquet as pq
+
+    files = glob(os.path.join(walks.path, "**", "*.parquet"), recursive=True)
+    rows = sum(pq.read_metadata(f).num_rows for f in files)
+    if rows != walks.n_walks:
+        raise RuntimeError(
+            f"{walks.path} holds {rows:,} of the {walks.n_walks:,} walks written; "
+            "multi-GPU gensim training needs every dask worker on this node"
+        )
+
+
 def _checked_weights(kg_data):
     """`kg_data` with float `weights`, rejecting missing, negative or
-    non-finite weights."""
+    non-finite weights, and graphs whose weights are all 0 (no weighted walk
+    would leave its start vertex)."""
     w = kg_data["weights"]
     if w.dtype.kind != "f":
         kg_data = kg_data.assign(weights=w.astype("float32"))
         w = kg_data["weights"]
     n_bad = (w.isnull() | (w < 0) | ~(w.abs() < float("inf"))).sum()
-    n_bad = int(n_bad.compute() if hasattr(n_bad, "compute") else n_bad)
-    if n_bad:
-        raise ValueError(f"{n_bad} edge weights are missing, negative or not finite")
+    n_positive = (w > 0).sum()
+    if hasattr(n_bad, "compute"):
+        n_bad, n_positive = dask.compute(n_bad, n_positive)
+    if int(n_bad):
+        raise ValueError(f"{int(n_bad)} edge weights are missing, negative or not finite")
+    if not int(n_positive):
+        raise ValueError("all edge weights are 0, so weighted walks would not leave their start vertices")
     return kg_data
 
 
@@ -361,6 +400,10 @@ class GPU_RDF2Vec:
 
     def construct_graph(self, kg_data):
         with self.tracker.stage("Graph_Construction"):
+            if self.config.multi_gpu:
+                # The edge list is still the lazy read plus vocabulary merges,
+                # and several steps below compute it.
+                kg_data = kg_data.persist()
             # cuGraph does not allow edge_attr and weight simultaneously, so
             # weighted walks look their predicates up in `_edge_index` by
             # (subject, object, weight) instead.
@@ -506,7 +549,7 @@ class GPU_RDF2Vec:
         -----
         * Builds a vocabulary with `_generate_vocab` and stores it in
             `self.word2idx`.
-        * Persists ``word2idx`` as Parquet under *./vector/* when
+        * `transform` writes ``word2idx`` as Parquet under *./vector/* when
             ``self.generate_artifact`` is ``True``.
         * Returns the int‑encoded edge list for downstream use (e.g.,
             a`fit`).
@@ -825,6 +868,7 @@ class GPU_RDF2Vec:
                 walks_parquet = f"{walk_dir}/walks"
                 if isinstance(walk_sequences, WalkParquet):
                     walks_parquet = walk_sequences.path  # written by the GPUs
+                    _check_walk_files(walk_sequences)
                 elif hasattr(walk_sequences, "to_parquet"):
                     logger.info(f"Checkpointing walk sequences to {walks_parquet}")
                     # dask_cudf.DataFrame: each worker writes its partition.
@@ -929,15 +973,7 @@ class GPU_RDF2Vec:
             if self.config.reproducible:
                 L.seed_everything(self.config.random_state, workers=True)
             self.tracker.log_pytorch()
-            # On one node, Lightning spawns one worker per GPU itself. Inside a
-            # SLURM allocation it would otherwise defer the launch to SLURM and,
-            # under `--ntasks=1`, run DDP as a single rank.
-            if n_gpus > 1 and self.config.num_nodes == 1:
-                from lightning.pytorch.strategies import DDPStrategy
-                from lightning.pytorch.plugins.environments import LightningEnvironment
-                strategy = DDPStrategy(cluster_environment=LightningEnvironment())
-            else:
-                strategy = "ddp" if n_gpus > 1 else "auto"
+            strategy = _ddp_strategy(n_gpus, self.config.num_nodes)
             trainer = L.Trainer(
                 max_epochs=self.config.epochs,
                 log_every_n_steps=1,
@@ -1050,7 +1086,8 @@ class GPU_RDF2Vec:
         * ``embedding_0 … embedding_{vector_size‑1}`` – float32 components
 
         When `self.generate_artifact` is *True*, the resulting table is also
-        written to *./vector/embeddings_<model‑hash>.parquet*.
+        written to *./vector/embeddings_<embedding_model>.parquet* and the
+        ``word2idx`` mapping to *./vector/word2idx.parquet*.
 
         Returns
         -------
@@ -1083,10 +1120,13 @@ class GPU_RDF2Vec:
             else:
                 embedding_df = self._extract_embeddings_pytorch()
             if self.config.generate_artifact:
+                os.makedirs("vector", exist_ok=True)
                 embedding_df.to_parquet(
                     f"vector/embeddings_{self.config.embedding_model}.parquet",
                     index=False,
                 )
+                word2idx = self.word2idx.compute() if hasattr(self.word2idx, "compute") else self.word2idx
+                word2idx.to_parquet("vector/word2idx.parquet", index=False)
             return embedding_df
 
     def _extract_embeddings_pytorch(self) -> cudf.DataFrame:
@@ -1126,7 +1166,8 @@ class GPU_RDF2Vec:
 
         kv = self.word2vec_model.wv  # gensim.models.KeyedVectors
         # Numeric, token-indexed matrix (zeros for any token gensim filtered).
-        vectors = kv_to_token_aligned_matrix(kv, self.word2idx)
+        # the library trains gensim on token ids (`int_tokens=True`)
+        vectors = kv_to_token_aligned_matrix(kv, self.word2idx, int_tokens=True)
         if len(kv.index_to_key) < vectors.shape[0]:
             logger.warning(
                 f"gensim KV vocab ({len(kv.index_to_key):,}) is smaller than "
@@ -1206,7 +1247,8 @@ class GPU_RDF2Vec:
         Creates a directory with:
           - config.json     (RDF2VecConfig as JSON)
           - word2idx.parquet (token↔word mapping)
-          - model.pt        (PyTorch state dict, only if fit() was called)
+          - model.pt        (PyTorch state dict, only if fit() was called), or
+            model.gensim    (gensim Word2Vec, with backend="gensim")
         """
         from pathlib import Path as _P
         import json
@@ -1220,7 +1262,10 @@ class GPU_RDF2Vec:
             self.word2idx.to_parquet(out / "word2idx.parquet", index=False)
         # Model weights
         if self.word2vec_model is not None:
-            torch.save(self.word2vec_model.state_dict(), out / "model.pt")
+            if self.config.backend == "gensim":
+                self.word2vec_model.save(str(out / "model.gensim"))
+            else:
+                torch.save(self.word2vec_model.state_dict(), out / "model.pt")
         logger.info(f"Saved GPU_RDF2Vec artifacts to {out}")
 
     @classmethod
@@ -1238,7 +1283,11 @@ class GPU_RDF2Vec:
             instance.word2idx = cudf.read_parquet(word2idx_path)
         # Model weights
         model_path = src / "model.pt"
-        if model_path.exists():
+        if config.backend == "gensim" and (src / "model.gensim").exists():
+            from gensim.models import Word2Vec
+
+            instance.word2vec_model = Word2Vec.load(str(src / "model.gensim"))
+        elif model_path.exists():
             if config.embedding_model == "skipgram":
                 model = SkipGram(
                     vocab_size=instance.word2idx.shape[0],

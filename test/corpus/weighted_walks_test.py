@@ -194,6 +194,22 @@ def test_invalid_weights_rejected(bad):
 
 
 @pytest.mark.gpu
+def test_all_zero_weights_rejected():
+    from src.rdf2vecgpu.gpu_rdf2vec import _checked_weights
+
+    edges = _edges()
+    edges["weights"] = 0.0
+    with pytest.raises(ValueError, match="all edge weights are 0"):
+        _checked_weights(edges)
+    import dask_cudf
+
+    with pytest.raises(ValueError, match="all edge weights are 0"):
+        _checked_weights(dask_cudf.from_cudf(edges, npartitions=2))
+    edges["weights"] = cudf.Series([0, 0, 0, 0, 0, 0, 2], dtype="float32")
+    _checked_weights(edges)
+
+
+@pytest.mark.gpu
 def test_integer_weights_become_float():
     from src.rdf2vecgpu.gpu_rdf2vec import _checked_weights
 
@@ -253,3 +269,57 @@ def test_walk_stepwise_matches_walk_probabilities():
     assert abs((first == 1).mean() - 8 / 12) < 5 * math.sqrt(8 / 12 * 4 / 12 / n)
     assert set(np.unique(weights[first == 2]).tolist()) == {4.0}
     assert (V[n:, 2:] == -1).all() and (W[n:, 1:] == 0).all()
+
+
+@pytest.mark.gpu
+def test_recover_draws_follow_input_order():
+    """A seeded draw depends on the steps' order only, not on the order the
+    merge returns rows in: row i draws the i-th number of the seeded stream."""
+    edges = _edges()
+    steps = cudf.DataFrame({
+        "id": cp.arange(2000),
+        "src": cudf.Series([0] * 2000, dtype="int32"),
+        "dst": cudf.Series([1, 2] * 1000, dtype="int32"),
+        "weight": cudf.Series([3.0, 4.0] * 1000, dtype="float32"),
+    })
+    got = recover_weighted_predicates(steps, weighted_edge_index(edges), random_state=7)
+    got = got.sort_values("id")["predicate"].values_host
+    u = cp.random.RandomState(7).random_sample(len(steps)).get()
+    tie = np.array([B, D])[np.minimum((u * 2).astype(int), 1)]
+    expected = np.where(np.arange(2000) % 2 == 0, tie, C)
+    assert (got == expected).all()
+
+
+@pytest.mark.gpu
+def test_write_walk_sequences_refuses_used_out_dir(tmp_path):
+    """Old part files in `out_dir` would be read along with the new walks."""
+    from src.rdf2vecgpu.corpus.walk_corpus import MultiGPUWalkCorpus
+
+    cudf.DataFrame({"a": [1]}).to_parquet(tmp_path / "part.7.parquet")
+    with pytest.raises(ValueError, match="already holds parquet files"):
+        MultiGPUWalkCorpus(None, window_size=2).write_walk_sequences(
+            None, walk_number=1, walk_depth=4, random_state=0, out_dir=str(tmp_path)
+        )
+
+
+@pytest.mark.gpu
+def test_zero_weights():
+    """A weight-0 edge is never taken; a vertex whose out-edges all weigh 0
+    ends the walk, also when every walk starts there."""
+    ring = list(range(10, 50))
+    edges = cudf.DataFrame({
+        "subject": cudf.Series(ring + [10, 20, 200], dtype="int32"),
+        "predicate": cudf.Series([A] * len(ring) + [B, C, D], dtype="int64"),
+        "object": cudf.Series(ring[1:] + ring[:1] + [100, 200, 201], dtype="int32"),
+        "weights": cudf.Series([1.0] * len(ring) + [0.0, 1.0, 0.0], dtype="float32"),
+    })
+    corpus = _corpus(edges, weighted=True)
+    walks = corpus.random_walk_sequences(cudf.Series([10, 20] * 1000, dtype="int32"), walk_depth=4, random_state=0)
+    V, P = _matrices(walks, 4)
+    steps = _assert_valid_steps(V, P, edges)
+    assert (10, B, 100) not in steps and (200, D, 201) not in steps
+    through_200 = (V == 200).any(axis=1)
+    assert through_200.any() and (V[through_200][:, 2:] < 0).all()
+    stuck = corpus.random_walk_sequences(cudf.Series([200] * 10, dtype="int32"), walk_depth=4, random_state=0)
+    V, _ = _matrices(stuck, 4)
+    assert (V[:, 0] == 200).all() and (V[:, 1:] < 0).all()

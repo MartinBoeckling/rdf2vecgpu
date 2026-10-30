@@ -114,6 +114,11 @@ name). You can use ``col_map`` to rename an existing edge-weight column accordin
        col_map={"distance": "weights"},
    )
 
+Weights must be finite and non-negative, and at least one must be positive. A walk takes an
+out-edge with probability proportional to its weight, so a weight-0 edge is never walked and a
+vertex whose out-edges all weigh 0 ends the walk. BFS walks (``walk_strategy="bfs"``) ignore
+the weights and also follow weight-0 edges.
+
 Literal handling
 ~~~~~~~~~~~~~~~~
 Knowledge graphs often contain edges whose object is a literal value (for example numeric

@@ -126,10 +126,16 @@ def _draw_ranks(df, random_state=None):
 def _pick_parallel_edges(steps, index, keys, random_state, what):
     """`steps` (cudf or dask_cudf) with an int64 `predicate` column added: that
     of one `index` edge sharing the step's `keys`, drawn uniformly among them.
-    Rows come back in arbitrary order; a step without a matching edge raises."""
+    Rows come back in arbitrary order; a step without a matching edge raises.
+    With cudf `steps` a `random_state` fixes the draws."""
     groups = index[index["rank"] == 0][keys + ["n"]]
+    is_dask = isinstance(steps, dcudf.DataFrame)
+    if not is_dask:
+        # merge output order is arbitrary; the draws follow the input order
+        steps = steps.assign(_row=cp.arange(len(steps)))
     out = steps.merge(groups, on=keys, how="left")
-    is_dask = isinstance(out, dcudf.DataFrame)
+    if not is_dask:
+        out = out.sort_values("_row").drop(columns="_row").reset_index(drop=True)
     if is_dask:
         from dask.distributed import wait as dask_wait
 
@@ -864,10 +870,9 @@ class MultiGPUWalkCorpus:
         # including the list columns' leaf dtype — newer cudf reports list
         # columns as `list` (not `object`) and dask's check_meta compares the
         # full dtype, so a hand-built meta with the wrong leaf type still trips
-        # it ("Found: list / Expected: list"). Derive the meta by actually
-        # computing the first partition (cheap — `walks_s`/`edge_attrs_s` are
-        # already persisted, so this is just the reshape+to-list for one
-        # partition, not a re-walk).
+        # it ("Found: list / Expected: list"). The meta is therefore the empty
+        # head of the first partition, taken after the partitions are
+        # persisted, so no partition is built twice or sent to the client.
         walks_delayed = walks_s.to_delayed()
         edges_delayed = edge_attrs_s.to_delayed()
         if len(walks_delayed) != len(edges_delayed):
@@ -881,7 +886,8 @@ class MultiGPUWalkCorpus:
                                           edge_index)
             for i in range(len(walks_delayed))
         ]
-        meta = dask.compute(parts[0])[0].iloc[:0]
+        parts = dask.persist(*parts)
+        meta = dask.compute(parts[0].iloc[:0])[0]
         # dask's pyarrow-string check passes each meta dtype to pandas'
         # `is_object_dtype`, which raises on cuDF list dtypes; the walk frame
         # holds no strings, so the conversion is off for this call.
@@ -928,6 +934,8 @@ class MultiGPUWalkCorpus:
         from dask.distributed import default_client
         from cugraph.dask.comms import comms as Comms
 
+        if os.path.isdir(out_dir) and any(f.endswith(".parquet") for f in os.listdir(out_dir)):
+            raise ValueError(f"{out_dir} already holds parquet files, which readers would mix with these walks")
         client = default_client()
         if hasattr(walk_vertices, "compute"):
             walk_vertices = walk_vertices.compute()

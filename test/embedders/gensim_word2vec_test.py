@@ -276,3 +276,20 @@ def test_kv_to_token_aligned_matrix_dtype_is_float32():
     fake_kv = _FakeKeyedVectors({"0": np.array([1.0], dtype=np.float64)})
     matrix = kv_to_token_aligned_matrix(fake_kv, word2idx)
     assert matrix.dtype == np.float32
+
+
+def test_kv_to_token_aligned_matrix_word_keys_that_look_like_ints():
+    """With word keys, a literal such as "1990" is looked up, not read as token 1990."""
+    word2idx = pd.DataFrame({"token": [0, 1, 2], "word": ["http://a", "1990", "2"]})
+    fake_kv = _FakeKeyedVectors({"1990": np.array([5.0]), "2": np.array([7.0]), "http://a": np.array([1.0])})
+    matrix = kv_to_token_aligned_matrix(fake_kv, word2idx, int_tokens=False)
+    assert matrix[:, 0].tolist() == [1.0, 5.0, 7.0]
+
+
+def test_kv_to_token_aligned_matrix_uses_vectors_array():
+    """A KeyedVectors' `vectors` array (aligned with `index_to_key`) is used directly."""
+    word2idx = pd.DataFrame({"token": [0, 1, 2], "word": ["a", "b", "c"]})
+    fake_kv = _FakeKeyedVectors({"2": np.array([3.0]), "0": np.array([1.0])})
+    fake_kv.vectors = np.array([[3.0], [1.0]], dtype=np.float32)
+    matrix = kv_to_token_aligned_matrix(fake_kv, word2idx, int_tokens=True)
+    assert matrix[:, 0].tolist() == [1.0, 0.0, 3.0]

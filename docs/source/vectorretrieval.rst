@@ -46,5 +46,6 @@ The following example demonstrates how to perform this retrieval process:
 
 The ``transform`` method returns a cuDF dataframe where the keys are the entity URIs, together with
 the internal integer-based ID and the embedding vectors. If you set ``generate_artifact=True``
-during the configuration, the embeddings will also be saved to disk in the specified output
-directory as a Parquet file.
+during the configuration, the embeddings and the ``word2idx`` mapping are also written as
+Parquet files to ``./vector/embeddings_<embedding_model>.parquet`` and
+``./vector/word2idx.parquet``.

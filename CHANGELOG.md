@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.0] — 2026-10-26
+## [0.5.0] — 2026-10-30
 
 Walk-generation fixes and a chunked multi-GPU walk writer. 0.4.0 was not
 published to PyPI, so this is the first PyPI release that also contains the
@@ -32,7 +32,21 @@ published to PyPI, so this is the first PyPI release that also contains the
 - Walk predicates are int64 vocabulary tokens, weighted and unweighted
   (previously float, from cuGraph's weight slot).
 - `walk_weighted=True` rejects missing, negative or non-finite edge weights
-  and converts integer weights to float32.
+  and converts integer weights to float32, and a graph whose weights are all
+  0. A weight-0 edge is never walked; a vertex whose out-edges all weigh 0
+  ends the walk. BFS walks ignore the weights.
+- Triples with a missing subject, predicate or object are dropped before the
+  vocabulary is built.
+- Multi-GPU CBOW with `backend="pytorch"` is rejected by `RDF2VecConfig`: its
+  training pairs lost the context windows, so CBOW trained on one context
+  word per sample. Use `backend="gensim"` or a single GPU.
+- `write_walk_sequences` refuses an `out_dir` that already holds parquet
+  files, which readers would otherwise mix with the new walks.
+- Multi-GPU gensim training checks that the walk files it reads hold every
+  walk written. The Dask workers write them, so all workers must run on the
+  client's node.
+- `generate_artifact=True` also writes `vector/word2idx.parquet`, as
+  documented, and creates `vector/`.
 
 ### Fixed
 
@@ -74,7 +88,8 @@ published to PyPI, so this is the first PyPI release that also contains the
   edge list (`construct_graph` stores them), passed to cuGraph as one
   `cudf.Series`.
 - Multi-GPU `random_walk_sequences` failed dask's meta check on newer cuDF
-  (list vs object dtype); the meta is now taken from the first partition.
+  (list vs object dtype); the meta is now the empty head of the first
+  persisted partition.
   With pyarrow strings enabled (dask's default) it also failed in
   `from_delayed` (`issubclass() arg 1 must be a class`), which is now
   called with string conversion off.
@@ -83,7 +98,37 @@ published to PyPI, so this is the first PyPI release that also contains the
   the gradient all-reduce blocked. Each rank now reads a disjoint block of
   `total_rows // world_size` rows. On one node, Lightning now spawns the
   per-GPU workers itself; inside a SLURM allocation with `--ntasks=1` it
-  previously ran DDP as a single rank.
+  previously ran DDP as a single rank. When SLURM starts one task per GPU,
+  the launch stays with SLURM.
+- The single-GPU vocabulary paired tokens with the wrong words after a
+  missing word (`factorize` codes it -1 but leaves it out of the uniques),
+  so every later embedding was labelled with the next word.
+- Seeded predicate draws among parallel edges (weighted walks, BFS) depended
+  on the row order of a cuDF merge and were not reproducible.
+- Multi-GPU N-Triples input failed: `dask.dataframe` has no `read_text`; it
+  now uses `dask_cudf.read_text`.
+- Parquet input with a `col_map` other than the identity raised `KeyError`:
+  the reader took the map's values as file columns, the rename its keys.
+  `col_map` maps file columns to `subject`/`predicate`/`object`/`weights`,
+  as documented.
+- `save()` failed with `backend="gensim"` (gensim models have no
+  `state_dict`); gensim models are now saved as `model.gensim` and restored
+  by `load()`.
+- `transform()` with `generate_artifact=True` failed when `./vector/` did
+  not exist.
+- Multi-GPU graph construction recomputed the edge list (file read and
+  vocabulary merges) for each of its steps; it is now persisted once.
+- Exporting gensim vectors copied them one key at a time in Python; the copy
+  is now one array assignment. With word keys (`int_tokens=False`), keys
+  that look like integers (e.g. the literal "1990") are looked up as words.
+
+### Known issues
+
+- Multi-GPU PyTorch training on one node: Lightning starts the user's script
+  again for every further GPU, so each process repeats data loading and walk
+  generation and trains on its own walks.
+- Before training, multi-GPU `fit()` closes the Dask client but not the
+  cluster, so the workers keep their GPU memory (e.g. an RMM pool).
 
 ## [0.4.0] — 2026-04-27
 
