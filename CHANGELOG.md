@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.0] — 2026-10-30
+## [0.5.0] — 2026-11-02
 
 Walk-generation fixes and a chunked multi-GPU walk writer. 0.4.0 was not
 published to PyPI, so this is the first PyPI release that also contains the
@@ -31,6 +31,8 @@ published to PyPI, so this is the first PyPI release that also contains the
   of depth 4, now ~5 ms). The parquet schema is unchanged.
 - Walk predicates are int64 vocabulary tokens, weighted and unweighted
   (previously float, from cuGraph's weight slot).
+- The `gensim` extra requires `gensim>=4.4.0`, the first release that
+  supports numpy 2.
 - `walk_weighted=True` rejects missing, negative or non-finite edge weights
   and converts integer weights to float32, and a graph whose weights are all
   0. A weight-0 edge is never walked; a vertex whose out-edges all weigh 0
