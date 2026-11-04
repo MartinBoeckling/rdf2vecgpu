@@ -258,27 +258,17 @@ In case you have found a bug or unexpected behaviour, please reach out by openin
 If you use gpuRDF2Vec in your research, please cite the following paper:
 
 ```bibtex
-@InProceedings{10.1007/978-3-032-09530-5_14,
-  author="B{\"o}ckling, Martin and Paulheim, Heiko",
-  editor="Garijo, Daniel
-  and Kirrane, Sabrina
-  and Salatino, Angelo
-  and Shimizu, Cogan
-  and Acosta, Maribel
-  and Nuzzolese, Andrea Giovanni
-  and Ferrada, Sebasti{\'a}n
-  and Soulard, Thibaut
-  and Kozaki, Kouji
-  and Takeda, Hideaki
-  and Gentile, Anna Lisa",
-  title="gpuRDF2vec -- Scalable GPU-Based RDF2vec",
-  booktitle="The Semantic Web -- ISWC 2025",
-  year="2026",
-  publisher="Springer Nature Switzerland",
-  address="Cham",
-  pages="240--257",
-  isbn="978-3-032-09530-5"
+@inproceedings{boeckling2025gpurdf2vec,
+  author    = {B{\"o}ckling, Martin and Paulheim, Heiko},
+  editor    = {Garijo, Daniel and Kirrane, Sabrina and Salatino, Angelo and Shimizu, Cogan and Acosta, Maribel and Nuzzolese, Andrea Giovanni and Ferrada, Sebasti{\'a}n and Soulard, Thibaut and Kozaki, Kouji and Takeda, Hideaki and Gentile, Anna Lisa},
+  title     = {{gpuRDF2vec} -- Scalable {GPU}-Based {RDF2vec}},
+  booktitle = {The Semantic Web -- {ISWC} 2025},
+  series    = {Lecture Notes in Computer Science},
+  year      = {2025},
+  publisher = {Springer Nature Switzerland},
+  address   = {Cham},
+  pages     = {240--257},
+  isbn      = {978-3-032-09530-5},
+  doi       = {10.1007/978-3-032-09530-5_14}
 }
-
-
 ```

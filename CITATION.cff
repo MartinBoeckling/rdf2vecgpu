@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-title: gpurdf2vec
+title: gpuRDF2vec
 message: If you use this software please cite it as below
 type: software
 authors:
@@ -24,7 +24,7 @@ preferred-citation:
         orcid: 'https://orcid.org/0000-0003-4386-8195'
   doi: 10.1007/978-3-032-09530-5_14
 
-  collection-title: The Semantic Web -- ISWC 2025
+  collection-title: The Semantic Web – ISWC 2025
   year: 2025
   editors:
       - family-names: Garijo
