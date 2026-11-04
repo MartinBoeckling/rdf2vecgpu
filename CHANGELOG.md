@@ -118,6 +118,13 @@ published to PyPI, so this is the first PyPI release that also contains the
   by `load()`.
 - `transform()` with `generate_artifact=True` failed when `./vector/` did
   not exist.
+- N-Quads input (`.nq`) kept the graph term in the object column
+  (`<a> <b> <c> <g> .` gave the object `c> <g`); it is now dropped.
+- `fit()` without `load_data()` (for example after `read_data()`, which only
+  reads the file) failed with a misleading "call fit() first"; it now says to
+  call `load_data()`, which builds the vocabulary and the graph.
+- `read_kwargs={"columns": ...}` for parquet input raised a duplicate-keyword
+  `TypeError`; it is now rejected with a message pointing to `col_map`.
 - Multi-GPU graph construction recomputed the edge list (file read and
   vocabulary merges) for each of its steps; it is now persisted once.
 - Exporting gensim vectors copied them one key at a time in Python; the copy

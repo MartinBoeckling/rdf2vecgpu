@@ -70,3 +70,18 @@ def test_gensim_save_load_and_artifacts(tmp_path, monkeypatch):
     row = emb[emb["token"] == 3]
     got = np.array([float(row[f"embedding_{i}"].iloc[0]) for i in range(4)])
     assert np.allclose(got, w2v.wv["3"])
+
+
+@pytest.mark.gpu
+def test_fit_before_load_data_says_so(tmp_path):
+    """`read_data` only reads the file; `fit` needs the graph `load_data` builds."""
+    import cudf
+
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    path = tmp_path / "kg.parquet"
+    cudf.DataFrame({"subject": ["a", "b"], "predicate": ["p", "p"], "object": ["b", "a"]}).to_parquet(path)
+    model = GPU_RDF2Vec(epochs=1, vector_size=4, window_size=2, tune_batch_size=False)
+    edges = model.read_data(str(path))
+    with pytest.raises(RuntimeError, match="call load_data"):
+        model.fit(edges)

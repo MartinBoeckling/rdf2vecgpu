@@ -33,6 +33,12 @@ class WalkParquet:
     n_walks: int
 
 
+_NO_GRAPH = (
+    "no graph built yet: call load_data() before fit(); read_data() only reads the file, "
+    "load_data() also builds the vocabulary and the graph"
+)
+
+
 def _ddp_strategy(n_gpus: int, num_nodes: int):
     """Lightning strategy for training on `n_gpus` GPUs per node.
 
@@ -589,16 +595,13 @@ class GPU_RDF2Vec:
         Raises
         ------
         RuntimeError
-            If `walk_vertices` is None *and* the instance is un-fitted
-            (`self._walk_source_vertices is None`).
+            If `walk_vertices` is None *and* no graph has been built yet
+            (`load_data` / `construct_graph` not called).
         """
         if walk_vertices is not None:
             return walk_vertices
         if self._walk_source_vertices is None:
-            raise RuntimeError(
-                "call fit() first, or pass walk_vertices explicitly — "
-                "_walk_source_vertices is unset (instance not yet fitted)"
-            )
+            raise RuntimeError(_NO_GRAPH)
         return self._walk_source_vertices
 
     def walk_generation(
@@ -769,6 +772,8 @@ class GPU_RDF2Vec:
          ------
          ValueError
              If an invalid ``walk_strategy`` is supplied.
+         RuntimeError
+             If no graph has been built yet (call `load_data` first).
 
         Notes
         -----
@@ -781,6 +786,8 @@ class GPU_RDF2Vec:
          >>> edges = rdf2vec.load_data("example.parquet")
          >>> rdf2vec.fit(edges)
         """
+        if self._walk_source_vertices is None:
+            raise RuntimeError(_NO_GRAPH)
         # backend dispatch: gensim consumes walks-as-sequences via parquet
         # streaming and trains on CPU; pytorch consumes (center, context)
         # skip-gram pairs and trains on GPU via Lightning.

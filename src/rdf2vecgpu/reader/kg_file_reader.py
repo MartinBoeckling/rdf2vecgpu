@@ -99,6 +99,11 @@ class KGFileReader:
         source = {target: name for name, target in self.col_map.items()}
         targets = ["subject", "predicate", "object"] + (["weights"] if self.walk_weighted else [])
         columns = [source.get(target, target) for target in targets]
+        if "columns" in self.read_kwargs:
+            raise ValueError(
+                "read_kwargs may not set 'columns' for parquet: the reader reads the subject, predicate "
+                "and object (and weights) columns; use col_map to name them"
+            )
         if self.multi_gpu:
             kg_data = dd.read_parquet(
                 self.file_path,
@@ -142,6 +147,9 @@ class KGFileReader:
         extracted = df["raw"].str.extract(nt_pattern)
         extracted.columns = ["subject", "predicate", "object"]
 
+        if self.file_ending == ".nq":
+            # an N-Quads line may end with a graph term after the object
+            extracted["object"] = extracted["object"].str.replace(r"\s+(<[^>]+>|_:\S+)$", "", regex=True)
         extracted["object"] = extracted["object"].str.replace(r"^<|>$", "", regex=True)
         kg_data = extracted[["subject", "predicate", "object"]]
         return kg_data
