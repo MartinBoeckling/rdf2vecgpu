@@ -163,6 +163,10 @@ published to PyPI, so this is the first PyPI release that also contains the
   `sphinx-build -W`.
 - README links and the header image use absolute GitHub URLs so they work on
   PyPI.
+- The README's "Implementation Details" section is replaced by a short "How it
+  works" section based on the code. It drops claims the code does not support
+  (a GPU-memory batch-size rule, all-reduce at fixed intervals, linear scaling)
+  and figures without a source.
 - The contributor notes (the Dask `persist` / `broadcast=True` patterns and the
   `_compat` patches) moved from the README to a new `CONTRIBUTING.md`, which
   also covers the development setup, the tests and the docs build.
