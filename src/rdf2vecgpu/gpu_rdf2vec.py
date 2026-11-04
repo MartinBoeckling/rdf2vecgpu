@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 from cugraph import MultiGraph
 import cugraph
@@ -9,11 +10,85 @@ from .helper.functions import _generate_vocab, cudf_to_torch_tensor
 from .embedders.word2vec import SkipGram, CBOW
 from .embedders.word2vec_loader import SkipGramDataModule, CBOWDataModule, ParquetSkipGramDataModule
 from .reader.kg_file_reader import KGFileReader
-from .corpus.walk_corpus import SingleGPUWalkCorpus, MultiGPUWalkCorpus
+from .corpus.walk_corpus import (
+    SingleGPUWalkCorpus,
+    MultiGPUWalkCorpus,
+    encode_predicates,
+    predicate_code_table,
+    weighted_edge_index,
+)
 from .logger import build_tracker
 import cudf
 from loguru import logger
 from .config import RDF2VecConfig
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class WalkParquet:
+    """Walk sequences already written to a parquet directory by the multi-GPU
+    `walk_generation_sequences(out_dir=...)` path."""
+
+    path: str
+    n_walks: int
+
+
+_NO_GRAPH = (
+    "no graph built yet: call load_data() before fit(); read_data() only reads the file, "
+    "load_data() also builds the vocabulary and the graph"
+)
+
+
+def _ddp_strategy(n_gpus: int, num_nodes: int):
+    """Lightning strategy for training on `n_gpus` GPUs per node.
+
+    On one node, Lightning spawns one worker per GPU itself. Inside a SLURM
+    allocation it would otherwise defer the launch to SLURM and, under
+    `--ntasks=1`, run DDP as a single rank. When SLURM starts several tasks
+    (one per GPU), the launch stays with SLURM."""
+    if n_gpus < 2:
+        return "auto"
+    if num_nodes == 1 and int(os.environ.get("SLURM_NTASKS", "1")) == 1:
+        from lightning.pytorch.strategies import DDPStrategy
+        from lightning.pytorch.plugins.environments import LightningEnvironment
+
+        return DDPStrategy(cluster_environment=LightningEnvironment())
+    return "ddp"
+
+
+def _check_walk_files(walks: WalkParquet) -> None:
+    """Raise unless the parquet files under `walks.path` hold all
+    `walks.n_walks` walks. The dask workers write them, so on a cluster
+    spanning several nodes the files of other nodes are not visible here."""
+    from glob import glob
+    import pyarrow.parquet as pq
+
+    files = glob(os.path.join(walks.path, "**", "*.parquet"), recursive=True)
+    rows = sum(pq.read_metadata(f).num_rows for f in files)
+    if rows != walks.n_walks:
+        raise RuntimeError(
+            f"{walks.path} holds {rows:,} of the {walks.n_walks:,} walks written; "
+            "multi-GPU gensim training needs every dask worker on this node"
+        )
+
+
+def _checked_weights(kg_data):
+    """`kg_data` with float `weights`, rejecting missing, negative or
+    non-finite weights, and graphs whose weights are all 0 (no weighted walk
+    would leave its start vertex)."""
+    w = kg_data["weights"]
+    if w.dtype.kind != "f":
+        kg_data = kg_data.assign(weights=w.astype("float32"))
+        w = kg_data["weights"]
+    n_bad = (w.isnull() | (w < 0) | ~(w.abs() < float("inf"))).sum()
+    n_positive = (w > 0).sum()
+    if hasattr(n_bad, "compute"):
+        n_bad, n_positive = dask.compute(n_bad, n_positive)
+    if int(n_bad):
+        raise ValueError(f"{int(n_bad)} edge weights are missing, negative or not finite")
+    if not int(n_positive):
+        raise ValueError("all edge weights are 0, so weighted walks would not leave their start vertices")
+    return kg_data
 
 
 class GPU_RDF2Vec:
@@ -160,6 +235,9 @@ class GPU_RDF2Vec:
         self._validate_environment()
         # Initialize the cugraph graph
         self.knowledge_graph = MultiGraph(directed=True)
+        self._walk_source_vertices = None  # set during fit (construct_graph); spec 2026-05-15 §1
+        self._code_to_token = None  # predicate code -> token table (construct_graph)
+        self._edge_index = None  # weighted walks' predicate lookup table (construct_graph)
         self.word2vec_model = None
         self.word2idx = None
         self.tracker = build_tracker(
@@ -328,9 +406,13 @@ class GPU_RDF2Vec:
 
     def construct_graph(self, kg_data):
         with self.tracker.stage("Graph_Construction"):
-            # cuGraph does not allow edge_attr and weight simultaneously.
-            # Predicates are always looked up via merge in the walk corpus,
-            # so we only need them stored in the graph for unweighted walks.
+            if self.config.multi_gpu:
+                # The edge list is still the lazy read plus vocabulary merges,
+                # and several steps below compute it.
+                kg_data = kg_data.persist()
+            # cuGraph does not allow edge_attr and weight simultaneously, so
+            # weighted walks look their predicates up in `_edge_index` by
+            # (subject, object, weight) instead.
             if self.config.walk_weighted:
                 edge_kwargs = dict(
                     source="subject",
@@ -339,16 +421,35 @@ class GPU_RDF2Vec:
                     renumber=False,
                 )
             else:
+                # The edge attribute travels in cuGraph's float32 weight slot,
+                # exact only below 2^24, so the graph carries compact predicate
+                # codes; walk output is decoded back with `_code_to_token`.
                 edge_kwargs = dict(
                     source="subject",
                     destination="object",
-                    edge_attr="predicate",
+                    edge_attr="pcode",
                     renumber=False,
                 )
+            if not self.config.walk_weighted:
+                tokens = kg_data["predicate"].unique()
+                if hasattr(tokens, "compute"):
+                    tokens = tokens.compute()
+                tokens = tokens.sort_values().values_host.astype("int64")
+                self._code_to_token = predicate_code_table(tokens)
+                if self.config.multi_gpu:
+                    kg_data = kg_data.assign(pcode=kg_data["predicate"].map_partitions(
+                        encode_predicates, tokens, meta=("pcode", "float32")))
+                else:
+                    kg_data = kg_data.assign(pcode=encode_predicates(kg_data["predicate"], tokens))
+            else:
+                self._code_to_token = None
+                kg_data = _checked_weights(kg_data)
+                self._edge_index = weighted_edge_index(kg_data)
+                if self.config.multi_gpu:
+                    self._edge_index = self._edge_index.persist()
             if self.config.multi_gpu:
-                cols = ["subject", "predicate", "object"]
-                if self.config.walk_weighted:
-                    cols.append("weights")
+                cols = ["subject", "object"]
+                cols.append("weights" if self.config.walk_weighted else "pcode")
                 kg_data = kg_data[cols]
                 if cugraph.dask.comms.comms.is_initialized():
                     self.knowledge_graph.from_dask_cudf_edgelist(
@@ -365,6 +466,30 @@ class GPU_RDF2Vec:
                 self.knowledge_graph.from_cudf_edgelist(
                     kg_data, **edge_kwargs
                 )
+            # Stash the actual source-vertex set for walk-gen. cuGraph's
+            # `.nodes()` on this MG / renumber=False config empirically returns
+            # only a fraction of the source set (~25% on the DBpedia subset).
+            # Compute from the encoded edge df directly. Spec 2026-05-15 §1, D2.
+            #
+            # cuGraph MG API contract (verified by reading
+            # cugraph/dask/sampling/uniform_random_walks.py:108-132): expects
+            # start_vertices as a *single* cudf.Series (NOT dask_cudf). cuGraph
+            # internally calls dask_cudf.from_cudf(start_vertices, npartitions=N)
+            # to distribute across workers, then submits one walk task per
+            # worker via persist_dask_df_equal_parts_per_worker. Passing a
+            # dask_cudf.Series in confuses that internal from_cudf call and
+            # only ~1/n_workers of starts emit walks (SLURM 246120 + 246160
+            # diagnostic: walked_mask 45% on both .unique() and .drop_duplicates()).
+            #
+            # Materialise to a single cudf.Series. walk_corpus.py is also
+            # patched to pass it through directly (not wrap to dask_cudf).
+            self._walk_source_vertices = kg_data["subject"].unique()
+            if hasattr(self._walk_source_vertices, "compute"):
+                self._walk_source_vertices = self._walk_source_vertices.compute()
+            logger.info(
+                f"walk-source vertices stashed: type={type(self._walk_source_vertices).__name__} "
+                f"shape={self._walk_source_vertices.shape} (cudf.Series — cuGraph distributes internally)"
+            )
             if self.config.tracker != "none":
                 degree_df = self.knowledge_graph.degree()
                 degree_col = degree_df["degree"]
@@ -430,7 +555,7 @@ class GPU_RDF2Vec:
         -----
         * Builds a vocabulary with `_generate_vocab` and stores it in
             `self.word2idx`.
-        * Persists ``word2idx`` as Parquet under *./vector/* when
+        * `transform` writes ``word2idx`` as Parquet under *./vector/* when
             ``self.generate_artifact`` is ``True``.
         * Returns the int‑encoded edge list for downstream use (e.g.,
             a`fit`).
@@ -446,6 +571,39 @@ class GPU_RDF2Vec:
         self.construct_graph(encoded_kg_data)
         return encoded_kg_data
 
+    def _resolve_walk_vertices(self, walk_vertices):
+        """Resolve the walk start-vertex set, routing around cuGraph .nodes().
+
+        cuGraph's MG `.nodes()` on a `renumber=False` graph empirically returns
+        only a fraction of the source-vertex set (~25% on the DBpedia subset);
+        instead we stash the actual `kg_data["subject"].unique()` during
+        `construct_graph` and consume it here. Callers can still override by
+        passing `walk_vertices` explicitly. Spec 2026-05-15 §1, §2.
+
+        Parameters
+        ----------
+        walk_vertices : cudf.Series, dcudf.Series, or None
+            If None, returns ``self._walk_source_vertices``. If provided,
+            returned unchanged (caller-supplied override).
+
+        Returns
+        -------
+        cudf.Series or dcudf.Series
+            The start-vertex set — int token IDs, one row per (vertex, walk)
+            pair *after* the caller's downstream `.repeat(walk_number)`.
+
+        Raises
+        ------
+        RuntimeError
+            If `walk_vertices` is None *and* no graph has been built yet
+            (`load_data` / `construct_graph` not called).
+        """
+        if walk_vertices is not None:
+            return walk_vertices
+        if self._walk_source_vertices is None:
+            raise RuntimeError(_NO_GRAPH)
+        return self._walk_source_vertices
+
     def walk_generation(
         self, edge_df: cudf.DataFrame, walk_vertices: cudf.Series = None
     ) -> cudf.DataFrame:
@@ -455,16 +613,19 @@ class GPU_RDF2Vec:
                     self.knowledge_graph,
                     self.config.window_size,
                     walk_weighted=self.config.walk_weighted,
+                    code_to_token=self._code_to_token,
+                    edge_index=self._edge_index,
                 )
             else:
                 walk_instance = SingleGPUWalkCorpus(
                     self.knowledge_graph,
                     self.config.window_size,
                     walk_weighted=self.config.walk_weighted,
+                    code_to_token=self._code_to_token,
+                    edge_index=self._edge_index,
                 )
             if self.config.walk_strategy == "random":
-                if walk_vertices is None:
-                    walk_vertices = self.knowledge_graph.nodes()
+                walk_vertices = self._resolve_walk_vertices(walk_vertices)
                 # Repeat each vertex walk_number times for walk start points
                 n = self.config.walk_number
                 if hasattr(walk_vertices, "map_partitions"):
@@ -482,8 +643,7 @@ class GPU_RDF2Vec:
                     min_count=self.config.min_count,
                 )
             elif self.config.walk_strategy == "bfs":
-                if walk_vertices is None:
-                    walk_vertices = self.knowledge_graph.nodes()
+                walk_vertices = self._resolve_walk_vertices(walk_vertices)
                 walk_corpus = walk_instance.bfs_walk(
                     edge_df=edge_df,
                     walk_vertices=walk_vertices,
@@ -506,7 +666,7 @@ class GPU_RDF2Vec:
         return walk_corpus
 
     def walk_generation_sequences(
-        self, edge_df: cudf.DataFrame, walk_vertices: cudf.Series = None
+        self, edge_df: cudf.DataFrame, walk_vertices: cudf.Series = None, out_dir: Optional[str] = None
     ):
         """Walks-as-sequences output for the gensim training backend.
 
@@ -519,6 +679,11 @@ class GPU_RDF2Vec:
         Only the "random" walk strategy is supported for the gensim backend
         in this release — bfs walks would need a parallel BFS-to-sequences
         path on the corpus classes.
+
+        With ``multi_gpu`` and `out_dir`, the walks are written by the GPUs
+        straight to that parquet directory in chunks
+        (`MultiGPUWalkCorpus.write_walk_sequences`) and a `WalkParquet` is
+        returned instead of a dask frame.
         """
         with self.tracker.stage("Walk_Generation"):
             if self.config.multi_gpu:
@@ -526,12 +691,16 @@ class GPU_RDF2Vec:
                     self.knowledge_graph,
                     self.config.window_size,
                     walk_weighted=self.config.walk_weighted,
+                    code_to_token=self._code_to_token,
+                    edge_index=self._edge_index,
                 )
             else:
                 walk_instance = SingleGPUWalkCorpus(
                     self.knowledge_graph,
                     self.config.window_size,
                     walk_weighted=self.config.walk_weighted,
+                    code_to_token=self._code_to_token,
+                    edge_index=self._edge_index,
                 )
             if self.config.walk_strategy != "random":
                 raise NotImplementedError(
@@ -539,20 +708,29 @@ class GPU_RDF2Vec:
                     f"only (got {self.config.walk_strategy!r}). bfs+gensim would "
                     f"need a parallel sequences output on bfs_walk."
                 )
-            if walk_vertices is None:
-                walk_vertices = self.knowledge_graph.nodes()
+            walk_vertices = self._resolve_walk_vertices(walk_vertices)
             n = self.config.walk_number
-            if hasattr(walk_vertices, "map_partitions"):
-                walk_vertices = walk_vertices.map_partitions(
-                    lambda s: s.repeat(n).reset_index(drop=True)
+            if self.config.multi_gpu and out_dir is not None:
+                n_walks = walk_instance.write_walk_sequences(
+                    walk_vertices,
+                    walk_number=n,
+                    walk_depth=self.config.walk_depth,
+                    random_state=self.config.random_state,
+                    out_dir=out_dir,
                 )
+                walk_sequences = WalkParquet(out_dir, n_walks)
             else:
-                walk_vertices = walk_vertices.repeat(n)
-            walk_sequences = walk_instance.random_walk_sequences(
-                walk_vertices=walk_vertices,
-                walk_depth=self.config.walk_depth,
-                random_state=self.config.random_state,
-            )
+                if hasattr(walk_vertices, "map_partitions"):
+                    walk_vertices = walk_vertices.map_partitions(
+                        lambda s: s.repeat(n).reset_index(drop=True)
+                    )
+                else:
+                    walk_vertices = walk_vertices.repeat(n)
+                walk_sequences = walk_instance.random_walk_sequences(
+                    walk_vertices=walk_vertices,
+                    walk_depth=self.config.walk_depth,
+                    random_state=self.config.random_state,
+                )
             self.tracker.log_params(
                 {
                     "walk_depth": self.config.walk_depth,
@@ -594,6 +772,8 @@ class GPU_RDF2Vec:
          ------
          ValueError
              If an invalid ``walk_strategy`` is supplied.
+         RuntimeError
+             If no graph has been built yet (call `load_data` first).
 
         Notes
         -----
@@ -606,14 +786,13 @@ class GPU_RDF2Vec:
          >>> edges = rdf2vec.load_data("example.parquet")
          >>> rdf2vec.fit(edges)
         """
+        if self._walk_source_vertices is None:
+            raise RuntimeError(_NO_GRAPH)
         # backend dispatch: gensim consumes walks-as-sequences via parquet
         # streaming and trains on CPU; pytorch consumes (center, context)
         # skip-gram pairs and trains on GPU via Lightning.
         if self.config.backend == "gensim":
-            walk_sequences = self.walk_generation_sequences(
-                edge_df=edge_df, walk_vertices=walk_vertices
-            )
-            self._fit_via_gensim(walk_sequences)
+            self._with_walk_sequences(edge_df, walk_vertices, self._fit_via_gensim)
             return
         walk_corpus = self.walk_generation(
             edge_df=edge_df,
@@ -654,11 +833,30 @@ class GPU_RDF2Vec:
                 walk_corpus = walk_corpus.compute()
             self._fit_from_tensors(walk_corpus)
 
+    def _with_walk_sequences(self, edge_df, walk_vertices, train) -> None:
+        """Generate walk sequences and pass them to `train`. Multi-GPU walks
+        are written by the GPUs to a temporary parquet directory (removed
+        afterwards) and passed as a `WalkParquet`."""
+        import shutil
+        import tempfile
+
+        if not self.config.multi_gpu:
+            train(self.walk_generation_sequences(edge_df=edge_df, walk_vertices=walk_vertices))
+            return
+        walk_dir = tempfile.mkdtemp(prefix="rdf2vec_walks_")
+        try:
+            train(self.walk_generation_sequences(
+                edge_df=edge_df, walk_vertices=walk_vertices, out_dir=f"{walk_dir}/walks"
+            ))
+        finally:
+            shutil.rmtree(walk_dir, ignore_errors=True)
+
     def _fit_via_gensim(self, walk_sequences) -> None:
         """Train Word2Vec via the optional gensim backend.
 
         Materializes the walks-as-sequences corpus to a temp parquet directory
-        (gensim's streaming `WalkCorpus` iterator reads parquet files), tears
+        (gensim's streaming `WalkCorpus` iterator reads parquet files; a
+        `WalkParquet` from the multi-GPU path is already on disk), tears
         down the dask cluster if multi-GPU was used so the GPU memory is
         released before CPU-side training, then fits gensim's
         negative-sampling Word2Vec.
@@ -675,8 +873,11 @@ class GPU_RDF2Vec:
             walk_dir = tempfile.mkdtemp(prefix="rdf2vec_gensim_walks_")
             try:
                 walks_parquet = f"{walk_dir}/walks"
-                logger.info(f"Checkpointing walk sequences to {walks_parquet}")
-                if hasattr(walk_sequences, "to_parquet"):
+                if isinstance(walk_sequences, WalkParquet):
+                    walks_parquet = walk_sequences.path  # written by the GPUs
+                    _check_walk_files(walk_sequences)
+                elif hasattr(walk_sequences, "to_parquet"):
+                    logger.info(f"Checkpointing walk sequences to {walks_parquet}")
                     # dask_cudf.DataFrame: each worker writes its partition.
                     # `random_walk_sequences()` already persist+wait-ed the
                     # walk output, but re-pin defensively here so a future
@@ -779,13 +980,14 @@ class GPU_RDF2Vec:
             if self.config.reproducible:
                 L.seed_everything(self.config.random_state, workers=True)
             self.tracker.log_pytorch()
+            strategy = _ddp_strategy(n_gpus, self.config.num_nodes)
             trainer = L.Trainer(
                 max_epochs=self.config.epochs,
                 log_every_n_steps=1,
                 accelerator="gpu",
                 precision="16-mixed",
                 devices=n_gpus,
-                strategy="ddp" if n_gpus > 1 else "auto",
+                strategy=strategy,
                 num_nodes=self.config.num_nodes,
                 enable_checkpointing=False,
             )
@@ -891,7 +1093,8 @@ class GPU_RDF2Vec:
         * ``embedding_0 … embedding_{vector_size‑1}`` – float32 components
 
         When `self.generate_artifact` is *True*, the resulting table is also
-        written to *./vector/embeddings_<model‑hash>.parquet*.
+        written to *./vector/embeddings_<embedding_model>.parquet* and the
+        ``word2idx`` mapping to *./vector/word2idx.parquet*.
 
         Returns
         -------
@@ -924,10 +1127,13 @@ class GPU_RDF2Vec:
             else:
                 embedding_df = self._extract_embeddings_pytorch()
             if self.config.generate_artifact:
+                os.makedirs("vector", exist_ok=True)
                 embedding_df.to_parquet(
                     f"vector/embeddings_{self.config.embedding_model}.parquet",
                     index=False,
                 )
+                word2idx = self.word2idx.compute() if hasattr(self.word2idx, "compute") else self.word2idx
+                word2idx.to_parquet("vector/word2idx.parquet", index=False)
             return embedding_df
 
     def _extract_embeddings_pytorch(self) -> cudf.DataFrame:
@@ -967,7 +1173,8 @@ class GPU_RDF2Vec:
 
         kv = self.word2vec_model.wv  # gensim.models.KeyedVectors
         # Numeric, token-indexed matrix (zeros for any token gensim filtered).
-        vectors = kv_to_token_aligned_matrix(kv, self.word2idx)
+        # the library trains gensim on token ids (`int_tokens=True`)
+        vectors = kv_to_token_aligned_matrix(kv, self.word2idx, int_tokens=True)
         if len(kv.index_to_key) < vectors.shape[0]:
             logger.warning(
                 f"gensim KV vocab ({len(kv.index_to_key):,}) is smaller than "
@@ -1047,7 +1254,8 @@ class GPU_RDF2Vec:
         Creates a directory with:
           - config.json     (RDF2VecConfig as JSON)
           - word2idx.parquet (token↔word mapping)
-          - model.pt        (PyTorch state dict, only if fit() was called)
+          - model.pt        (PyTorch state dict, only if fit() was called), or
+            model.gensim    (gensim Word2Vec, with backend="gensim")
         """
         from pathlib import Path as _P
         import json
@@ -1061,7 +1269,10 @@ class GPU_RDF2Vec:
             self.word2idx.to_parquet(out / "word2idx.parquet", index=False)
         # Model weights
         if self.word2vec_model is not None:
-            torch.save(self.word2vec_model.state_dict(), out / "model.pt")
+            if self.config.backend == "gensim":
+                self.word2vec_model.save(str(out / "model.gensim"))
+            else:
+                torch.save(self.word2vec_model.state_dict(), out / "model.pt")
         logger.info(f"Saved GPU_RDF2Vec artifacts to {out}")
 
     @classmethod
@@ -1079,7 +1290,11 @@ class GPU_RDF2Vec:
             instance.word2idx = cudf.read_parquet(word2idx_path)
         # Model weights
         model_path = src / "model.pt"
-        if model_path.exists():
+        if config.backend == "gensim" and (src / "model.gensim").exists():
+            from gensim.models import Word2Vec
+
+            instance.word2vec_model = Word2Vec.load(str(src / "model.gensim"))
+        elif model_path.exists():
             if config.embedding_model == "skipgram":
                 model = SkipGram(
                     vocab_size=instance.word2idx.shape[0],

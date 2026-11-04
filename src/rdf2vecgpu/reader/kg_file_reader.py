@@ -95,13 +95,15 @@ class KGFileReader:
         return renamed_df
 
     def _parquet_reader(self) -> DataFrameLike:
-        columns = [
-            self.col_map["subject"],
-            self.col_map["predicate"],
-            self.col_map["object"],
-        ]
-        if self.walk_weighted:
-            columns.append("weights")
+        # `col_map` maps source column names to the expected ones.
+        source = {target: name for name, target in self.col_map.items()}
+        targets = ["subject", "predicate", "object"] + (["weights"] if self.walk_weighted else [])
+        columns = [source.get(target, target) for target in targets]
+        if "columns" in self.read_kwargs:
+            raise ValueError(
+                "read_kwargs may not set 'columns' for parquet: the reader reads the subject, predicate "
+                "and object (and weights) columns; use col_map to name them"
+            )
         if self.multi_gpu:
             kg_data = dd.read_parquet(
                 self.file_path,
@@ -133,7 +135,9 @@ class KGFileReader:
 
     def _nt_reader(self) -> DataFrameLike:
         if self.multi_gpu:
-            df = dd.read_text(self.file_path).to_dataframe()
+            import dask_cudf
+
+            df = dask_cudf.read_text(str(self.file_path), delimiter="\n").to_frame()
             df.columns = ["raw"]
         else:
             df = cudf.read_text(self.file_path, delimiter="\n").to_frame()
@@ -143,6 +147,9 @@ class KGFileReader:
         extracted = df["raw"].str.extract(nt_pattern)
         extracted.columns = ["subject", "predicate", "object"]
 
+        if self.file_ending == ".nq":
+            # an N-Quads line may end with a graph term after the object
+            extracted["object"] = extracted["object"].str.replace(r"\s+(<[^>]+>|_:\S+)$", "", regex=True)
         extracted["object"] = extracted["object"].str.replace(r"^<|>$", "", regex=True)
         kg_data = extracted[["subject", "predicate", "object"]]
         return kg_data

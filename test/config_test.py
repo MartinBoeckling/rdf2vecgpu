@@ -68,3 +68,11 @@ def test_config_reject_invalid_tracker():
     assert "mlflow" in msg
     assert "wandb" in msg
     assert "none" in msg
+
+
+def test_multi_gpu_cbow_needs_gensim():
+    """Multi-GPU CBOW pairs on the PyTorch backend lose their context windows."""
+    with pytest.raises(ValueError, match="multi-GPU CBOW"):
+        RDF2VecConfig(multi_gpu=True, embedding_model="cbow", backend="pytorch")
+    RDF2VecConfig(multi_gpu=True, embedding_model="cbow", backend="gensim")
+    RDF2VecConfig(multi_gpu=False, embedding_model="cbow", backend="pytorch")

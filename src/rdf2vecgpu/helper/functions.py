@@ -62,7 +62,10 @@ def _generate_vocab(
       zero-based codes.
     * The Dask branch categorises the vocabulary to ensure identical codes
       across partitions before resetting the index.
+    * Triples with a missing subject, predicate or object (e.g. N-Triples
+      lines the reader cannot parse) are dropped first.
     """
+    edge_df = edge_df.dropna(subset=["subject", "predicate", "object"])
     if multi_gpu:
         # Build word2idx via hash-partition + per-partition arange.
         #
@@ -143,7 +146,9 @@ def _generate_vocab(
             .merge(w2i_p, on="predicate", broadcast=True)
             .merge(w2i_o, on="object", broadcast=True)
         )
-        edge_df = edge_df[["s_tok", "p_tok", "o_tok"]].rename(
+        # Extra columns (the `weights` of weighted walks) pass through.
+        extra = [c for c in edge_df.columns if c not in ("subject", "predicate", "object", "s_tok", "p_tok", "o_tok")]
+        edge_df = edge_df[["s_tok", "p_tok", "o_tok"] + extra].rename(
             columns={"s_tok": "subject", "p_tok": "predicate", "o_tok": "object"}
         )
         edge_df = edge_df.astype(

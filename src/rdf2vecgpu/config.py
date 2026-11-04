@@ -1,5 +1,5 @@
 from typing import Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class RDF2VecConfig(BaseModel):
@@ -124,3 +124,12 @@ class RDF2VecConfig(BaseModel):
     literal_strategy: Literal["drop", "bin"] = "drop"
     literal_n_bins: int = Field(default=5, gt=1)
     literal_bin_strategy: Literal["quantile", "uniform"] = "quantile"
+
+    @model_validator(mode="after")
+    def _check_multi_gpu_cbow(self):
+        if self.multi_gpu and self.backend == "pytorch" and self.embedding_model == "cbow":
+            # its training pairs lose the context windows (see `_cbow_pairs`)
+            raise ValueError(
+                "multi-GPU CBOW is not supported with backend='pytorch'; use backend='gensim' or a single GPU"
+            )
+        return self

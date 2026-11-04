@@ -61,6 +61,21 @@ Here is an example code snippet demonstrating how to train RDF2vec embeddings us
    gpu_rdf2vec_model.fit(edge_df=edge_data, walk_vertices=None)
 
 
+Multi-GPU training
+~~~~~~~~~~~~~~~~~~
+With ``multi_gpu=True`` the walks are written to a temporary parquet directory
+(``tempfile.mkdtemp``, i.e. under ``$TMPDIR`` or ``/tmp``) before training. Large
+corpora can take hundreds of GB, so point ``TMPDIR`` at a disk with enough space.
+
+* ``backend="gensim"`` trains in one process on the node of the Dask client and
+  reads the walk files the Dask workers wrote, so all workers must run on that
+  node (as with a ``LocalCUDACluster``). Training stops with an error if walk
+  files are missing.
+* ``backend="pytorch"`` trains with DDP. On one node, Lightning starts one
+  process per GPU itself; when SLURM starts one task per GPU
+  (``srun --ntasks-per-node=<GPUs>``), the launch is left to SLURM.
+* Multi-GPU CBOW needs ``backend="gensim"``.
+
 Pipeline stages and experiment tracking
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Internally, the pipeline is divided into stages wrapped by the tracker's context manager, for

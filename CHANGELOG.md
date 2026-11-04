@@ -5,6 +5,140 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-11-02
+
+Walk-generation fixes and a chunked multi-GPU walk writer. 0.4.0 was not
+published to PyPI, so this is the first PyPI release that also contains the
+0.4.0 changes below.
+
+### Added
+
+- `MultiGPUWalkCorpus.write_walk_sequences(...)` — multi-GPU random walks
+  written straight to a walks-as-sequences parquet directory in chunks, for
+  corpora that do not fit in GPU memory at once. Start vertices are split
+  across the GPUs once; each chunk is one task per GPU that walks, builds the
+  list columns and writes its own parquet files in the background while the
+  next chunk walks, so only walk counts reach the client.
+  `walk_generation_sequences(..., out_dir=...)` uses it in multi-GPU mode and
+  returns a `WalkParquet(path, n_walks)`, and the multi-GPU gensim `fit()`
+  trains from the files the GPUs wrote.
+
+### Changed
+
+- Walk list columns (`vertices`, `predicates`) are assembled on the GPU from
+  an offsets column instead of `cudf.Series(matrix.tolist())`, which
+  round-tripped every element through a Python object (~36 s per 25 M walks
+  of depth 4, now ~5 ms). The parquet schema is unchanged.
+- Walk predicates are int64 vocabulary tokens, weighted and unweighted
+  (previously float, from cuGraph's weight slot).
+- The `gensim` extra requires `gensim>=4.4.0`, the first release that
+  supports numpy 2.
+- `walk_weighted=True` rejects missing, negative or non-finite edge weights
+  and converts integer weights to float32, and a graph whose weights are all
+  0. A weight-0 edge is never walked; a vertex whose out-edges all weigh 0
+  ends the walk. BFS walks ignore the weights.
+- Triples with a missing subject, predicate or object are dropped before the
+  vocabulary is built.
+- Multi-GPU CBOW with `backend="pytorch"` is rejected by `RDF2VecConfig`: its
+  training pairs lost the context windows, so CBOW trained on one context
+  word per sample. Use `backend="gensim"` or a single GPU.
+- `write_walk_sequences` refuses an `out_dir` that already holds parquet
+  files, which readers would otherwise mix with the new walks.
+- Multi-GPU gensim training checks that the walk files it reads hold every
+  walk written. The Dask workers write them, so all workers must run on the
+  client's node.
+- `generate_artifact=True` also writes `vector/word2idx.parquet`, as
+  documented, and creates `vector/`.
+
+### Fixed
+
+- Walk predicates were rounded for vocabularies above 2^24 tokens: cuGraph
+  carries the edge attribute in a float32 weight slot, so token 16,777,217
+  came back as 16,777,216. The graph is now built on compact predicate codes
+  1..N (`encode_predicates`) and walk output is decoded back to tokens.
+- Weighted walks (`walk_weighted=True`) emitted each step's edge weight as
+  its predicate, so training failed on float token indices (since 0.4.0,
+  which stopped looking predicates up in the edge list as 0.3.0 did).
+  cuGraph's biased walks return only the weight, so the predicate is now
+  recovered from the edge list by (subject, object, weight), drawn uniformly
+  among parallel edges of equal weight. This matches the walker's edge
+  choice exactly, including on parallel edges where 0.3.0 picked an
+  arbitrary predicate. Multi-GPU skip-gram/CBOW walks look predicates up in
+  the distributed edge list; the multi-GPU walk-sequence paths (gensim) keep
+  a copy of the edge list on every GPU, so that list has to fit on one GPU.
+- BFS walks (`walk_strategy="bfs"`) failed with a `TypeError`: cuGraph's
+  `bfs()` only accepts a `cugraph.Graph`, not the `MultiGraph` the walks use.
+  BFS now runs on a `Graph` of the distinct (subject, object) pairs.
+- BFS walks were also out of order and duplicated steps over parallel
+  edges. Each walk's edges were sorted by subject token rather
+  than by depth, so a path whose vertex ids do not increase came out
+  scrambled and did not start at its root; and the predicate was merged back
+  by (subject, object), repeating a step once per parallel edge. Walks now
+  follow BFS-tree depth, and over parallel edges one predicate is drawn
+  uniformly (seeded by `random_state`), one walk per root-to-leaf path.
+- Single-GPU weighted walks crashed (`overall_num_elements must be > 0`,
+  raised by cuGraph's `biased_random_walks`) whenever every walk of a call
+  ended two or more steps before `walk_depth`, e.g. on graphs with many dead
+  ends. Such calls are now walked one step at a time, which gives the same
+  walk distribution. The multi-GPU walker is not affected.
+- Multi-GPU weighted walks dropped the `weights` column during vocabulary
+  encoding and could not build the graph.
+- Multi-GPU random walks started from only a fraction of the vertices:
+  cuGraph's MG `.nodes()` on a `renumber=False` graph returns a subset of the
+  source vertices, and a `dask_cudf.Series` of start vertices made cuGraph
+  walk only ~1/n_workers of them. Walks now start from the subjects of the
+  edge list (`construct_graph` stores them), passed to cuGraph as one
+  `cudf.Series`.
+- Multi-GPU `random_walk_sequences` failed dask's meta check on newer cuDF
+  (list vs object dtype); the meta is now the empty head of the first
+  persisted partition.
+  With pyarrow strings enabled (dask's default) it also failed in
+  `from_delayed` (`issubclass() arg 1 must be a class`), which is now
+  called with string conversion off.
+- Multi-GPU PyTorch training could hang: `ParquetSkipGramDataModule` gave
+  each DDP rank whole files, so ranks ran different numbers of batches and
+  the gradient all-reduce blocked. Each rank now reads a disjoint block of
+  `total_rows // world_size` rows. On one node, Lightning now spawns the
+  per-GPU workers itself; inside a SLURM allocation with `--ntasks=1` it
+  previously ran DDP as a single rank. When SLURM starts one task per GPU,
+  the launch stays with SLURM.
+- The single-GPU vocabulary paired tokens with the wrong words after a
+  missing word (`factorize` codes it -1 but leaves it out of the uniques),
+  so every later embedding was labelled with the next word.
+- Seeded predicate draws among parallel edges (weighted walks, BFS) depended
+  on the row order of a cuDF merge and were not reproducible.
+- Multi-GPU N-Triples input failed: `dask.dataframe` has no `read_text`; it
+  now uses `dask_cudf.read_text`.
+- Parquet input with a `col_map` other than the identity raised `KeyError`:
+  the reader took the map's values as file columns, the rename its keys.
+  `col_map` maps file columns to `subject`/`predicate`/`object`/`weights`,
+  as documented.
+- `save()` failed with `backend="gensim"` (gensim models have no
+  `state_dict`); gensim models are now saved as `model.gensim` and restored
+  by `load()`.
+- `transform()` with `generate_artifact=True` failed when `./vector/` did
+  not exist.
+- N-Quads input (`.nq`) kept the graph term in the object column
+  (`<a> <b> <c> <g> .` gave the object `c> <g`); it is now dropped.
+- `fit()` without `load_data()` (for example after `read_data()`, which only
+  reads the file) failed with a misleading "call fit() first"; it now says to
+  call `load_data()`, which builds the vocabulary and the graph.
+- `read_kwargs={"columns": ...}` for parquet input raised a duplicate-keyword
+  `TypeError`; it is now rejected with a message pointing to `col_map`.
+- Multi-GPU graph construction recomputed the edge list (file read and
+  vocabulary merges) for each of its steps; it is now persisted once.
+- Exporting gensim vectors copied them one key at a time in Python; the copy
+  is now one array assignment. With word keys (`int_tokens=False`), keys
+  that look like integers (e.g. the literal "1990") are looked up as words.
+
+### Known issues
+
+- Multi-GPU PyTorch training on one node: Lightning starts the user's script
+  again for every further GPU, so each process repeats data loading and walk
+  generation and trains on its own walks.
+- Before training, multi-GPU `fit()` closes the Dask client but not the
+  cluster, so the workers keep their GPU memory (e.g. an RMM pool).
+
 ## [0.4.0] — 2026-04-27
 
 This release bundles a four-PR upstream-port sequence that ports

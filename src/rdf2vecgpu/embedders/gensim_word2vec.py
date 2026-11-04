@@ -24,6 +24,7 @@ import glob
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import pandas as pd
 
 # gensim and pyarrow are optional dependencies. Import lazily so users on the
 # default pytorch backend don't need them installed; raise a friendly error
@@ -155,7 +156,7 @@ class WalkCorpus:
                     yield out
 
 
-def kv_to_token_aligned_matrix(kv, word2idx_df) -> np.ndarray:
+def kv_to_token_aligned_matrix(kv, word2idx_df, int_tokens: bool | None = None) -> np.ndarray:
     """Reshape a `gensim.models.KeyedVectors` into a token-indexed matrix.
 
     Used by `gpu_rdf2vec._extract_embeddings_gensim` to materialize the
@@ -171,8 +172,9 @@ def kv_to_token_aligned_matrix(kv, word2idx_df) -> np.ndarray:
       `n_tokens` is derived from `max(token) + 1`.
     * If gensim trained with `int_tokens=True` (default in the library), the
       KV's `.index_to_key` entries are stringified ints and we use them
-      directly. If `int_tokens=False`, keys are URI strings and we fall back
-      to looking each one up in `word2idx_df` — slower but correct.
+      directly. If `int_tokens=False`, keys are words (URIs, literals) and
+      are looked up in `word2idx_df`. With `int_tokens=None` the keys are
+      taken as tokens when every one of them is an integer.
     * Tokens that gensim's `min_count` filter dropped from the KV vocab get
       a zero row in the output. This is intentional but lossy at
       `min_count > 1`; callers may want to log a warning when
@@ -184,16 +186,24 @@ def kv_to_token_aligned_matrix(kv, word2idx_df) -> np.ndarray:
         word2idx_df = word2idx_df.to_pandas()
     n_tokens = int(word2idx_df["token"].max()) + 1
     vectors = np.zeros((n_tokens, kv.vector_size), dtype=np.float32)
-    for key in kv.index_to_key:
+    keys = list(kv.index_to_key)
+    if not keys:
+        return vectors
+    toks = None
+    if int_tokens is not False:
         try:
-            tok = int(key)
+            toks = np.asarray(keys).astype(np.int64)
         except (TypeError, ValueError):
-            row = word2idx_df[word2idx_df["word"] == key]
-            if row.empty:
-                continue
-            tok = int(row["token"].iloc[0])
-        if 0 <= tok < n_tokens:
-            vectors[tok] = kv[key]
+            if int_tokens:
+                raise
+    if toks is None:
+        lookup = pd.Series(word2idx_df["token"].to_numpy(), index=word2idx_df["word"].to_numpy())
+        toks = lookup.reindex(keys).fillna(-1).to_numpy(np.int64)
+    kv_vectors = getattr(kv, "vectors", None)
+    if kv_vectors is None:
+        kv_vectors = np.stack([kv[k] for k in keys])
+    keep = (toks >= 0) & (toks < n_tokens)
+    vectors[toks[keep]] = np.asarray(kv_vectors, dtype=np.float32)[keep]
     return vectors
 
 
