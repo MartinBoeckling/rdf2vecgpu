@@ -147,7 +147,7 @@ embeddings.to_parquet("data/wikidata5m/wikidata5m_embeddings.parquet", index=Fal
 - Core `RDF2VecConfig` parameters (see the [configuration reference](https://rdf2vecgpu.readthedocs.io/en/latest/configuration.html) for defaults and details):
   - Walks: `walk_strategy` (`"random"`, `"bfs"`), `walk_depth`, `walk_number`, `walk_weighted` (biased random walks; requires a `weights` column)
   - Model: `embedding_model` (`"skipgram"`, `"cbow"`), `backend` (`"pytorch"`, `"gensim"`), `vector_size`, `window_size`, `min_count`, `negative_samples`, `learning_rate`
-  - Training: `epochs`, `batch_size`, `tune_batch_size` (on a single GPU, Lightning's batch-size tuner runs by default and replaces `batch_size`; set `tune_batch_size=False` to keep an explicit value), `random_state`, `reproducible`, `cpu_count` (gensim worker threads)
+  - Training: `epochs`, `batch_size` (if `None`, Lightning's batch-size tuner picks it on a single GPU), `tune_batch_size`, `random_state`, `reproducible`, `cpu_count` (gensim worker threads)
   - Execution: `multi_gpu` (requires a Dask client), `num_nodes`, `generate_artifact`
   - Literals: `literal_predicates`, `literal_strategy`, `literal_n_bins`, `literal_bin_strategy`
   - Tracking: `tracker` (`"none"`, `"mlflow"`, `"wandb"`), `tracker_kwargs`, `tracker_run_name`
@@ -172,7 +172,7 @@ in the [ISWC 2025 paper](#citation).
    indexes into these GPU tensors instead of copying batches.
 4. **Training**: Skip-gram with negative sampling or CBOW, trained with PyTorch Lightning
    (Adam, 16-bit mixed precision). On a single GPU, Lightning's batch-size tuner picks the batch
-   size unless `tune_batch_size=False`. With `multi_gpu=True`, the pairs are written to Parquet, the
+   size unless `batch_size` is set or `tune_batch_size=False`. With `multi_gpu=True`, the pairs are written to Parquet, the
    Dask cluster is released, and Lightning trains with DDP: each GPU reads its own block of the
    pairs and gradients are averaged every step. With `backend="gensim"`, the walks are streamed
    from Parquet into gensim's Word2Vec on the CPU instead.

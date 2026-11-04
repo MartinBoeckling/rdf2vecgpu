@@ -137,6 +137,10 @@ published to PyPI, so this is the first PyPI release that also contains the
   vectors barely moved from their random start. `learning_rate` now defaults
   to `None` and resolves per backend: 0.0001 for `"pytorch"`, 0.025 for
   `"gensim"`. An explicitly set value is used unchanged.
+- Single-GPU training ran Lightning's batch-size tuner whenever
+  `tune_batch_size=True` (the default) and replaced an explicit
+  `batch_size` with its result. The tuner now only runs when `batch_size` is
+  `None`.
 
 ### Documentation
 

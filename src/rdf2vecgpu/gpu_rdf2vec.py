@@ -72,6 +72,13 @@ def _check_walk_files(walks: WalkParquet) -> None:
         )
 
 
+def _tunes_batch_size(config: RDF2VecConfig) -> bool:
+    """Whether single-GPU training runs Lightning's batch-size tuner: only
+    when it is enabled and no explicit `batch_size` is set, which the tuner
+    would otherwise replace."""
+    return config.tune_batch_size and config.batch_size is None
+
+
 def _checked_weights(kg_data):
     """`kg_data` with float `weights`, rejecting missing, negative or
     non-finite weights, and graphs whose weights are all 0 (no weighted walk
@@ -1039,7 +1046,7 @@ class GPU_RDF2Vec:
                 num_nodes=self.config.num_nodes,
                 enable_checkpointing=False,
             )
-            if self.config.tune_batch_size:
+            if _tunes_batch_size(self.config):
                 tuner = Tuner(trainer)
                 tuner.scale_batch_size(
                     word2vec_model,

@@ -53,10 +53,9 @@ class RDF2VecConfig(BaseModel):
 
     batch_size : int or None, default None
         Training batch size of the PyTorch backend. If None, a single-GPU run
-        uses 1/100 of the training pairs and a multi-GPU run uses 512. On a
-        single GPU, ``tune_batch_size=True`` replaces this value with the
-        tuner's result, so set ``tune_batch_size=False`` to keep it. Not used
-        by ``backend="gensim"``.
+        uses 1/100 of the training pairs (or, with ``tune_batch_size=True``,
+        the tuner's result) and a multi-GPU run uses 512. An explicit value is
+        always used as given. Not used by ``backend="gensim"``.
 
     vector_size : int, default 256
         Dimensionality of the output embeddings.
@@ -111,9 +110,9 @@ class RDF2VecConfig(BaseModel):
 
     tune_batch_size : bool, default True
         Run Lightning's batch-size tuner (power scaling, starting from 1/200
-        of the training pairs) before single-GPU PyTorch training. Its result
-        replaces ``batch_size``, also when ``batch_size`` is set. Not used by
-        multi-GPU training or ``backend="gensim"``.
+        of the training pairs) before single-GPU PyTorch training when
+        ``batch_size`` is None. Not used by multi-GPU training or
+        ``backend="gensim"``.
 
     num_nodes : int, default 1
         Number of nodes for multi-GPU PyTorch training (Lightning

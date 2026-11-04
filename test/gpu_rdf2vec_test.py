@@ -94,3 +94,14 @@ def test_fit_transform_walk_vertices_defaults_to_none():
     from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
 
     assert inspect.signature(GPU_RDF2Vec.fit_transform).parameters["walk_vertices"].default is None
+
+
+def test_batch_size_tuner_keeps_explicit_batch_size():
+    """The tuner replaces the batch size it tunes, so it must not run when one is set."""
+    from src.rdf2vecgpu.config import RDF2VecConfig
+    from src.rdf2vecgpu.gpu_rdf2vec import _tunes_batch_size
+
+    assert _tunes_batch_size(RDF2VecConfig())
+    assert not _tunes_batch_size(RDF2VecConfig(batch_size=4096))
+    assert not _tunes_batch_size(RDF2VecConfig(tune_batch_size=False))
+    assert not _tunes_batch_size(RDF2VecConfig(batch_size=4096, tune_batch_size=False))
