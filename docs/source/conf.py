@@ -45,7 +45,8 @@ autodoc_default_options = {
     "members": True,
     "undoc-members": True,
     "show-inheritance": True,
-    "inherited-members": True,
+    # document inherited members, except pydantic's BaseModel API
+    "inherited-members": "BaseModel",
 }
 add_module_names = False
 autodoc_typehints = "description"
@@ -66,6 +67,8 @@ autodoc_mock_imports = [
     "sparkkgml",
     "mlflow",
     "wandb",
+    "gensim",
+    "pylibcugraph",
 ]
 
 # Optionally, pick up package version automatically

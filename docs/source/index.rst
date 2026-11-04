@@ -1,5 +1,5 @@
 gpuRDF2vec documentation
-==========
+========================
 
 gpuRDF2Vec is a scalable GPU-based implementation of RDF2Vec embeddings for large and dense Knowledge Graphs.
 
@@ -66,6 +66,13 @@ This project is licensed under the MIT License.
    training
    vectorretrieval
    tracking
+
+.. toctree::
+   :maxdepth: 2
+   :hidden:
+   :caption: API reference
+
+   modules
 
 
 Indices and tables

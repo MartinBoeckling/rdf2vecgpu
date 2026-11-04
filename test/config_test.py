@@ -76,3 +76,22 @@ def test_multi_gpu_cbow_needs_gensim():
         RDF2VecConfig(multi_gpu=True, embedding_model="cbow", backend="pytorch")
     RDF2VecConfig(multi_gpu=True, embedding_model="cbow", backend="gensim")
     RDF2VecConfig(multi_gpu=False, embedding_model="cbow", backend="pytorch")
+
+
+def test_learning_rate_defaults_per_backend():
+    assert RDF2VecConfig().learning_rate == 0.0001
+    assert RDF2VecConfig(backend="pytorch").learning_rate == 0.0001
+    # gensim's alpha; 1e-4 would leave the vectors close to their random start
+    assert RDF2VecConfig(backend="gensim").learning_rate == 0.025
+
+
+def test_explicit_learning_rate_is_kept():
+    assert RDF2VecConfig(backend="gensim", learning_rate=0.01).learning_rate == 0.01
+    assert RDF2VecConfig(backend="pytorch", learning_rate=0.01).learning_rate == 0.01
+
+
+def test_resolved_learning_rate_round_trips():
+    """`save()` writes the resolved value; `load()` must read it back unchanged."""
+    config = RDF2VecConfig(backend="gensim")
+    restored = RDF2VecConfig.model_validate_json(config.model_dump_json())
+    assert restored.learning_rate == 0.025

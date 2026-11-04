@@ -1,22 +1,21 @@
 """Optional gensim Word2Vec backend for the RDF2Vec training stage.
 
-Mirrors `tools/train_gensim.py` from the upstream Wikidata calibration runs
-but lives inside the library so `GPU_RDF2Vec(config=RDF2VecConfig(
-backend="gensim")).fit(...)` works end-to-end.
+Used by `GPU_RDF2Vec` when ``RDF2VecConfig(backend="gensim")`` is set. The
+walks are still generated on the GPU; gensim then trains on the CPU.
 
 Why this exists alongside the default PyTorch trainer:
 
-* gensim's C-level negative-sampling Word2Vec is typically 5-10× faster on CPU
-  than the equivalent PyTorch skip-gram loop on the same corpus.
-* `pyarrow.parquet.ParquetFile.iter_batches` keeps memory constant while
-  streaming multi-billion-walk corpora; the PyTorch path materializes the
-  whole corpus to GPU.
-* For users running CPU-rich + GPU-light boxes (e.g. a single A6000 + a
-  large NUMA box for training), the gensim path frees the GPU after walk
-  generation and lets the CPU do the training work.
+* gensim's C implementation of negative-sampling Word2Vec is a mature,
+  widely used CPU trainer.
+* `pyarrow.parquet.ParquetFile.iter_batches` streams the walk corpus from
+  Parquet with constant memory; the PyTorch path holds the whole set of
+  training pairs in GPU memory.
+* On machines with many CPU cores and few or small GPUs, the GPU is only
+  needed for walk generation and is free again during training.
 
-This module is gated behind the `gensim` optional-dependency group:
-    pip install rdf2vecgpu[gensim]
+This module needs the ``gensim`` optional-dependency group::
+
+    pip install "rdf2vecgpu[gensim]"
 """
 from __future__ import annotations
 
@@ -81,11 +80,13 @@ def load_id_to_word(word2idx_df) -> np.ndarray:
 class WalkCorpus:
     """Stream walks-parquet → interleaved URI sequences for gensim.
 
-    Each parquet file under `walks_dir` has columns
-        vertices   : list<int>   length = walk_depth + 1
-        predicates : list<int>   length = walk_depth
-    written by `MultiGPUWalkCorpus.random_walk_sequences` (or by the standalone
-    `tools/walk_gen.py`). This iterator emits interleaved sequences
+    Each parquet file under `walks_dir` has the columns
+
+    - ``vertices``: ``list<int>`` of length ``walk_depth + 1``
+    - ``predicates``: ``list<int>`` of length ``walk_depth``
+
+    as written by `MultiGPUWalkCorpus.write_walk_sequences` or
+    `MultiGPUWalkCorpus.random_walk_sequences`. This iterator emits interleaved sequences
     `[v0, p0, v1, p1, v2, ..., v_n]` per walk — the format gensim's
     `Word2Vec(sentences=...)` constructor consumes.
 
@@ -238,14 +239,14 @@ def train_gensim_word2vec(
         The word2idx mapping (`word`, `token` columns). Required even when
         `int_tokens=True` so the resulting embeddings can be joined back to
         URIs in `transform()`.
-    vector_size, window, min_count, negative, epochs, workers, learning_rate,
-    random_state : int / float
-        Forwarded to `gensim.models.Word2Vec`.
+    vector_size, window, min_count, negative, epochs, workers, learning_rate, random_state : int or float
+        Forwarded to `gensim.models.Word2Vec` (``learning_rate`` as
+        ``alpha``, ``random_state`` as ``seed``).
     embedding_model : {"skipgram", "cbow"}, default "skipgram"
         Mapped to gensim's `sg=1` / `sg=0`.
     int_tokens : bool, default True
         Train on stringified int tokens instead of decoded URI strings. Saves
-        ~20 GB RAM on Wikidata-scale corpora at the cost of one post-training
+        a lot of RAM on large vocabularies at the cost of one post-training
         join with `word2idx_df` to recover URI-keyed embeddings (handled in
         `gpu_rdf2vec._fit_via_gensim`).
     """

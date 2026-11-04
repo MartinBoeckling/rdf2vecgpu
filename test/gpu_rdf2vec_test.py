@@ -85,3 +85,12 @@ def test_fit_before_load_data_says_so(tmp_path):
     edges = model.read_data(str(path))
     with pytest.raises(RuntimeError, match="call load_data"):
         model.fit(edges)
+
+
+def test_fit_transform_walk_vertices_defaults_to_none():
+    """The docs call `fit_transform(edges)` without start vertices."""
+    import inspect
+
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    assert inspect.signature(GPU_RDF2Vec.fit_transform).parameters["walk_vertices"].default is None

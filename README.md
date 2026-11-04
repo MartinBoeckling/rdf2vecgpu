@@ -4,7 +4,7 @@ A scalable GPU based implementation of RDF2Vec embeddings for large and dense Kn
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-![RDF2VecGPU_Image](img/github_repo_header.png)
+![RDF2VecGPU_Image](https://raw.githubusercontent.com/MartinBoeckling/rdf2vecgpu/main/img/github_repo_header.png)
 
 > [!IMPORTANT]
 > This package is under active development in the beta phase. The overall class/ method design will most probably change and introduce breaking changes between releases
@@ -16,7 +16,8 @@ The content of this repository readme can be found here:
 - [gpuRDF2Vec](#gpurdf2vec)
 - [Table of contents](#table-of-contents)
 - [Package installation](#package-installation)
-- [Repository setup](#repository-setup)
+  - [Requirements](#requirements)
+  - [Optional extras](#optional-extras)
 - [gpuRDF2Vec overview](#gpurdf2vec-overview)
   - [Repository Structure](#repository-structure)
   - [Capability overview](#capability-overview)
@@ -25,6 +26,7 @@ The content of this repository readme can be found here:
 - [License](#license)
 - [Roadmap](#roadmap)
 - [Report issues and bugs](#report-issues-and-bugs)
+- [Citation](#citation)
 
 ## Package installation
 
@@ -34,35 +36,31 @@ Install the package rdf2vecgpu by running the following command:
 pip install rdf2vecgpu
 ```
 
-> [!IMPORTANT]
-> Make sure to install the accompanying cuda version as outlined in the [following section](#repository-setup)
+This installs the package together with its GPU stack: PyTorch, PyTorch Lightning and the
+RAPIDS libraries cuDF, Dask-cuDF and cuGraph 25.6 (CUDA 12 builds).
 
-## Repository setup
+### Requirements
 
-The repository setup builds on top of two major libraries. Both Pytorch lightning as well as the RAPIDS libraries cuDF and cuGraph. We provide the exeplanatory installation details for Cuda 12.6:
+- Python 3.12 or newer
+- Linux (on Windows, use WSL2; the RAPIDS pip wheels are Linux-only)
+- An NVIDIA GPU with a CUDA 12.x driver
 
-1. Pytorch [installation page](https://pytorch.org/get-started/locally/)
-Cuda 12.6 installation
+If you need a specific PyTorch build for your CUDA version, install it first with the
+[PyTorch selector](https://pytorch.org/get-started/locally/), then install `rdf2vecgpu`. See the
+[installation guide](https://rdf2vecgpu.readthedocs.io/en/latest/installation.html) for
+multi-GPU setup and troubleshooting.
+
+### Optional extras
 
 ```bash
-pip install torch torchvision torchaudio
+pip install "rdf2vecgpu[gensim]"   # CPU Word2Vec trainer, RDF2VecConfig(backend="gensim")
+pip install "rdf2vecgpu[mlflow]"   # MLflow experiment tracking
+pip install "rdf2vecgpu[wandb]"    # Weights & Biases experiment tracking
+pip install "rdf2vecgpu[test]"     # test suite
 ```
 
-2. Detailed cudf installation instruction [here](https://docs.rapids.ai/install/).
-Cudf Cuda 12 install
-
-```bash
-pip install \
-    --extra-index-url=https://pypi.nvidia.com \
-    "cudf-cu12==25.4.*" "dask-cudf-cu12==25.4.*" \
-    "cugraph-cu12==25.4.*" "nx-cugraph-cu12==25.4.*" \
-    "nx-cugraph-cu12==25.4.*"
-```
-
-The requirement files and conda environment files can be found here:
-
-- [Conda environment](performance/env_files/rdf2vecgpu_environment.yml)
-- [Requirement file](performance/env_files/rdf2vecgpu_requirements.txt)
+The pinned environments used for the ISWC 2025 benchmarks (gpuRDF2Vec and the baselines) are in
+[`performance/env_files`](https://github.com/MartinBoeckling/rdf2vecgpu/blob/main/performance/env_files).
 
 ## gpuRDF2Vec overview
 
@@ -74,64 +72,30 @@ RDF2Vec is a powerful technique to generate vector embeddings of entities in RDF
 
 ### Repository Structure
 
-```bash
+```text
 .
-├── README.md
-├── data
-├── data_preparation
-│   ├── converstion_to_ttl.py
-│   └── merge_text_file.py
-├── img
-│   └── github_repo_header.png
-├── jrdf2vec-1.3-SNAPSHOT.jar
-├── performance
-│   ├── env_files
-│   │   ├── jrdf2vec_environment.yml
-│   │   ├── jrdf2vec_requirements.txt
-│   │   ├── pyrdf2vec_environment.yml
-│   │   ├── pyrdf2vec_requirements.txt
-│   │   ├── rdf2vecgpu_environment.yml
-│   │   ├── rdf2vecgpu_requirements.txt
-│   │   ├── sparkrdf2vec_environment.yml
-│   │   └── sparkrdf2vec_requirements.txt
-│   ├── evaluation_parameters.py
-│   ├── gpu_rdf2vec_performance.py
-│   ├── graph_creation.py
-│   ├── graph_statistics.py
-│   ├── jrdf2vec_based_performance.py
-│   ├── pyrdf2vec_based_performance.py
-│   ├── spark_rdf2vec_performance.py
-│   └── wandb_analysis.py
-├── src
-│   ├── __init__.py
-│   ├── corpus
-│   │   ├── __init__.py
-│   │   └── walk_corpus.py
-│   ├── cpu_based_rdf2vec_approach.py
-│   ├── embedders
-│   │   ├── __init__.py
-│   │   ├── word2vec.py
-│   │   └── word2vec_loader.py
-│   ├── gpu_rdf2vec.py
-│   ├── helper
-│   │   ├── __init__.py
-│   │   └── functions.py
-│   └── reader
-│       ├── __init__.py
-│       └── kg_reader.py
-└── test
-    ├── helper
-    └── reader
-        ├── functions_test.py
-        └── kg_reader_test.py
+├── src/rdf2vecgpu/         # the package
+│   ├── gpu_rdf2vec.py      # GPU_RDF2Vec: load_data, fit, transform, save/load
+│   ├── config.py           # RDF2VecConfig
+│   ├── corpus/             # single- and multi-GPU walk generation (cuGraph)
+│   ├── embedders/          # PyTorch Lightning Word2Vec, data loaders, gensim backend
+│   ├── reader/             # KGFileReader: Parquet, CSV, ORC, N-Triples/N-Quads, rdflib
+│   ├── helper/             # vocabulary construction
+│   ├── logger/             # MLflow / W&B / no-op trackers
+│   └── _compat.py          # cuGraph / dask compatibility patches
+├── test/                   # unit and GPU end-to-end tests
+├── docs/                   # Sphinx documentation (Read the Docs)
+├── performance/            # ISWC 2025 benchmark scripts and environments
+└── data_preparation/       # dataset conversion scripts
 ```
 
 ### Capability overview
 
-- GPU-backed walk generation over CUDA Kernels
-- Batched Word2Vec training with Pytorch lightning
-- Pluggable rdf loaders and parquet, csv, txt integration
-- Performance comparison can be found in the following [folder](performance/)
+- Random and BFS walk generation on the GPU with cuGraph, single- or multi-GPU, optionally weighted
+- Skip-gram and CBOW training on the GPU with PyTorch Lightning (single- or multi-GPU DDP), or on the CPU with gensim
+- Readers for Parquet, CSV, ORC, N-Triples/N-Quads and every RDF format rdflib parses
+- Literal handling (drop or bin numeric literals) and MLflow / W&B experiment tracking
+- The benchmark scripts of the ISWC 2025 paper are in the [performance folder](https://github.com/MartinBoeckling/rdf2vecgpu/blob/main/performance)
 
 ## Quick start
 
@@ -164,52 +128,29 @@ gpu_rdf2vec_model = GPU_RDF2Vec(config=config)
 # Path to the triple dataset
 path = "data/wikidata5m/wikidata5m_kg.parquet"
 
-# Read data and receive edge data
-edge_data = gpu_rdf2vec_model.read_data(path)
+# Read the file, build the vocabulary and the graph
+edge_data = gpu_rdf2vec_model.load_data(path)
 
 # Fit the Word2Vec model and transform the dataset to an embedding
-embeddings = gpu_rdf2vec_model.fit_transform(edge_df=edge_data, walk_vertices=None)
+embeddings = gpu_rdf2vec_model.fit_transform(edge_df=edge_data)
 
 # Write embedding to file format. Return format is a cuDF dataframe
 embeddings.to_parquet("data/wikidata5m/wikidata5m_embeddings.parquet", index=False)
 ```
 
 - Supported file formats:
-  - `.csv`
+  - `.csv` (with a header row)
   - `.parquet`
   - `.orc`
   - `.nt`, `.nq`
   - All supported [RDFlib file formats](https://rdflib.readthedocs.io/en/stable/plugin_parsers.html)
-- Core `RDF2VecConfig` parameters (see [Configuration reference](https://rdf2vecgpu.readthedocs.io/en/latest/configuration.html) for the full list):
-  - `walk_strategy`: `["random", "bfs"]`
-  - `walk_depth`: `int`
-  - `walk_number`: `int`
-  - `walk_weighted`: `bool` (uses cuGraph biased random walks; requires a `weights` column)
-  - `embedding_model`: `["skipgram", "cbow"]`
-  - `epochs`: `int`
-  - `batch_size`: `int | None` — if `None`, a heuristic batch size is picked based on the data loader and the available GPU memory
-  - `vector_size`: `int`
-  - `window_size`: `int`
-  - `min_count`: `int`
-  - `learning_rate`: `float`
-  - `negative_samples`: `int`
-  - `random_state`: `int`
-  - `reproducible`: `bool`
-  - `multi_gpu`: `bool`
-  - `generate_artifact`: `bool`
-  - `cpu_count`: `int`
-  - `literal_predicates`, `literal_strategy`, `literal_n_bins`, `literal_bin_strategy` — see the literal handling section of the docs
-  - `tracker`: `["none", "mlflow", "wandb"]` — pluggable experiment tracking backend
-
-### Optional extras
-
-The experiment tracking backends and the test suite are opt-in:
-
-```bash
-pip install "rdf2vecgpu[mlflow]"
-pip install "rdf2vecgpu[wandb]"
-pip install "rdf2vecgpu[test]"
-```
+- Core `RDF2VecConfig` parameters (see the [configuration reference](https://rdf2vecgpu.readthedocs.io/en/latest/configuration.html) for defaults and details):
+  - Walks: `walk_strategy` (`"random"`, `"bfs"`), `walk_depth`, `walk_number`, `walk_weighted` (biased random walks; requires a `weights` column)
+  - Model: `embedding_model` (`"skipgram"`, `"cbow"`), `backend` (`"pytorch"`, `"gensim"`), `vector_size`, `window_size`, `min_count`, `negative_samples`, `learning_rate`
+  - Training: `epochs`, `batch_size` (if `None`, a single-GPU run starts from 1/100 of the training pairs and, with `tune_batch_size=True`, Lightning's batch-size tuner scales it), `tune_batch_size`, `random_state`, `reproducible`, `cpu_count` (gensim worker threads)
+  - Execution: `multi_gpu` (requires a Dask client), `num_nodes`, `generate_artifact`
+  - Literals: `literal_predicates`, `literal_strategy`, `literal_n_bins`, `literal_bin_strategy`
+  - Tracking: `tracker` (`"none"`, `"mlflow"`, `"wandb"`), `tracker_kwargs`, `tracker_run_name`
 
 ## Implementation Details
 
@@ -255,15 +196,14 @@ We achieve order-of-magnitude for large and dense graphs over CPU-bound RDF2Vec 
      Without persist, every consumer triggers a re-roll of the underlying
      hash-shuffle / random-walk generator. Because `drop_duplicates` over a
      non-deterministic shuffle is itself non-deterministic, partition
-     assignments drift between rolls — we observed 23 M → 15 M row loss
-     between a partition-sizes pass and the eventual write on the standalone
-     tool that pioneered this pattern.
+     assignments drift between rolls, and rows are silently lost between a
+     partition-sizes pass and the eventual write.
 
    **(b) When using `.merge()` against a small table, prefer `broadcast=True`.**
    Without it, dask defaults to a hash-shuffle join. With a small right-side
-   partition count, the large left side gets funneled through a single worker
-   — observed 6+ hours at 100 % single-GPU utilization on Wikidata-scale
-   `_generate_vocab` runs before this fix landed. `broadcast=True` replicates
+   partition count, the large left side gets funneled through a single worker,
+   which turns the vocabulary build of a large graph into hours of
+   single-GPU work. `broadcast=True` replicates
    the small side to every worker so each large-side partition does a local
    hash join with no shuffle.
 
@@ -284,7 +224,7 @@ We achieve order-of-magnitude for large and dense graphs over CPU-bound RDF2Vec 
 
 ## License
 
-The overview of the used MIT license can be found [here](LICENSE)
+The overview of the used MIT license can be found [here](https://github.com/MartinBoeckling/rdf2vecgpu/blob/main/LICENSE)
 
 ## Roadmap
 
@@ -293,13 +233,11 @@ The overview of the used MIT license can be found [here](LICENSE)
 - [X] Provide weighted walks for spatial datasets [Issue item](https://github.com/MartinBoeckling/rdf2vecgpu/issues/4)
 - [X] Provide logging capabilities of complete Word2Vec pipeline for [Wandb](https://wandb.ai/site/) and [mlflow](https://mlflow.org/). [Issue item](https://github.com/MartinBoeckling/rdf2vecgpu/issues/5)
 - [X] Optional gensim Word2Vec trainer backend (`backend="gensim"`)
-  alongside the default PyTorch Lightning trainer. The gensim C path is
-  5–10× faster on CPU for very large corpora (~390 M-token vocab,
-  multi-billion walks) and supports constant-memory streaming via
-  `pyarrow.parquet.ParquetFile.iter_batches`. Useful when running on a
-  CPU-rich + GPU-light box where the PyTorch trainer is bottlenecked on
-  data movement rather than compute. Shipped in `v0.4.0`; opt in via
-  `pip install rdf2vecgpu[gensim]` and `RDF2VecConfig(backend="gensim")`.
+  alongside the default PyTorch Lightning trainer. It trains on the CPU
+  and streams the walk corpus from Parquet with constant memory, which
+  suits machines with many CPU cores and few or small GPUs. Available since
+  0.5.0 (the first PyPI release that contains it); opt in via
+  `pip install "rdf2vecgpu[gensim]"` and `RDF2VecConfig(backend="gensim")`.
 
 ## Report issues and bugs
 

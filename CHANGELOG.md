@@ -130,6 +130,39 @@ published to PyPI, so this is the first PyPI release that also contains the
 - Exporting gensim vectors copied them one key at a time in Python; the copy
   is now one array assignment. With word keys (`int_tokens=False`), keys
   that look like integers (e.g. the literal "1990") are looked up as words.
+- `fit_transform(edge_df)` raised a `TypeError` because `walk_vertices` had no
+  default; it now defaults to `None` like `fit`.
+- `backend="gensim"` passed the PyTorch default `learning_rate=0.0001` to
+  gensim as `alpha`, 250x below gensim's own default of 0.025, so the
+  vectors barely moved from their random start. `learning_rate` now defaults
+  to `None` and resolves per backend: 0.0001 for `"pytorch"`, 0.025 for
+  `"gensim"`. An explicitly set value is used unchanged.
+
+### Documentation
+
+- All examples (README, getting started, training, data loading, embedding
+  retrieval) now call `load_data()`, which builds the vocabulary and the
+  graph, instead of `read_data()`, which only reads the file.
+- Installation: a CUDA GPU and Linux (or WSL2) are required, Python >= 3.12;
+  RAPIDS and PyTorch are installed as dependencies (the README's RAPIDS 25.4
+  instructions conflicted with the `cugraph-cu12==25.6.*` pin); new
+  `gensim` extra and multi-GPU setup notes.
+- `RDF2VecConfig` reference: corrected defaults (`learning_rate=0.0001`,
+  `reproducible=False`), documented `backend`, `tracker`, `tracker_kwargs`
+  and `tracker_run_name`, and what `batch_size`, `cpu_count`, `min_count`
+  and `reproducible` actually do.
+- `GPU_RDF2Vec` docstrings rewritten to match the code (`read_data`,
+  `load_data` formats, `fit`, `transform`, `save`/`load`).
+- Data loading: N-Triples/N-Quads use the cuDF reader only, CSV needs a
+  header, `literal_predicates` are matched without angle brackets for `.nt`
+  input; tracking and training pages list the actual stage names.
+- The API reference is linked from the navigation; the stale `docs/source/api/`
+  pages of the old `src.*` layout are removed, and the gensim backend module
+  is documented. `walk_corpus` and `gpu_rdf2vec` failed to import under the
+  Sphinx mocks, so their API pages were empty; the docs now build with
+  `sphinx-build -W`.
+- README links and the header image use absolute GitHub URLs so they work on
+  PyPI.
 
 ### Known issues
 

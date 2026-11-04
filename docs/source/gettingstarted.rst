@@ -48,8 +48,8 @@ Basic usage
    # Path to the triple dataset
    path = "data/wikidata5m/wikidata5m_kg.parquet"
 
-   # Read data and receive edge data
-   edge_data = gpu_rdf2vec_model.read_data(path)
+   # Read the file, build the vocabulary and the graph
+   edge_data = gpu_rdf2vec_model.load_data(path)
 
    # Fit the Word2Vec model and transform the dataset to an embedding
    embeddings = gpu_rdf2vec_model.fit_transform(edge_df=edge_data, walk_vertices=None)

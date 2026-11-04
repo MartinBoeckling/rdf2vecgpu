@@ -62,14 +62,20 @@ For Weights & Biases, use ``tracker="wandb"`` and provide backend-specific kwarg
 Pipeline stages
 ---------------
 
-The pipeline wraps each major step with a tracker stage context manager. Parameters and metrics
-logged inside a stage are associated with that stage in the tracking backend:
+The pipeline wraps each major step with a tracker stage context manager. With MLflow every stage
+is a nested run (so its start and end time give the stage duration); with Weights & Biases the
+start and end of each stage are logged as ``stage/start`` and ``stage/end`` events. The stages and
+the parameters logged in them are:
 
-- ``data_loading`` — edge count, column count, source path
-- ``Literal_Handling`` — literal strategy and predicates (when configured)
-- walk generation — walk strategy, depth, count, timing
-- vocabulary construction — vocabulary size
-- Word2Vec training — hyperparameters, loss curves, batch-size tuning results
+- ``data_loading`` — source path, number of rows and columns
+- ``Literal_Handling`` — literal strategy and predicates (only when ``literal_predicates`` is set)
+- ``Word2idx_Generation`` — vocabulary size
+- ``Graph_Construction`` — graph size and degree statistics
+- ``Walk_Generation`` — walk strategy, depth, number, weighting and ``min_count``
+- ``Word2Vec_Training`` — training hyperparameters; with MLflow and the PyTorch backend,
+  ``mlflow.pytorch.autolog`` also records the Lightning training metrics, and the trained model
+  is logged as an artifact
+- ``Embedding_Extraction`` — extraction of the embedding table in ``transform``
 
 Run metadata such as the library name and backend are recorded via tags when the pipeline starts.
 
