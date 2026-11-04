@@ -174,53 +174,8 @@ We achieve order-of-magnitude for large and dense graphs over CPU-bound RDF2Vec 
    - We use PyTorch Distributed + NCCL: each GPU holds the same graph shard but a unique walk corpus.  
    - Gradients are synchronized via `all_reduce` at regular intervals (~500 ms), amortizing PCIe/NVLink costs and ensuring linear scaling across nodes.
 
-5. **Distributed correctness — when to `persist`**
-
-   The multi-GPU code paths use `dask_cudf` for the vocab build, the
-   broadcast-encode of edge triples, and the random-walk reshape. Two patterns
-   are easy to get wrong and produce silent data drift rather than visible
-   crashes; both are documented inline at the relevant call sites and re-stated
-   here for contributors.
-
-   **(a) Any non-deterministic dask output that is read more than once must be
-   `.persist()`-ed before the second consumer.** Examples:
-
-   - `MultiGPUWalkCorpus.random_walk` persists the cuGraph walk output before
-     it computes per-partition sizes for the reshape (see
-     `corpus/walk_corpus.py` around the `walks_s.persist()` call).
-   - `_generate_vocab` persists the post-shuffle deduplicated vocabulary
-     before reading partition sizes for the `cumsum` offsets that drive the
-     per-partition `cupy.arange` token assignment (see
-     `helper/functions.py` around the `vocabulary_df.persist()` call).
-
-     Without persist, every consumer triggers a re-roll of the underlying
-     hash-shuffle / random-walk generator. Because `drop_duplicates` over a
-     non-deterministic shuffle is itself non-deterministic, partition
-     assignments drift between rolls, and rows are silently lost between a
-     partition-sizes pass and the eventual write.
-
-   **(b) When using `.merge()` against a small table, prefer `broadcast=True`.**
-   Without it, dask defaults to a hash-shuffle join. With a small right-side
-   partition count, the large left side gets funneled through a single worker,
-   which turns the vocabulary build of a large graph into hours of
-   single-GPU work. `broadcast=True` replicates
-   the small side to every worker so each large-side partition does a local
-   hash join with no shuffle.
-
-   **Compatibility patches.** `_compat.apply_patches()` (called from
-   `GPU_RDF2Vec.__init__` when `multi_gpu=True`) currently fixes two upstream
-   issues that are still alive at the cuGraph 25.6 / dask >= 2025.5 versions
-   we pin:
-
-   - `_patch_convert_to_cudf` — `cugraph.dask`'s random-walk
-     `convert_to_cudf` helper crashes on `renumber=False` graphs because it
-     unconditionally dereferences `number_map.implementation.numbered`.
-   - `_patch_dask_cudf_from_cudf` — works around a dask-expr backend
-     breakage in dask >= 2025.5 that affects `dask_cudf.from_cudf`.
-
-   Both patches are self-contained workarounds; the long-term fix is upstream
-   in cuGraph / dask-cudf. Track those there and remove the patches once they
-   land.
+Contributor notes (the Dask `persist` / `broadcast=True` patterns and the cuGraph / dask
+compatibility patches) are in [CONTRIBUTING.md](https://github.com/MartinBoeckling/rdf2vecgpu/blob/main/CONTRIBUTING.md).
 
 ## License
 
@@ -251,7 +206,7 @@ In case you have found a bug or unexpected behaviour, please reach out by openin
     - **Error messages/ stack traces** (copy-paste or attach logs)
 
 2. We aim to respond to open issues within 3 business days
-3. If you have identified a fix, fork the repo, branch off `main`, implement & test then open a PR referencing the issue.
+3. If you have identified a fix, fork the repo, branch off `main`, implement & test then open a PR referencing the issue. See [CONTRIBUTING.md](https://github.com/MartinBoeckling/rdf2vecgpu/blob/main/CONTRIBUTING.md) for the development setup, tests and docs build.
 
 ## Citation
 
