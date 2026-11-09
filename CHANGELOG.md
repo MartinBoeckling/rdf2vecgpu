@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.0] — 2026-11-04
+## [0.5.0] — 2026-11-09
 
 Walk-generation fixes and a chunked multi-GPU walk writer. 0.4.0 was not
 published to PyPI, so this is the first PyPI release that also contains the
@@ -170,8 +170,8 @@ published to PyPI, so this is the first PyPI release that also contains the
   `sphinx-build -W`.
 - README links and the header image use absolute GitHub URLs so they work on
   PyPI.
-- The README's "Implementation Details" section is replaced by a short "How it
-  works" section based on the code. It drops claims the code does not support
+- The README's "Implementation Details" section and the list on the docs landing
+  page are replaced by a short "How it works" section based on the code. It drops claims the code does not support
   (a GPU-memory batch-size rule, all-reduce at fixed intervals, linear scaling)
   and figures without a source.
 - The contributor notes (the Dask `persist` / `broadcast=True` patterns and the
