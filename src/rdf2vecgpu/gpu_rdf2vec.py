@@ -860,7 +860,7 @@ class GPU_RDF2Vec:
                 if isinstance(walk_sequences, WalkParquet):
                     walks_parquet = walk_sequences.path  # written by the GPUs
                     _check_walk_files(walk_sequences)
-                elif hasattr(walk_sequences, "to_parquet"):
+                elif hasattr(walk_sequences, "compute"):
                     logger.info(f"Checkpointing walk sequences to {walks_parquet}")
                     # dask_cudf.DataFrame: each worker writes its partition.
                     # `random_walk_sequences()` already persist+wait-ed the
