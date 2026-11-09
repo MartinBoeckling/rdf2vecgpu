@@ -8,8 +8,10 @@ The overall training of the embedding model happens by calling the ``fit`` metho
 :class:`~rdf2vecgpu.gpu_rdf2vec.GPU_RDF2Vec` class.
 Below, we outline the main steps that are performed during the training process:
 
-1. **Data Reading**: ``read_data`` loads the triples into a cuDF (single-GPU) or Dask-cuDF
-   (multi-GPU) dataframe using :class:`~rdf2vecgpu.reader.kg_file_reader.KGFileReader`.
+1. **Data Loading** (``load_data``, before ``fit``): reads the triples into a cuDF (single-GPU)
+   or Dask-cuDF (multi-GPU) dataframe using
+   :class:`~rdf2vecgpu.reader.kg_file_reader.KGFileReader`, encodes them as integer tokens and
+   builds the cuGraph graph.
 
 2. **Walk Extraction**: Based on the selected ``walk_strategy`` (``random`` or ``bfs``), the package
    generates walks from the knowledge graph. This step is performed entirely on the GPU using cuGraph
@@ -54,8 +56,8 @@ Here is an example code snippet demonstrating how to train RDF2vec embeddings us
    )
    gpu_rdf2vec_model = GPU_RDF2Vec(config=config)
 
-   # Read the knowledge graph
-   edge_data = gpu_rdf2vec_model.read_data("data/wikidata5m/wikidata5m_kg.parquet")
+   # Read the file, build the vocabulary and the graph
+   edge_data = gpu_rdf2vec_model.load_data("data/wikidata5m/wikidata5m_kg.parquet")
 
    # Fit the model to the knowledge graph data
    gpu_rdf2vec_model.fit(edge_df=edge_data, walk_vertices=None)
@@ -78,9 +80,9 @@ corpora can take hundreds of GB, so point ``TMPDIR`` at a disk with enough space
 
 Pipeline stages and experiment tracking
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Internally, the pipeline is divided into stages wrapped by the tracker's context manager, for
-example ``data_loading``, ``Literal_Handling``, walk generation, vocabulary construction, and
-training. When a tracker backend is configured via ``config.tracker`` (``"mlflow"`` or ``"wandb"``),
+Internally, the pipeline is divided into stages wrapped by the tracker's context manager:
+``data_loading``, ``Literal_Handling``, ``Word2idx_Generation``, ``Graph_Construction``,
+``Walk_Generation``, ``Word2Vec_Training`` and ``Embedding_Extraction``. When a tracker backend is configured via ``config.tracker`` (``"mlflow"`` or ``"wandb"``),
 parameters and metrics for each stage are logged to the selected experiment tracking backend.
 See :doc:`tracking` for details on the available backends, required extras, and what is captured
 at each stage.

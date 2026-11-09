@@ -72,6 +72,13 @@ def _check_walk_files(walks: WalkParquet) -> None:
         )
 
 
+def _tunes_batch_size(config: RDF2VecConfig) -> bool:
+    """Whether single-GPU training runs Lightning's batch-size tuner: only
+    when it is enabled and no explicit `batch_size` is set, which the tuner
+    would otherwise replace."""
+    return config.tune_batch_size and config.batch_size is None
+
+
 def _checked_weights(kg_data):
     """`kg_data` with float `weights`, rejecting missing, negative or
     non-finite weights, and graphs whose weights are all 0 (no weighted walk
@@ -98,86 +105,54 @@ class GPU_RDF2Vec:
         client: Optional[dask.distributed.Client] = None,
         **kwargs,
     ):
-        """GPU‑accelerated implementation of the RDF2Vec pipeline.
+        """GPU-accelerated implementation of the RDF2Vec pipeline.
 
-        This class wraps every step that is necessary to obtain dense vector
-        representations for entities in a (potentially very large) knowledge
-        graph on the GPU:
+        The class wraps every step needed to obtain vector representations
+        for the entities of a (potentially very large) knowledge graph:
 
-        1. **Load the triples** into a cuGraph `Graph`, optionally persisting
-        intermediate artefacts.
-        2. **Generate random walks** (or, in the future, BFS walks) that serve as a
-        textual corpus.
-        3. **Train a Word2Vec model** (currently Skip‑gram, CBOW forthcoming) on
-        this corpus with all heavy‐lifting—negative sampling, matrix ops, CUDA
-        kernels—performed on the GPU and orchestrated through PyTorch Lightning.
-        4. **Export the learned embeddings** back to cuDF for further downstream
-        analytics or as Parquet artefacts.
+        1. **Load the triples** (`load_data`): read the file, build the
+           token vocabulary (``word2idx``) and the cuGraph ``MultiGraph``.
+        2. **Generate walks** (`fit`): random or BFS walks on the GPU with
+           cuGraph, starting from every subject of the graph by default.
+        3. **Train Word2Vec** (`fit`): Skip-gram or CBOW, either on the
+           GPU(s) with PyTorch Lightning (``backend="pytorch"``) or on the CPU
+           with gensim (``backend="gensim"``).
+        4. **Export the embeddings** (`transform`): a cuDF table with one row
+           per vocabulary token, optionally written to Parquet.
 
-
-        Args:
-            walk_strategy (str): {"random", "bfs"}
-                How to sample walks from the graph.
-            walk_depth (int):
-                Maximum length of every walk.
-            walk_number (int):
-                Number of walks to start **per start vertex** (Relevant for random walk)
-            embedding_model (str): {"skipgram", "cbow"}
-                Variant of Word2Vec to train
-            epochs (int):
-                Training epochs for the Word2Vec model
-            batch_size (int):
-                Mini-batch size used by the Pytorch DataLoader
-            vector_size (int):
-                Dimensionality of the output embeddings
-            window_size (int):
-                Context window size in tokens
-            min_count (int):
-                Ignore tokens that appear fewer than this number of times when building the vocabulary
-            negative_samples (int):
-                Number of negative samples in the negative-sampling loss
-            learning_rate (float):
-                Learning rate for the optimiser
-            random_state (int):
-                Seed for deterministic sampling operations
-            reproducible (bool):
-                Turn on all Pytorch/ CUDA deterministic flags **at the cost of speed**
-            multi_gpu (bool):
-                If true, Dask CUDA cluster for multi-gpu training
-            generate_artifact (bool):
-                Persist word2idx and embedding matrices as Parquet artefacts under provided directory
-            cpu_count (int):
-                Number of cpu workers that feed the GPU via the DataLoader
-            client (dask.distributed.Client, optional):
-                Dask distributed client for multi-GPU operations. Required if multi_gpu=True.
-                If None and multi_gpu=False, operates in single-GPU mode.
-            tune_batch_size (bool):
-                Whether to use PyTorch Lightning's Tuner to find the optimal batch size.
-
-            number_nodes (int):
-                Number of nodes in the Dask cluster for multi-GPU training.
+        Parameters
+        ----------
+        config : RDF2VecConfig, optional
+            All hyperparameters; see `RDF2VecConfig` for the full list and
+            the defaults. If omitted, one is built from ``**kwargs``.
+        client : dask.distributed.Client, optional
+            Dask client of a running cluster (for example a
+            ``dask_cuda.LocalCUDACluster``). Required when
+            ``multi_gpu=True``, ignored otherwise.
+        **kwargs
+            Forwarded to ``RDF2VecConfig(**kwargs)`` when ``config`` is None.
 
         Attributes
         ----------
-        knowledge_graph : cugraph.Graph
-            Directed graph that stores the integer‑encoded triples.
-        word2vec_model : torch.nn.Module or None
-            Trained model after `fit`; ``None`` before.
-        word2idx : cudf.DataFrame or None
-            Two‑column mapping *token* → *word*; available after
+        config : RDF2VecConfig
+            The validated configuration.
+        knowledge_graph : cugraph.MultiGraph
+            Directed multigraph of the integer-encoded triples; built by
             `load_data`.
-        generate_artifact : bool
-            Copied from the constructor.
-        cpu_count : int
-            Copied from the constructor.
+        word2idx : cudf.DataFrame or None
+            Vocabulary with columns ``token`` (int id) and ``word`` (IRI or
+            literal); available after `load_data`.
+        word2vec_model : torch.nn.Module, gensim.models.Word2Vec or None
+            The trained model after `fit`; None before.
 
         Raises
         ------
-        NotImplementedError
-            If a not‑yet‑supported walk strategy, embedding model is specified.
+        EnvironmentError
+            If no CUDA GPU is available.
         ValueError
-            If an unsupported file format is passed to `load_data` or if
-            `transform` is called prior to `fit`.
+            If ``multi_gpu=True`` and no ``client`` is given.
+        pydantic.ValidationError
+            If a keyword argument is not a valid `RDF2VecConfig` value.
 
         Examples
         --------
@@ -187,17 +162,8 @@ class GPU_RDF2Vec:
         ...     walk_number=10,
         ...     embedding_model="skipgram",
         ...     epochs=5,
-        ...     batch_size=2**14,
-        ...     vector_size=256,
-        ...     window_size=5,
-        ...     min_count=1,
-        ...     negative_samples=5,
-        ...     learning_rate=0.025,
-        ...     random_state=42,
-        ...     reproducible=True,
-        ...     multi_gpu=False,
-        ...     generate_artifact=False,
-        ...     cpu_count=4,
+        ...     vector_size=128,
+        ...     learning_rate=0.01,
         ... )
         >>> edges = rdf2vec.load_data("example.parquet")
         >>> rdf2vec.fit(edges)
@@ -251,6 +217,33 @@ class GPU_RDF2Vec:
         col_map: Optional[dict] = None,
         read_kwargs: Optional[dict] = None,
     ):
+        """Read a triple file into a cuDF (or, with ``multi_gpu``, Dask-cuDF)
+        DataFrame with ``subject``, ``predicate`` and ``object`` columns, plus
+        ``weights`` when ``walk_weighted=True``.
+
+        This only reads the file. Use `load_data` to also build the
+        vocabulary and the graph, which `fit` needs.
+
+        Parameters
+        ----------
+        path : str
+            Path to the knowledge-graph file; see `load_data` for the
+            supported formats.
+        col_map : dict, optional
+            Renames the file's columns to ``subject``, ``predicate``,
+            ``object`` (and ``weights``), for example
+            ``{"src": "subject", "rel": "predicate", "dst": "object"}``.
+        read_kwargs : dict, optional
+            Extra keyword arguments for the cuDF/Dask CSV, Parquet or ORC
+            reader (for example ``{"delimiter": "\\t"}``). Ignored for
+            N-Triples/N-Quads and rdflib formats. ``columns`` is rejected for
+            Parquet; use ``col_map`` instead.
+
+        Returns
+        -------
+        cudf.DataFrame or dask_cudf.DataFrame
+            The triples with string values, not yet integer-encoded.
+        """
         self.tracker.start_pipeline(
             run_name=self.config.tracker_run_name,
             tags={"lib": "gpu-rdf2vec", "backend": self.config.backend},
@@ -515,51 +508,46 @@ class GPU_RDF2Vec:
         read_kwargs: Optional[dict] = None,
     ):
         """
-        Load a triple file, build the token vocabulary, and populate the internal
-        cuGraph instance.
+        Load a triple file, build the token vocabulary, and populate the
+        internal cuGraph graph.
 
-        The method chooses the most efficient cuDF reader based on the file
-        extension (`.parquet`, `.csv`, `.txt`, `.nt`).  If the extension is not
-        one of these, it attempts to infer any other RDF serialisation via
-        `rdflib.util.guess_format` and falls back to a generic
-        ``rdflib`` reader.  After reading, the triples are integer‑encoded, a
-        ``word2idx`` mapping is created (and optionally persisted), and the
-        resulting edge list is loaded into `self.knowledge_graph`.
+        Runs `read_data`, the literal handling (``literal_predicates``), the
+        vocabulary construction and the graph construction. Call it before
+        `fit` or `fit_transform`.
 
         Parameters
         ----------
         path : str
-            Path to the knowledge‑graph file.  Supported formats:
+            Path to the knowledge-graph file. The reader is chosen by the file
+            extension:
 
-            * ``.parquet`` – three‑column Parquet file *(subject, predicate, object)*
-            * ``.csv`` – comma‑separated triples without header
-            * ``.txt`` – whitespace‑separated triples without header
-            * ``.nt`` – N‑Triples (parsed with cuDF CSV reader and cleaned)
-            * any other RDF serialisation recognised by
-                `rdflib.util.guess_format`
+            * ``.parquet``, ``.orc`` – columns ``subject``, ``predicate``,
+              ``object`` (rename others with ``col_map``)
+            * ``.csv`` – a header row naming the columns ``subject``,
+              ``predicate``, ``object`` (or names mapped with ``col_map``)
+            * ``.nt``, ``.nq`` – N-Triples / N-Quads, read line by line on the
+              GPU; angle brackets are stripped from IRIs, the graph term of
+              N-Quads is dropped, and lines with a blank-node subject or
+              predicate are skipped
+            * any other RDF serialisation that `rdflib.util.guess_format`
+              recognises (for example ``.ttl``, ``.rdf``, ``.jsonld``),
+              parsed on the CPU with rdflib
+        col_map : dict, optional
+            See `read_data`.
+        read_kwargs : dict, optional
+            See `read_data`.
 
         Returns
         -------
-        cudf.DataFrame
-            Three‑column cuDF DataFrame whose ``subject``, ``predicate``, and
-            ``object`` are *int32* tokens.  The DataFrame is also stored as a
-            directed edge list in `self.knowledge_graph`.
+        cudf.DataFrame or dask_cudf.DataFrame
+            Edge list whose ``subject``, ``predicate`` and ``object`` are
+            integer tokens (see ``self.word2idx``). Pass it to `fit`.
 
         Raises
         ------
-        ValueError
-            If the file extension is unsupported **and** `rdflib` cannot guess
+        NotImplementedError
+            If the file extension is not supported and rdflib cannot guess
             the RDF format.
-
-        Notes
-        -----
-        * Builds a vocabulary with `_generate_vocab` and stores it in
-            `self.word2idx`.
-        * `transform` writes ``word2idx`` as Parquet under *./vector/* when
-            ``self.generate_artifact`` is ``True``.
-        * Returns the int‑encoded edge list for downstream use (e.g.,
-            a`fit`).
-
         """
         kg_data = self.read_data(
             path=path,
@@ -746,45 +734,41 @@ class GPU_RDF2Vec:
 
     def fit(self, edge_df: cudf.DataFrame, walk_vertices: cudf.Series = None) -> None:
         """
-         Train a Word2Vec model on random-walk sequences generated from the
-         knowledge graph.
+        Generate walks from the knowledge graph and train the Word2Vec model.
 
-         The method performs three high-level steps:
+        With ``backend="pytorch"`` the walks are turned into (center, context)
+        pairs on the GPU and trained with a PyTorch Lightning ``Trainer`` (DDP
+        across all GPUs with ``multi_gpu``). With ``backend="gensim"`` the
+        walks are kept as sequences and gensim trains on the CPU; with
+        ``multi_gpu`` they are first written to a temporary Parquet directory
+        under ``$TMPDIR``, and the Dask client is closed before training to
+        free the GPU memory.
 
-         1. **Generate walks** – Uses the configured ``walk_strategy``
-         to obtain (center, context) pairs that mimic natural-language contexts.
-         2. **Build the training data set** – Converts the pairs to PyTorch
-         tensors and wraps them in a performant `TensorDataset`/`DataLoader`.
-         3. **Optimize the embedding model** – Instantiates the requested
-         Word2Vec variant, then fits it with a
-         PyTorch Lightning `Trainer`.
+        Parameters
+        ----------
+        edge_df : cudf.DataFrame or dask_cudf.DataFrame
+            Integer-encoded edge list, the output of `load_data`.
+        walk_vertices : cudf.Series or None, default None
+            Token ids of the start vertices. If None, walks start from every
+            subject of the graph. Random walks start ``walk_number`` walks per
+            vertex.
 
-         Parameters
-         ----------
-         edge_df : cudf.DataFrame
-             Int-encoded edge list with columns ``subject``, ``predicate``,
-             ``object``—typically the output of `load_data`.
-         walk_vertices : cudf.Series or None, default None
-             Optional subset of starting vertices from which to launch random
-             walks. If None, all vertices in ``self.knowledge_graph`` are used.
-
-         Raises
-         ------
-         ValueError
-             If an invalid ``walk_strategy`` is supplied.
-         RuntimeError
-             If no graph has been built yet (call `load_data` first).
+        Raises
+        ------
+        RuntimeError
+            If no graph has been built yet (call `load_data` first).
+        NotImplementedError
+            If ``walk_strategy="bfs"`` is combined with ``backend="gensim"``.
 
         Notes
         -----
-        - Walks are repeated ``self.walk_number`` times and have maximum depth ``self.walk_depth``.
-        - Skip-gram training uses negative sampling with ``self.negative_samples`` negatives per positive pair.
-        - The trained model is stored in ``self.word2vec_model`` and can subsequently be exported via ``transform``.
+        The trained model is stored in ``self.word2vec_model``; get the
+        embeddings with `transform`.
 
-         Examples
-         --------
-         >>> edges = rdf2vec.load_data("example.parquet")
-         >>> rdf2vec.fit(edges)
+        Examples
+        --------
+        >>> edges = rdf2vec.load_data("example.parquet")
+        >>> rdf2vec.fit(edges)
         """
         if self._walk_source_vertices is None:
             raise RuntimeError(_NO_GRAPH)
@@ -876,7 +860,7 @@ class GPU_RDF2Vec:
                 if isinstance(walk_sequences, WalkParquet):
                     walks_parquet = walk_sequences.path  # written by the GPUs
                     _check_walk_files(walk_sequences)
-                elif hasattr(walk_sequences, "to_parquet"):
+                elif hasattr(walk_sequences, "compute"):
                     logger.info(f"Checkpointing walk sequences to {walks_parquet}")
                     # dask_cudf.DataFrame: each worker writes its partition.
                     # `random_walk_sequences()` already persist+wait-ed the
@@ -1062,7 +1046,7 @@ class GPU_RDF2Vec:
                 num_nodes=self.config.num_nodes,
                 enable_checkpointing=False,
             )
-            if self.config.tune_batch_size:
+            if _tunes_batch_size(self.config):
                 tuner = Tuner(trainer)
                 tuner.scale_batch_size(
                     word2vec_model,
@@ -1080,40 +1064,37 @@ class GPU_RDF2Vec:
 
     def transform(self) -> cudf.DataFrame:
         """
-        Convert the learned Word2Vec parameters into a cuDF table of
-        entity‑level embeddings.
+        Return the learned embeddings as a cuDF table.
 
-        The method fetches the trained embedding matrix
-        (shape ``[vocab_size, vector_size]``), converts it from the PyTorch
-        tensor on the GPU into a cuDF DataFrame, and concatenates it with the
-        ``word2idx`` mapping so every row contains
+        The table has one row per vocabulary token, which covers entities,
+        predicates and literals, with the columns
 
-        * ``token`` – integer ID
-        * ``word`` – original IRI / literal
-        * ``embedding_0 … embedding_{vector_size‑1}`` – float32 components
+        * ``token`` – integer id
+        * ``word`` – the IRI or literal
+        * ``embedding_0 … embedding_{vector_size-1}`` – float32 components
 
-        When `self.generate_artifact` is *True*, the resulting table is also
-        written to *./vector/embeddings_<embedding_model>.parquet* and the
-        ``word2idx`` mapping to *./vector/word2idx.parquet*.
+        Tokens excluded from training by ``min_count`` keep their random
+        initial vector with the PyTorch backend and get a zero vector with
+        the gensim backend.
+
+        When ``generate_artifact=True``, the table is also written to
+        ``./vector/embeddings_<embedding_model>.parquet`` and the vocabulary
+        to ``./vector/word2idx.parquet``.
 
         Returns
         -------
         cudf.DataFrame
-            A ``(vocab_size × (vector_size + 2))`` DataFrame with the mapping
-            and embeddings.
+            A ``vocab_size × (vector_size + 2)`` DataFrame.
 
         Raises
         ------
         ValueError
-            If called before `fit` (no trained model) **or**
-            `load_data` (no ``word2idx`` vocabulary).
+            If called before `fit` (no trained model) or `load_data` (no
+            vocabulary).
 
         Notes
         -----
-        The method is a pure transformation; it never mutates the underlying
-        Word2Vec parameters.  Use it to obtain fresh snapshots after each
-        training run.
-
+        The model parameters are not changed.
         """
         # Check if model is fitted and word2idx is available
         with self.tracker.stage("Embedding_Extraction"):
@@ -1198,38 +1179,29 @@ class GPU_RDF2Vec:
         return cudf.concat([w2i, model_embeddings_df], axis=1)
 
     def fit_transform(
-        self, edge_df: cudf.DataFrame, walk_vertices: cudf.DataFrame
+        self, edge_df: cudf.DataFrame, walk_vertices: cudf.Series = None
     ) -> cudf.DataFrame:
         """
-        Train the Word2Vec model **and** immediately return the resulting
-        embeddings.
+        Train the Word2Vec model and return the embeddings.
 
-        This convenience wrapper simply calls `fit` followed by
-        `transform`.  Use it when you do **not** need to inspect the
-        model object itself and only care about the final entity vectors.
+        Calls `fit` followed by `transform`.
 
         Parameters
         ----------
-        edge_df : cudf.DataFrame
-            Int‑encoded triples that define the knowledge graph (typically the
-            output of `load_data`).
-        walk_vertices : cudf.Series or None, default ``None``
-            Optional subset of start vertices for walk generation; see
-            a`fit` for semantics.
+        edge_df : cudf.DataFrame or dask_cudf.DataFrame
+            Integer-encoded edge list, the output of `load_data`.
+        walk_vertices : cudf.Series or None, default None
+            Start vertices for the walks; see `fit`.
 
         Returns
         -------
         cudf.DataFrame
-            The concatenated ``word2idx``–embedding table produced by
-            a`transform`.
+            The embedding table returned by `transform`.
 
         Notes
         -----
-        - All exceptions raised by a`fit` or a`transform`
-          propagate unchanged.
-        - The trained model is still stored in
-          `self.word2vec_model` for later re‑use.
-
+        Exceptions raised by `fit` or `transform` propagate unchanged. The
+        trained model stays in ``self.word2vec_model``.
         """
         self.fit(edge_df, walk_vertices)
         embedding_df = self.transform()
@@ -1249,13 +1221,18 @@ class GPU_RDF2Vec:
         return False
 
     def save(self, path: str) -> None:
-        """Persist config, vocabulary, and trained model to *path*.
+        """Save the config, vocabulary and trained model to the directory
+        *path* (created if needed).
 
-        Creates a directory with:
-          - config.json     (RDF2VecConfig as JSON)
-          - word2idx.parquet (token↔word mapping)
-          - model.pt        (PyTorch state dict, only if fit() was called), or
-            model.gensim    (gensim Word2Vec, with backend="gensim")
+        The directory holds:
+
+        - ``config.json`` – the `RDF2VecConfig` as JSON
+        - ``word2idx.parquet`` – the vocabulary (after `load_data`)
+        - ``model.pt`` – the PyTorch state dict, or ``model.gensim`` – the
+          gensim model with ``backend="gensim"`` (after `fit`)
+
+        The graph is not saved; restore with `load` and call `transform`, or
+        `load_data` again to train further.
         """
         from pathlib import Path as _P
         import json
@@ -1277,7 +1254,21 @@ class GPU_RDF2Vec:
 
     @classmethod
     def load(cls, path: str, client=None) -> "GPU_RDF2Vec":
-        """Restore a GPU_RDF2Vec instance from a previously saved directory."""
+        """Restore a GPU_RDF2Vec instance from a directory written by `save`.
+
+        Parameters
+        ----------
+        path : str
+            Directory written by `save`.
+        client : dask.distributed.Client, optional
+            Required if the saved config has ``multi_gpu=True``.
+
+        Returns
+        -------
+        GPU_RDF2Vec
+            An instance with config, vocabulary and model restored, ready for
+            `transform`.
+        """
         from pathlib import Path as _P
         import json
 

@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-title: gpurdf2vec
+title: gpuRDF2vec
 message: If you use this software please cite it as below
 type: software
 authors:
@@ -11,7 +11,7 @@ authors:
     orcid: 'https://orcid.org/0000-0003-4386-8195'
 url: 'https://github.com/MartinBoeckling/rdf2vecgpu'
 version: 0.5.0
-date-released: '2026-11-02'
+date-released: '2026-11-09'
 preferred-citation:
   type: conference-paper
   title: "gpuRDF2vec – Scalable GPU-Based RDF2vec"
@@ -24,7 +24,7 @@ preferred-citation:
         orcid: 'https://orcid.org/0000-0003-4386-8195'
   doi: 10.1007/978-3-032-09530-5_14
 
-  collection-title: The Semantic Web -- ISWC 2025
+  collection-title: The Semantic Web – ISWC 2025
   year: 2025
   editors:
       - family-names: Garijo

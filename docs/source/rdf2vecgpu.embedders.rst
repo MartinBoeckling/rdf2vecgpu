@@ -22,6 +22,14 @@ rdf2vecgpu.embedders.word2vec\_loader module
    :show-inheritance:
    :undoc-members:
 
+rdf2vecgpu.embedders.gensim\_word2vec module
+--------------------------------------------
+
+.. automodule:: rdf2vecgpu.embedders.gensim_word2vec
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
 Module contents
 ---------------
 

@@ -22,9 +22,9 @@ In the following, you find an overview of the different supported file formats f
 +------------------+-----------------------+-------------------------+
 | File Format      | cuDF engine           | rdflib engine           |
 +==================+=======================+=========================+
-| N-Triples (.nt)  | Yes                   | Yes                     |
+| N-Triples (.nt)  | Yes                   | No                      |
 +------------------+-----------------------+-------------------------+
-| N-Quads (.nq)    | Yes                   | Yes                     |
+| N-Quads (.nq)    | Yes                   | No                      |
 +------------------+-----------------------+-------------------------+
 | Turtle (.ttl)    | No                    | Yes                     |
 +------------------+-----------------------+-------------------------+
@@ -48,6 +48,16 @@ Parquet, ORC, N-Triples, or CSV. If your dataset is in a different format, consi
 to one of these formats for better load efficiency. The best performance is typically achieved with
 Parquet files due to their columnar storage format, which is well-suited for GPU processing.
 
+Format details:
+
+- **Parquet, ORC**: columns named ``subject``, ``predicate`` and ``object`` (rename others with
+  ``col_map``).
+- **CSV**: needs a header row naming the columns; files without a header raise a ``KeyError``.
+- **N-Triples, N-Quads**: read line by line on the GPU. Angle brackets are stripped from IRIs, the
+  graph term of an N-Quads line is dropped, and lines whose subject or predicate is a blank node
+  (``_:b0``) are skipped.
+- **Other RDF formats**: parsed on the CPU with rdflib, then moved to the GPU.
+
 Code example
 ~~~~~~~~~~~~
 Here is a code snippet demonstrating how to load a knowledge graph using the cuDF engine with a
@@ -70,30 +80,35 @@ Parquet file:
    # Path to the triple dataset
    path = "data/wikidata5m/wikidata5m_kg.parquet"
 
-   # Read data and receive edge data
-   edge_data = gpu_rdf2vec_model.read_data(path)
+   # Read the file, build the vocabulary and the graph
+   edge_data = gpu_rdf2vec_model.load_data(path)
+
+``load_data`` reads the file, encodes every IRI and literal as an integer token (the mapping is
+kept in ``gpu_rdf2vec_model.word2idx``) and builds the graph that ``fit`` walks on. The lower-level
+``read_data`` only reads the file and returns the raw triples.
 
 Alternatively, when using a file format which is not directly supported by cuDF, this is
 automatically detected and the rdflib engine is used instead:
 
 .. code-block:: python
 
-   edge_data = gpu_rdf2vec_model.read_data("data/wikidata5m/wikidata5m_kg.ttl")
+   edge_data = gpu_rdf2vec_model.load_data("data/wikidata5m/wikidata5m_kg.ttl")
 
 This allows you to seamlessly load different file formats without changing the code logic.
 
 Column mapping and reader keyword arguments
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-``read_data`` exposes two optional arguments to adapt the reader to non-default schemas:
+``load_data`` (and ``read_data``) expose two optional arguments to adapt the reader to non-default schemas:
 
 - ``col_map``: a mapping from your source column names to the expected ``subject``, ``predicate``,
   ``object`` (and optionally ``weights``) names.
-- ``read_kwargs``: additional keyword arguments forwarded to the underlying cuDF/Dask reader
-  (for example ``delimiter``, ``columns``, ``compression``).
+- ``read_kwargs``: additional keyword arguments forwarded to the underlying cuDF/Dask CSV,
+  Parquet or ORC reader (for example ``delimiter`` or ``compression``). The N-Triples and rdflib
+  readers ignore them. ``columns`` is rejected for Parquet; use ``col_map`` to select columns.
 
 .. code-block:: python
 
-   edge_data = gpu_rdf2vec_model.read_data(
+   edge_data = gpu_rdf2vec_model.load_data(
        "data/my_graph.csv",
        col_map={"src": "subject", "rel": "predicate", "dst": "object"},
        read_kwargs={"delimiter": "\t"},
@@ -109,7 +124,7 @@ name). You can use ``col_map`` to rename an existing edge-weight column accordin
 
    config = RDF2VecConfig(walk_weighted=True, walk_strategy="random")
    gpu_rdf2vec_model = GPU_RDF2Vec(config=config)
-   edge_data = gpu_rdf2vec_model.read_data(
+   edge_data = gpu_rdf2vec_model.load_data(
        "data/spatial_graph.parquet",
        col_map={"distance": "weights"},
    )
@@ -122,9 +137,11 @@ the weights and also follow weight-0 edges.
 Literal handling
 ~~~~~~~~~~~~~~~~
 Knowledge graphs often contain edges whose object is a literal value (for example numeric
-attributes). ``RDF2VecConfig`` exposes three parameters to handle such edges:
+attributes). ``RDF2VecConfig`` exposes four parameters to handle such edges:
 
-- ``literal_predicates``: a list of predicate strings that identify literal edges.
+- ``literal_predicates``: a list of predicate strings that identify literal edges. Matching is
+  exact against the loaded data. The N-Triples reader strips the angle brackets from IRIs, so
+  give the IRIs without ``<>``.
 - ``literal_strategy``: ``"drop"`` removes literal edges from the graph (the pyRDF2Vec default),
   while ``"bin"`` discretizes the object values into bin tokens so the edge is preserved.
 - ``literal_n_bins`` and ``literal_bin_strategy`` (``"quantile"`` or ``"uniform"``) control the
@@ -133,7 +150,7 @@ attributes). ``RDF2VecConfig`` exposes three parameters to handle such edges:
 .. code-block:: python
 
    config = RDF2VecConfig(
-       literal_predicates=["<http://example.org/hasHeight>", "<http://example.org/hasAge>"],
+       literal_predicates=["http://example.org/hasHeight", "http://example.org/hasAge"],
        literal_strategy="bin",
        literal_n_bins=5,
        literal_bin_strategy="quantile",
@@ -141,7 +158,7 @@ attributes). ``RDF2VecConfig`` exposes three parameters to handle such edges:
 
 Considerations for multi-GPU and distributed setups
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Depending on the value of the ``multi_gpu`` flag in the configuration, ``read_data`` returns the
+Depending on the value of the ``multi_gpu`` flag in the configuration, ``load_data`` returns the
 data either as a single cuDF dataframe (for single-GPU training) or as a Dask-cuDF dataframe
 backed by a list of cuDF partitions (for multi-GPU training).
 

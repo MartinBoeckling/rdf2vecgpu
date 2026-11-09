@@ -1,3 +1,5 @@
+from __future__ import annotations  # the annotations use cudf | dask_cudf types
+
 import cupy as cp
 import cudf
 import dask
@@ -616,9 +618,10 @@ class SingleGPUWalkCorpus:
 
         Sister method to `random_walk` for the gensim training backend, which
         wants raw walk sequences (it builds its own skip-gram windows
-        internally). Output schema:
-            vertices   : list<int32>   length = walk_depth + 1
-            predicates : list<int32>   length = walk_depth
+        internally). Output columns:
+
+        - ``vertices``: ``list<int32>`` of length ``walk_depth + 1``
+        - ``predicates``: ``list<int32>`` of length ``walk_depth``
 
         Walks shorter than `walk_depth` keep cuGraph's `-1` sentinel slots in
         the lists so the gensim streaming iterator can trim them at first
@@ -834,8 +837,7 @@ class MultiGPUWalkCorpus:
 
         Sister method to `random_walk` for the gensim training backend. Returns
         a `dask_cudf.DataFrame` with one row per walk and `vertices` / `predicates`
-        list columns; mirrors the parquet schema produced by `tools/walk_gen.py`,
-        which is what `embedders.gensim_word2vec.WalkCorpus` consumes.
+        list columns, the schema that `embedders.gensim_word2vec.WalkCorpus` consumes.
         """
         # cuGraph MG uniform/biased_random_walks expects start_vertices as a
         # cudf.Series (NOT dask_cudf) — see random_walk method above for the

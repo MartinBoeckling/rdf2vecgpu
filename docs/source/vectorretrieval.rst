@@ -35,8 +35,8 @@ The following example demonstrates how to perform this retrieval process:
    )
    gpu_rdf2vec_model = GPU_RDF2Vec(config=config)
 
-   # Read the knowledge graph
-   edge_data = gpu_rdf2vec_model.read_data("data/wikidata5m/wikidata5m_kg.parquet")
+   # Read the file, build the vocabulary and the graph
+   edge_data = gpu_rdf2vec_model.load_data("data/wikidata5m/wikidata5m_kg.parquet")
 
    # Train the RDF2Vec embeddings
    gpu_rdf2vec_model.fit(edge_df=edge_data, walk_vertices=None)
@@ -44,8 +44,11 @@ The following example demonstrates how to perform this retrieval process:
    # Retrieve the embeddings for all entities
    embeddings = gpu_rdf2vec_model.transform()
 
-The ``transform`` method returns a cuDF dataframe where the keys are the entity URIs, together with
-the internal integer-based ID and the embedding vectors. If you set ``generate_artifact=True``
+The ``transform`` method returns a cuDF dataframe with one row per vocabulary token (entities,
+predicates and literals) and the columns ``token`` (integer id), ``word`` (the IRI or literal) and
+``embedding_0`` … ``embedding_<vector_size-1>``. Tokens excluded from training by ``min_count``
+keep their random initial vector with the PyTorch backend and get a zero vector with the gensim
+backend. If you set ``generate_artifact=True``
 during the configuration, the embeddings and the ``word2idx`` mapping are also written as
 Parquet files to ``./vector/embeddings_<embedding_model>.parquet`` and
 ``./vector/word2idx.parquet``.

@@ -27,7 +27,10 @@ rdf2vecgpu.gpu\_rdf2vec module
 rdf2vecgpu.config module
 ------------------------
 
+The configuration is documented in :doc:`configuration`.
+
 .. automodule:: rdf2vecgpu.config
+   :no-index:
    :members:
    :show-inheritance:
    :undoc-members:

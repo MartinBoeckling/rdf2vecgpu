@@ -85,3 +85,46 @@ def test_fit_before_load_data_says_so(tmp_path):
     edges = model.read_data(str(path))
     with pytest.raises(RuntimeError, match="call load_data"):
         model.fit(edges)
+
+
+def test_fit_transform_walk_vertices_defaults_to_none():
+    """The docs call `fit_transform(edges)` without start vertices."""
+    import inspect
+
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    assert inspect.signature(GPU_RDF2Vec.fit_transform).parameters["walk_vertices"].default is None
+
+
+def test_batch_size_tuner_keeps_explicit_batch_size():
+    """The tuner replaces the batch size it tunes, so it must not run when one is set."""
+    from src.rdf2vecgpu.config import RDF2VecConfig
+    from src.rdf2vecgpu.gpu_rdf2vec import _tunes_batch_size
+
+    assert _tunes_batch_size(RDF2VecConfig())
+    assert not _tunes_batch_size(RDF2VecConfig(batch_size=4096))
+    assert not _tunes_batch_size(RDF2VecConfig(tune_batch_size=False))
+    assert not _tunes_batch_size(RDF2VecConfig(batch_size=4096, tune_batch_size=False))
+
+
+@pytest.mark.gpu
+def test_single_gpu_gensim_fit(tmp_path):
+    """The whole single-GPU gensim path: a cuDF walk frame is not a Dask one."""
+    pytest.importorskip("gensim")
+    import cudf
+
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    path = tmp_path / "kg.parquet"
+    cudf.DataFrame(
+        {
+            "subject": ["a", "b", "c", "a", "d"],
+            "predicate": ["p", "p", "q", "q", "p"],
+            "object": ["b", "c", "a", "c", "a"],
+        }
+    ).to_parquet(path, index=False)
+    model = GPU_RDF2Vec(backend="gensim", walk_depth=2, walk_number=5, epochs=1, vector_size=4, window_size=2)
+    edges = model.load_data(str(path))
+    emb = model.fit_transform(edges)
+    assert emb.shape == (model.word2idx.shape[0], 4 + 2)
+    assert model.word2vec_model.alpha == 0.025
