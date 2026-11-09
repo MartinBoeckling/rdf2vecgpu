@@ -24,6 +24,9 @@ import numpy as np
 
 WALK_DEPTH, WALK_NUMBER = 4, 5
 HUB_STARTS = 4_000  # x WALK_NUMBER walks from the hub
+# x WALK_NUMBER walks from the self-loop vertex: each first step stays there with p = 1/2, so
+# with few walks `check_sequences` would by chance see no self-loop step (1/32 at 5 walks)
+LOOP_STARTS = 50
 # hub -> hub_dst1: zz_a twice (duplicate triple, weight 1), zz_b and zz_d (tie, weight 3); hub -> hub_dst2: zz_c (4)
 HUB_EDGES = [("zz_a", "hub_dst1", 1.0), ("zz_a", "hub_dst1", 1.0), ("zz_b", "hub_dst1", 3.0),
              ("zz_d", "hub_dst1", 3.0), ("zz_c", "hub_dst2", 4.0)]
@@ -186,13 +189,13 @@ def config(weighted, **kw):
 
 
 def starts_for(model, n):
-    """A sample of ring entities, the hub HUB_STARTS times, the self-loop and the sink."""
+    """A sample of ring entities, the hub HUB_STARTS times, the self-loop LOOP_STARTS times and the sink."""
     import cudf
 
     rng = np.random.default_rng(0)
     words = [str(x) for x in rng.choice(n, 20_000, replace=False)] + ["hub", "loop", "sink"]
     t = tokens_of(model, words + ["hub_dst1", "zz_a", "zz_b", "zz_c", "zz_d", "zz_self"])
-    starts = [t[w] for w in words[:-3]] + [t["hub"]] * HUB_STARTS + [t["loop"], t["sink"]]
+    starts = [t[w] for w in words[:-3]] + [t["hub"]] * HUB_STARTS + [t["loop"]] * LOOP_STARTS + [t["sink"]]
     counts = {}
     for s in starts:
         counts[s] = counts.get(s, 0) + WALK_NUMBER
