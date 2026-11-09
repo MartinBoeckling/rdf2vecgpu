@@ -124,7 +124,7 @@ class RDF2VecConfig(BaseModel):
 
     tracker_kwargs : dict or None, default None
         Keyword arguments for the tracker, keyed by backend name, for example
-        ``{"mlflow": {"experiment_name": "rdf2vec"}}`` or
+        ``{"mlflow": {"experiment": "rdf2vec", "tracking_uri": "file:./mlruns"}}`` or
         ``{"wandb": {"project": "rdf2vec"}}``.
 
     tracker_run_name : str or None, default None

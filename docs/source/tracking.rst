@@ -46,14 +46,16 @@ Selecting a tracker
        tracker_kwargs={
            "mlflow": {
                "tracking_uri": "http://mlflow.internal:5000",
-               "experiment_name": "rdf2vecgpu",
+               "experiment": "rdf2vecgpu",
            },
        },
    )
    model = GPU_RDF2Vec(config=config)
 
+The MLflow backend requires ``experiment`` and ``tracking_uri`` and also accepts ``registry_uri``.
+
 For Weights & Biases, use ``tracker="wandb"`` and provide backend-specific kwargs under the
-``"wandb"`` key (for example ``project``, ``entity``, ``group``).
+``"wandb"`` key: ``project`` is required, and ``entity``, ``run_name`` and ``config`` are optional.
 
 .. note::
    When ``tracker="none"`` (the default), a :class:`~rdf2vecgpu.logger.base.NoOpTracker` is used.
