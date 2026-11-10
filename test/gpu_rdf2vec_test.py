@@ -161,3 +161,69 @@ def test_pytorch_skipgram_zeroes_unwalked_tokens_and_keeps_them_zero_after_load(
     assert (tmp_path / "saved" / "walked_tokens.npy").exists()
     loaded = vectors(GPU_RDF2Vec.load(str(tmp_path / "saved")).transform())
     assert np.allclose(loaded.loc[emb.index].to_numpy(), emb.to_numpy())
+
+
+def _small_kg(tmp_path):
+    import cudf
+
+    path = tmp_path / "kg.parquet"
+    subjects = [f"e{i}" for i in range(20)]
+    cudf.DataFrame(
+        {
+            "subject": subjects,
+            "predicate": ["p" if i % 2 else "q" for i in range(20)],
+            "object": [f"e{(i + 1) % 20}" for i in range(20)],
+        }
+    ).to_parquet(path)
+    return str(path)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("backend", ["pytorch", "gensim"])
+def test_prepare_corpus_then_fit_from_walks(tmp_path, backend):
+    if backend == "gensim":
+        pytest.importorskip("gensim")
+    import cudf
+
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    settings = dict(backend=backend, epochs=1, vector_size=4, window_size=2, walk_number=3, walk_depth=3)
+    preparer = GPU_RDF2Vec(**settings)
+    edges = preparer.load_data(_small_kg(tmp_path))
+    walks_path, vocab_path = preparer.prepare_corpus(edges, str(tmp_path / "corpus"))
+    walks = cudf.read_parquet(walks_path)
+    assert len(walks) == 20 * 3
+    assert walks["vertices"].list.len().max() == 4  # walk_depth + 1
+    assert set(cudf.read_parquet(vocab_path).columns) == {"token", "word"}
+
+    trainer = GPU_RDF2Vec(**settings)  # a fresh instance: no graph, no load_data
+    trainer.fit_from_walks(walks_path, vocab_path)
+    emb = trainer.transform()
+    assert len(emb) == len(preparer.word2idx)
+    vectors = emb[[f"embedding_{i}" for i in range(4)]].to_pandas().to_numpy()
+    assert np.isfinite(vectors).all() and np.abs(vectors).sum() > 0
+
+
+@pytest.mark.gpu
+def test_fit_from_walks_errors(tmp_path):
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    with pytest.raises(FileNotFoundError):
+        GPU_RDF2Vec().fit_from_walks(str(tmp_path / "missing"), str(tmp_path / "missing.parquet"))
+    _write_walks(tmp_path / "walks", 2, "part.0.parquet")
+    (tmp_path / "vocab.parquet").write_bytes(b"")
+    with pytest.raises(NotImplementedError, match="CBOW"):
+        GPU_RDF2Vec(embedding_model="cbow").fit_from_walks(
+            str(tmp_path / "walks"), str(tmp_path / "vocab.parquet")
+        )
+
+
+@pytest.mark.gpu
+def test_multi_gpu_without_client_only_fails_when_reading(tmp_path):
+    """fit_from_walks needs no Dask client, so construction must not ask for one."""
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    model = GPU_RDF2Vec(multi_gpu=True)
+    assert model.client is None
+    with pytest.raises(ValueError, match="needs a Dask client"):
+        model.read_data(_small_kg(tmp_path))

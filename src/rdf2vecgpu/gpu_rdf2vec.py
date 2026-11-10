@@ -41,6 +41,16 @@ class WalkParquet:
     n_walks: int
 
 
+_NO_CLIENT = (
+    "multi_gpu=True needs a Dask client to read data and generate walks. Create a "
+    "LocalCUDACluster and Client, then pass the client to GPU_RDF2Vec:\n"
+    "  from dask_cuda import LocalCUDACluster\n"
+    "  from dask.distributed import Client\n"
+    "  cluster = LocalCUDACluster(...)\n"
+    "  client = Client(cluster)\n"
+    "  rdf2vec = GPU_RDF2Vec(..., client=client)\n"
+    "Training on walks already written by prepare_corpus (fit_from_walks) needs no client."
+)
 _NO_GRAPH = (
     "no graph built yet: call load_data() before fit(); read_data() only reads the file, "
     "load_data() also builds the vocabulary and the graph"
@@ -224,28 +234,17 @@ class GPU_RDF2Vec:
         # Initialize class variables
         self.config = config
         # Handle client
+        self.client = client if self.config.multi_gpu else None
         if self.config.multi_gpu:
-            if client is None:
-                raise ValueError(
-                    "multi_gpu=True requires a Dask client. Please create a "
-                    "LocalCUDACluster and Client, then pass the client to GPU_RDF2Vec.\n"
-                    "Example:\n"
-                    "  from dask_cuda import LocalCUDACluster\n"
-                    "  from dask.distributed import Client\n"
-                    "  cluster = LocalCUDACluster(...)\n"
-                    "  client = Client(cluster)\n"
-                    "  rdf2vec = GPU_RDF2Vec(..., client=client)"
+            # without a client only fit_from_walks works; reading data needs one
+            if client is not None:
+                logger.info(
+                    f"Using provided Dask client with {len(client.scheduler_info()['workers'])} workers"
                 )
-            self.client = client
-            logger.info(
-                f"Using provided Dask client with {len(client.scheduler_info()['workers'])} workers"
-            )
             dask.config.set({"dataframe.backend": "cudf"})
             # Apply cuGraph 25.6 + dask 2025.5 compatibility patches
             from ._compat import apply_patches
             apply_patches()
-        else:
-            self.client = None
         self._validate_environment()
         # Initialize the cugraph graph
         self.knowledge_graph = MultiGraph(directed=True)
@@ -295,6 +294,8 @@ class GPU_RDF2Vec:
         cudf.DataFrame or dask_cudf.DataFrame
             The triples with string values, not yet integer-encoded.
         """
+        if self.config.multi_gpu and self.client is None:
+            raise ValueError(_NO_CLIENT)
         self.tracker.start_pipeline(
             run_name=self.config.tracker_run_name,
             tags={"lib": "gpu-rdf2vec", "backend": self.config.backend},
@@ -1374,6 +1375,103 @@ class GPU_RDF2Vec:
             w2i = self.word2idx
         w2i = w2i.sort_values("token").reset_index(drop=True)
         return cudf.concat([w2i, model_embeddings_df], axis=1)
+
+    def prepare_corpus(self, edge_df, out_dir: str, walk_vertices=None) -> tuple[str, str]:
+        """Generate the walks and write them, with the vocabulary, under
+        *out_dir*, for training later with `fit_from_walks`.
+
+        Splits `fit` into its two halves, so walks can be generated once and
+        trained on several times, or in another process: for example
+        multi-GPU training, where Lightning starts one process per GPU by
+        running the training script again, and that script then only needs
+        to read the files.
+
+        Writes ``out_dir/walks/`` (Parquet, one row per walk with the
+        ``vertices`` and ``predicates`` token lists; ``-1`` pads walks that
+        ended early) and ``out_dir/word2idx.parquet`` (columns ``token``,
+        ``word``). Random walks only.
+
+        Parameters
+        ----------
+        edge_df : cudf.DataFrame or dask_cudf.DataFrame
+            Integer-encoded edge list, the output of `load_data`.
+        out_dir : str
+            Directory to write to; created if needed.
+        walk_vertices : cudf.Series or None, default None
+            Token ids of the start vertices; as in `fit`.
+
+        Returns
+        -------
+        (str, str)
+            The walks directory and the vocabulary file, to pass to
+            `fit_from_walks`.
+        """
+        if self._walk_source_vertices is None:
+            raise RuntimeError(_NO_GRAPH)
+        out = os.path.abspath(out_dir)
+        os.makedirs(out, exist_ok=True)
+        walks_path = os.path.join(out, "walks")
+        if self.config.multi_gpu:
+            # the GPUs write their walks straight to walks_path
+            self.walk_generation_sequences(edge_df, walk_vertices, out_dir=walks_path)
+        else:
+            walks = self.walk_generation_sequences(edge_df, walk_vertices)
+            if hasattr(walks, "compute"):
+                walks = walks.compute()
+            os.makedirs(walks_path, exist_ok=True)
+            walks.to_parquet(os.path.join(walks_path, "part.0.parquet"), index=False)
+        word2idx = self.word2idx.compute() if hasattr(self.word2idx, "compute") else self.word2idx
+        vocab_path = os.path.join(out, "word2idx.parquet")
+        word2idx[["token", "word"]].to_parquet(vocab_path, index=False)
+        logger.info(f"Wrote the walks to {walks_path} and the vocabulary to {vocab_path}")
+        return walks_path, vocab_path
+
+    def fit_from_walks(self, walks_path: str, vocab_path: str) -> None:
+        """Train the Word2Vec model on walks written by `prepare_corpus`.
+
+        Needs no graph and no `load_data`: the vocabulary is read from
+        *vocab_path*. Supports skip-gram with ``backend="pytorch"`` (one
+        GPU, or DDP across all GPUs of the node with ``multi_gpu``; no Dask
+        client is needed) and both models with ``backend="gensim"``. Get the
+        embeddings with `transform` afterwards.
+
+        Parameters
+        ----------
+        walks_path : str
+            Walks directory returned by `prepare_corpus`.
+        vocab_path : str
+            Vocabulary file returned by `prepare_corpus`.
+
+        Raises
+        ------
+        FileNotFoundError
+            If either path does not exist.
+        NotImplementedError
+            For CBOW with ``backend="pytorch"``, which trains on pairs.
+        """
+        from glob import glob
+        import pyarrow.parquet as pq
+
+        for path in (walks_path, vocab_path):
+            if not os.path.exists(path):
+                raise FileNotFoundError(path)
+        if self.config.backend == "pytorch" and self.config.embedding_model != "skipgram":
+            raise NotImplementedError(
+                "fit_from_walks trains skip-gram with backend='pytorch'; use backend='gensim' for CBOW"
+            )
+        self.word2idx = cudf.read_parquet(vocab_path)[["token", "word"]]
+        files = sorted(set(
+            glob(os.path.join(walks_path, "*.parquet"))
+            + glob(os.path.join(walks_path, "**", "*.parquet"), recursive=True)
+        ))
+        n_walks = sum(pq.read_metadata(f).num_rows for f in files)
+        walks = WalkParquet(walks_path, n_walks)
+        if self.config.backend == "gensim":
+            self._fit_via_gensim(walks)
+        elif self.config.multi_gpu:
+            self._fit_via_pytorch_sequences(walks)
+        else:
+            self._fit_via_pytorch_sequences(cudf.read_parquet(files, columns=["vertices", "predicates"]))
 
     def fit_transform(
         self, edge_df: cudf.DataFrame, walk_vertices: cudf.Series = None
