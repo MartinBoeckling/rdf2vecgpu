@@ -220,6 +220,8 @@ def train_gensim_word2vec(
     epochs: int = 5,
     workers: int = 4,
     learning_rate: float = 0.025,
+    min_learning_rate: float = 0.0001,
+    sample: float = 0.001,
     random_state: int = 42,
     batch_size: int = 20_000,
     int_tokens: bool = True,
@@ -239,9 +241,10 @@ def train_gensim_word2vec(
         The word2idx mapping (`word`, `token` columns). Required even when
         `int_tokens=True` so the resulting embeddings can be joined back to
         URIs in `transform()`.
-    vector_size, window, min_count, negative, epochs, workers, learning_rate, random_state : int or float
+    vector_size, window, min_count, negative, epochs, workers, learning_rate, min_learning_rate, sample, random_state : int or float
         Forwarded to `gensim.models.Word2Vec` (``learning_rate`` as
-        ``alpha``, ``random_state`` as ``seed``).
+        ``alpha``, ``min_learning_rate`` as ``min_alpha``, ``random_state``
+        as ``seed``).
     embedding_model : {"skipgram", "cbow"}, default "skipgram"
         Mapped to gensim's `sg=1` / `sg=0`.
     int_tokens : bool, default True
@@ -269,6 +272,8 @@ def train_gensim_word2vec(
         workers=workers,
         epochs=epochs,
         alpha=learning_rate,
+        min_alpha=min_learning_rate,
+        sample=sample,
         seed=random_state,
     )
     return model

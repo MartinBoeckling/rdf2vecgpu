@@ -2,7 +2,16 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field, model_validator
 
 
-_DEFAULT_LEARNING_RATE = {"pytorch": 0.0001, "gensim": 0.025}
+# skip-gram's PyTorch trainer sums the loss over a batch and uses SGD, so its
+# learning rate is a step size per pair like gensim's alpha; PyTorch CBOW uses
+# Adam on a mean loss
+_DEFAULT_LEARNING_RATE = {
+    ("pytorch", "skipgram"): 0.025,
+    ("pytorch", "cbow"): 0.0001,
+    ("gensim", "skipgram"): 0.025,
+    ("gensim", "cbow"): 0.025,
+}
+DEFAULT_BATCH_SIZE = 32_768
 
 
 class RDF2VecConfig(BaseModel):
@@ -52,10 +61,12 @@ class RDF2VecConfig(BaseModel):
         Number of training epochs.
 
     batch_size : int or None, default None
-        Training batch size of the PyTorch backend. If None, a single-GPU run
-        uses 1/100 of the training pairs (or, with ``tune_batch_size=True``,
-        the tuner's result) and a multi-GPU run uses 512. An explicit value is
-        always used as given. Not used by ``backend="gensim"``.
+        Number of (center, context) pairs per training step of the PyTorch
+        backend. If None, it is set to 32768, unless ``tune_batch_size=True``
+        leaves the choice to the tuner. Skip-gram on random walks fills each
+        step with whole walks, so a step holds about ``batch_size`` pairs
+        (fewer when walks end early or ``sample`` drops tokens). Not used by
+        ``backend="gensim"``.
 
     vector_size : int, default 256
         Dimensionality of the output embeddings.
@@ -74,10 +85,24 @@ class RDF2VecConfig(BaseModel):
         Number of negative examples for negative sampling.
 
     learning_rate : float or None, default None
-        Learning rate. With ``backend="pytorch"`` it is the optimiser's
-        learning rate; with ``backend="gensim"`` it is gensim's initial
-        ``alpha``. If None, it is set to the backend's default: 0.0001 for
-        ``"pytorch"`` and 0.025 (gensim's own default) for ``"gensim"``.
+        Initial learning rate. Skip-gram with ``backend="pytorch"`` and
+        ``backend="gensim"`` both use it as a step size per (center, context)
+        pair that decays linearly to ``min_learning_rate`` over training
+        (gensim's ``alpha``). PyTorch CBOW uses it as Adam's learning rate.
+        If None, it is set to 0.025 (gensim's own default), or to 0.0001 for
+        PyTorch CBOW.
+
+    min_learning_rate : float, default 0.0001
+        Learning rate at the end of training, after the linear decay
+        (gensim's ``min_alpha``). Not used by PyTorch CBOW.
+
+    sample : float, default 0.001
+        Threshold for dropping occurrences of frequent tokens from the walks
+        during training, as gensim's ``sample``: a token that makes up a
+        fraction ``f`` of the walks keeps each occurrence with probability
+        ``(sqrt(f / sample) + 1) * sample / f``. 0 keeps everything (as
+        jRDF2Vec does by default). Used by skip-gram on random walks with
+        ``backend="pytorch"`` and by ``backend="gensim"``.
 
     backend : {"pytorch", "gensim"}, default "pytorch"
         Word2Vec trainer. ``"pytorch"`` trains on the GPU(s) with PyTorch
@@ -108,11 +133,10 @@ class RDF2VecConfig(BaseModel):
         Number of gensim worker threads with ``backend="gensim"``. Not used
         by the PyTorch backend.
 
-    tune_batch_size : bool, default True
-        Run Lightning's batch-size tuner (power scaling, starting from 1/200
-        of the training pairs) before single-GPU PyTorch training when
-        ``batch_size`` is None. Not used by multi-GPU training or
-        ``backend="gensim"``.
+    tune_batch_size : bool, default False
+        Search for the batch size before single-GPU PyTorch training instead
+        of using ``batch_size``, which must then be None. Not used by
+        multi-GPU training or ``backend="gensim"``.
 
     num_nodes : int, default 1
         Number of nodes for multi-GPU PyTorch training (Lightning
@@ -164,6 +188,8 @@ class RDF2VecConfig(BaseModel):
     min_count: int = Field(default=1, ge=0)
     negative_samples: int = Field(default=5, ge=0)
     learning_rate: Optional[float] = Field(default=None, gt=0)
+    min_learning_rate: float = Field(default=0.0001, gt=0)
+    sample: float = Field(default=0.001, ge=0)
     backend: Literal["pytorch", "gensim"] = "pytorch"
     # library settings
     random_state: int = Field(default=42, ge=0)
@@ -171,7 +197,7 @@ class RDF2VecConfig(BaseModel):
     multi_gpu: bool = False
     generate_artifact: bool = False
     cpu_count: int = Field(default=4, gt=0)
-    tune_batch_size: bool = True
+    tune_batch_size: bool = False
     num_nodes: int = Field(default=1, gt=0)
     tracker: Literal["mlflow", "wandb", "none"] = "none"
     tracker_kwargs: Optional[dict] = None
@@ -184,10 +210,19 @@ class RDF2VecConfig(BaseModel):
 
     @model_validator(mode="after")
     def _default_learning_rate(self):
-        # the two trainers need very different learning rates: gensim's
-        # `alpha` decays linearly from 0.025, the PyTorch optimiser uses 1e-4
         if self.learning_rate is None:
-            self.learning_rate = _DEFAULT_LEARNING_RATE[self.backend]
+            self.learning_rate = _DEFAULT_LEARNING_RATE[(self.backend, self.embedding_model)]
+        return self
+
+    @model_validator(mode="after")
+    def _default_batch_size(self):
+        if self.tune_batch_size and self.batch_size is not None:
+            raise ValueError(
+                "tune_batch_size=True searches for the batch size; leave batch_size unset "
+                f"(got batch_size={self.batch_size})"
+            )
+        if not self.tune_batch_size and self.batch_size is None:
+            self.batch_size = DEFAULT_BATCH_SIZE
         return self
 
     @model_validator(mode="after")

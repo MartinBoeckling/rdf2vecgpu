@@ -101,10 +101,9 @@ def test_batch_size_tuner_keeps_explicit_batch_size():
     from src.rdf2vecgpu.config import RDF2VecConfig
     from src.rdf2vecgpu.gpu_rdf2vec import _tunes_batch_size
 
-    assert _tunes_batch_size(RDF2VecConfig())
+    assert _tunes_batch_size(RDF2VecConfig(tune_batch_size=True))
+    assert not _tunes_batch_size(RDF2VecConfig())
     assert not _tunes_batch_size(RDF2VecConfig(batch_size=4096))
-    assert not _tunes_batch_size(RDF2VecConfig(tune_batch_size=False))
-    assert not _tunes_batch_size(RDF2VecConfig(batch_size=4096, tune_batch_size=False))
 
 
 @pytest.mark.gpu
@@ -128,3 +127,37 @@ def test_single_gpu_gensim_fit(tmp_path):
     emb = model.fit_transform(edges)
     assert emb.shape == (model.word2idx.shape[0], 4 + 2)
     assert model.word2vec_model.alpha == 0.025
+
+
+@pytest.mark.gpu
+def test_pytorch_skipgram_zeroes_unwalked_tokens_and_keeps_them_zero_after_load(tmp_path):
+    """Walk only from `a`: the tokens of the other component never occur in a
+    walk, are never trained, and come back as zeros, also after save/load."""
+    import cudf
+
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    path = tmp_path / "kg.parquet"
+    cudf.DataFrame(
+        {"subject": ["a", "b", "c"], "predicate": ["p", "p", "q"], "object": ["b", "a", "d"]}
+    ).to_parquet(path)
+    model = GPU_RDF2Vec(epochs=2, vector_size=4, window_size=2, walk_number=5, batch_size=64)
+    edges = model.load_data(str(path))
+    words = model.word2idx.to_pandas().set_index("word")["token"]
+    # the token ids of this tiny vocabulary are int8; fit must cast them for cuGraph
+    model.fit(edges, walk_vertices=cudf.Series([int(words["a"])], dtype=words.dtype))
+
+    def vectors(emb):
+        frame = emb.to_pandas().set_index("word")
+        return frame[[f"embedding_{i}" for i in range(4)]]
+
+    emb = vectors(model.transform())
+    for word in ("c", "q", "d"):
+        assert (emb.loc[word] == 0).all(), word
+    for word in ("a", "b", "p"):
+        assert (emb.loc[word] != 0).any(), word
+
+    model.save(str(tmp_path / "saved"))
+    assert (tmp_path / "saved" / "walked_tokens.npy").exists()
+    loaded = vectors(GPU_RDF2Vec.load(str(tmp_path / "saved")).transform())
+    assert np.allclose(loaded.loc[emb.index].to_numpy(), emb.to_numpy())
