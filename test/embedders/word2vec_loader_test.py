@@ -45,3 +45,20 @@ def test_too_few_rows_for_ranks(tmp_path):
     dm.trainer = SimpleNamespace(global_rank=0, world_size=2)
     with pytest.raises(RuntimeError, match="cannot be split"):
         dm.setup()
+
+
+@pytest.mark.gpu
+def test_gpu_batches_cover_every_row_once_per_epoch():
+    import torch
+    from src.rdf2vecgpu.embedders.word2vec_loader import SkipGramDataModule
+
+    center = torch.arange(1000, device="cuda")
+    dm = SkipGramDataModule(center, center + 5000, batch_size=128)
+    loader = dm.train_dataloader()
+    assert len(loader) == 8
+    for _ in range(2):
+        batches = list(loader)
+        assert [len(b[0]) for b in batches] == [128] * 7 + [104]
+        seen = torch.cat([b[0] for b in batches])
+        assert sorted(seen.tolist()) == list(range(1000))
+        assert torch.equal(torch.cat([b[1] for b in batches]), seen + 5000)  # rows stay paired

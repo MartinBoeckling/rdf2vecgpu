@@ -1,24 +1,37 @@
 import lightning as L
-from torch.utils.data import DataLoader, Dataset, RandomSampler, BatchSampler
 import torch
+from torch.utils.data import DataLoader, IterableDataset
 
 
-class _IndexDataset(Dataset):
-    """Lightweight wrapper that just returns its own index.
+class _GPUBatches(IterableDataset):
+    """Batches of rows of GPU tensors, in a new random order each epoch.
 
-    The tensors live outside the dataset; DataLoader gives us a list of
-    integer indices that we slice in a custom collate_fn.  Returning only the
-    index keeps __getitem__ O(1) and avoids creating per‑sample tensors.
+    The order is one `torch.randperm` on the GPU per epoch and each batch is a
+    slice of it, so no Python work grows with the number of rows. (A
+    `RandomSampler` + `BatchSampler` builds a Python list of every row index
+    per epoch, which made training wait on the CPU.)
     """
 
-    def __init__(self, length: int):
-        self._len = length
+    def __init__(self, tensors, batch_size: int):
+        super().__init__()
+        self.tensors = tensors
+        self.batch_size = int(batch_size)
 
     def __len__(self):
-        return self._len
+        return -(-len(self.tensors[0]) // self.batch_size)
 
-    def __getitem__(self, idx: int):  # noqa: D401, D403  (simple stub)
-        return idx  # int – cheap to move between Python and C++
+    def __iter__(self):
+        n = len(self.tensors[0])
+        order = torch.randperm(n, device=self.tensors[0].device)
+        for start in range(0, n, self.batch_size):
+            rows = order[start : start + self.batch_size]
+            yield tuple(t[rows] for t in self.tensors)
+
+
+def _gpu_batch_loader(tensors, batch_size: int) -> DataLoader:
+    # the dataset yields ready batches of CUDA tensors: no collation, and no
+    # worker processes (CUDA tensors cannot cross them)
+    return DataLoader(_GPUBatches(tensors, batch_size), batch_size=None, num_workers=0)
 
 
 class SkipGramDataModule(L.LightningDataModule):
@@ -47,29 +60,11 @@ class SkipGramDataModule(L.LightningDataModule):
         self.context = context_tensor.contiguous()
         self.batch_size = batch_size
 
-        # length is reused in sampler
-        self._dataset = _IndexDataset(len(self.center))
-
     def setup(self, stage: str | None = None):
         pass
 
     def train_dataloader(self):
-        sampler = RandomSampler(self._dataset, replacement=False)
-        batch_sampler = BatchSampler(
-            sampler, batch_size=self.batch_size, drop_last=False
-        )
-
-        def _collate(indices: list[int]):  # indices comes from BatchSampler
-            idx = torch.tensor(indices, device=self.center.device)
-            return self.center[idx], self.context[idx]
-
-        return DataLoader(
-            self._dataset,
-            batch_sampler=batch_sampler,
-            collate_fn=_collate,
-            num_workers=0,  # CUDA tensors + index dataset → no workers
-            pin_memory=False,
-        )
+        return _gpu_batch_loader((self.center, self.context), self.batch_size)
 
 
 class CBOWDataModule(L.LightningDataModule):
@@ -107,31 +102,12 @@ class CBOWDataModule(L.LightningDataModule):
         self.center = center_tensor.contiguous()
         self.batch_size = batch_size
 
-        # simple index dataset
-        self._dataset = _IndexDataset(len(self.center))
-
     def setup(self, stage: str | None = None):
-        # nothing extra to do here
         pass
 
     def train_dataloader(self):
-        sampler = RandomSampler(self._dataset, replacement=False)
-        batch_sampler = BatchSampler(
-            sampler, batch_size=self.batch_size, drop_last=False
-        )
-
-        def _collate(indices: list[int]):
-            idx = torch.tensor(indices, device=self.center.device, dtype=torch.long)
-            # contexts: [B, ctx_size], centers: [B]
-            return self.context[idx], self.center[idx]
-
-        return DataLoader(
-            self._dataset,
-            batch_sampler=batch_sampler,
-            collate_fn=_collate,
-            num_workers=0,  # GPU tensors + index sampler → no subprocesses
-            pin_memory=False,
-        )
+        # contexts: [B, ctx_size], centers: [B]
+        return _gpu_batch_loader((self.context, self.center), self.batch_size)
 
 
 class ParquetSkipGramDataModule(L.LightningDataModule):
@@ -198,23 +174,7 @@ class ParquetSkipGramDataModule(L.LightningDataModule):
         ).contiguous()
 
     def train_dataloader(self):
-        dataset = _IndexDataset(len(self.center))
-        sampler = RandomSampler(dataset, replacement=False)
-        batch_sampler = BatchSampler(
-            sampler, batch_size=self.batch_size, drop_last=False
-        )
-
-        def _collate(indices: list[int]):
-            idx = torch.tensor(indices, device=self.center.device)
-            return self.center[idx], self.context[idx]
-
-        return DataLoader(
-            dataset,
-            batch_sampler=batch_sampler,
-            collate_fn=_collate,
-            num_workers=0,
-            pin_memory=False,
-        )
+        return _gpu_batch_loader((self.center, self.context), self.batch_size)
 
 
 class OrderAwareSkipGramDataModule(L.LightningDataModule):
@@ -245,28 +205,9 @@ class OrderAwareSkipGramDataModule(L.LightningDataModule):
         self.distance = distance_tensor.contiguous()
         self.batch_size = batch_size
 
-        self._dataset = _IndexDataset(len(self.center))
-
     def train_dataloader(self):
-        sampler = RandomSampler(self._dataset, replacement=False)
-        batch_sampler = BatchSampler(
-            sampler, batch_size=self.batch_size, drop_last=False
-        )
-
-        def _collate(indices: list[int]):
-            # 1. Move indices to GPU
-            idx = torch.tensor(indices, device=self.center.device)
-            # 2. Slice the large GPU tensors directly
-            # Returns: (Batch, ), (Batch, ), (Batch, )
-            return self.center[idx], self.context[idx], self.distance[idx]
-
-        return DataLoader(
-            self._dataset,
-            batch_sampler=batch_sampler,
-            collate_fn=_collate,
-            num_workers=0,
-            pin_memory=False,
-        )
+        # (Batch,), (Batch,), (Batch,)
+        return _gpu_batch_loader((self.center, self.context, self.distance), self.batch_size)
 
 
 class OrderAwareCBOWDataModule(L.LightningDataModule):
@@ -300,23 +241,8 @@ class OrderAwareCBOWDataModule(L.LightningDataModule):
         self.center = center_tensor.contiguous()
         self.batch_size = batch_size
 
-        self._dataset = _IndexDataset(len(self.center))
-
     def train_dataloader(self):
-        sampler = RandomSampler(self._dataset, replacement=False)
-        batch_sampler = BatchSampler(
-            sampler, batch_size=self.batch_size, drop_last=False
-        )
-
-        def _collate(indices: list[int]):
-            idx = torch.tensor(indices, device=self.center.device, dtype=torch.long)
-            # Returns: (Batch, Win), (Batch, Win), (Batch,)
-            return self.context[idx], self.context_distance[idx], self.center[idx]
-
-        return DataLoader(
-            self._dataset,
-            batch_sampler=batch_sampler,
-            collate_fn=_collate,
-            num_workers=0,
-            pin_memory=False,
+        # (Batch, Win), (Batch, Win), (Batch,)
+        return _gpu_batch_loader(
+            (self.context, self.context_distance, self.center), self.batch_size
         )
