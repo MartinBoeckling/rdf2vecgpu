@@ -330,3 +330,27 @@ def test_empty_batch_loss_still_reaches_every_embedding_table(model_name, sparse
     loss.backward()
     assert m.in_embeddings.weight.grad is not None
     assert m.output_embeddings.weight.grad is not None
+
+
+def test_output_tables_start_at_zero_like_word2vec():
+    from src.rdf2vecgpu.embedders.word2vec import CBOWNegativeSampling, OrderAwareSkipGram
+
+    for cls in (SkipGram, CBOWNegativeSampling, OrderAwareSkipGram):
+        m = cls(vocab_size=10, embedding_dim=4, neg_samples=2, window=2)
+        assert torch.count_nonzero(m.output_embeddings.weight) == 0, cls.__name__
+        assert torch.count_nonzero(m.in_embeddings.weight) > 0, cls.__name__
+
+
+def test_negatives_equal_to_the_positive_token_are_left_out():
+    m = _skipgram(use_sparse=False)
+    with torch.no_grad():
+        m.output_embeddings.weight.normal_()
+    center, context = torch.tensor([1]), torch.tensor([4])
+    negative = torch.tensor([[4, 7]])  # the first negative is the positive token
+    loss_function = torch.nn.BCEWithLogitsLoss(reduction="sum")
+    c = m.in_embeddings.weight[1]
+    expected = loss_function((c @ m.output_embeddings.weight[4]).view(1), torch.ones(1)) + loss_function(
+        (c @ m.output_embeddings.weight[7]).view(1), torch.zeros(1)
+    )
+    got = m(center, context, negative, negative != context.unsqueeze(1))
+    assert torch.allclose(got, expected)

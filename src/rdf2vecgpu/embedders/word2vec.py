@@ -85,10 +85,10 @@ class SkipGram(L.LightningModule):
             vocab_size, embedding_dim, sparse=use_sparse
         )
 
+        # as word2vec and gensim: small random input vectors, zero output vectors
         bound = 1.0 / embedding_dim
-
         nn.init.uniform_(self.in_embeddings.weight, -bound, bound)
-        nn.init.uniform_(self.output_embeddings.weight, -bound, bound)
+        nn.init.zeros_(self.output_embeddings.weight)
 
         self.neg_samples = neg_samples
         self.loss_fn = nn.BCEWithLogitsLoss(reduction="none")
@@ -130,7 +130,11 @@ class SkipGram(L.LightningModule):
             return tokens.view(n_rows, self.neg_samples)
         return torch.randint(0, self.vocab_size, (n_rows, self.neg_samples), device=device)
 
-    def forward(self, center, context, negative):
+    def forward(self, center, context, negative, negative_mask=None):
+        """Summed negative-sampling loss. `negative_mask` (batch, neg), if
+        given, leaves out negatives that are the positive's own token, as
+        word2vec does: otherwise a frequent token is pushed towards and away
+        from the same input in one step."""
         center_embed = self.in_embeddings(center)  # (batch, embed)
         context_embed = self.output_embeddings(context)  # (batch, embed)
         negative_embed = self.output_embeddings(negative)  # (batch, neg, embed)
@@ -139,9 +143,10 @@ class SkipGram(L.LightningModule):
         pos_loss = self.loss_fn(pos_logits, torch.ones_like(pos_logits))
 
         neg_score = torch.bmm(negative_embed, center_embed.unsqueeze(-1)).squeeze(-1)
-        neg_loss = self.loss_fn(neg_score, torch.zeros_like(neg_score)).sum(dim=1)
-
-        return torch.sum(pos_loss + neg_loss)
+        neg_loss = self.loss_fn(neg_score, torch.zeros_like(neg_score))
+        if negative_mask is not None:
+            neg_loss = neg_loss * negative_mask
+        return torch.sum(pos_loss + neg_loss.sum(dim=1))
 
     def _pair_template_for(self, length, device):
         """(i, j) position pairs with 0 < |i - j| <= window in a sequence of
@@ -208,7 +213,7 @@ class SkipGram(L.LightningModule):
         # loss stays connected to the embeddings, so every DDP rank still joins
         # the gradient all-reduce (a detached zero would leave the others waiting).
         negative = self._sample_negatives(center.size(0), center.device)
-        loss = self(center, context, negative)
+        loss = self(center, context, negative, negative != context.unsqueeze(1))
         self.log("train_loss", loss / max(1, center.size(0)), prog_bar=True)
         return loss
 
@@ -314,7 +319,9 @@ class CBOWNegativeSampling(SkipGram):
         negative = self._sample_negatives(center.size(0), center.device)
         negative_scores = torch.bmm(self.output_embeddings(negative), hidden.unsqueeze(-1)).squeeze(-1)
         loss = self.loss_fn(positive, torch.ones_like(positive))
-        loss = loss + self.loss_fn(negative_scores, torch.zeros_like(negative_scores)).sum(dim=1)
+        # leave out negatives that are the token to predict, see SkipGram.forward
+        negative_loss = self.loss_fn(negative_scores, torch.zeros_like(negative_scores))
+        loss = loss + (negative_loss * (negative != center.unsqueeze(1))).sum(dim=1)
         return loss.sum()
 
     def training_step(self, batch, batch_idx):
@@ -344,8 +351,7 @@ class OrderAwareSkipGram(SkipGram):
         self.output_embeddings = nn.Embedding(
             2 * window * vocab_size, embedding_dim, sparse=self.use_sparse
         )
-        bound = 1.0 / embedding_dim
-        nn.init.uniform_(self.output_embeddings.weight, -bound, bound)
+        nn.init.zeros_(self.output_embeddings.weight)
 
     def _offset_rows(self, offsets, tokens):
         """Rows of the output table: offsets -w..-1 map to 0..w-1, 1..w to w..2w-1."""
@@ -363,6 +369,7 @@ class OrderAwareSkipGram(SkipGram):
             center,
             self._offset_rows(offsets, context),
             self._offset_rows(offsets.unsqueeze(1), negatives),
+            negatives != context.unsqueeze(1),
         )
         self.log("train_loss", loss / max(1, center.size(0)), prog_bar=True)
         return loss
