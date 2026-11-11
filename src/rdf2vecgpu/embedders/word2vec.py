@@ -77,7 +77,7 @@ class SkipGram(L.LightningModule):
                 raise ValueError("sample > 0 and negative_sampling='unigram' need token_counts")
         # built on first use, on the batch's device
         self._p_keep = None
-        self._neg_weights = None
+        self._neg_cdf = None
         self._pair_templates = {}
 
         self.in_embeddings = nn.Embedding(vocab_size, embedding_dim, sparse=use_sparse)
@@ -109,19 +109,25 @@ class SkipGram(L.LightningModule):
             self._p_keep = p.clamp(max=1.0).to(torch.float32)
         return self._p_keep
 
-    def _get_neg_weights(self, device):
-        """Unnormalised count^0.75 weights; tokens absent from the corpus get 0."""
-        if self._neg_weights is None or self._neg_weights.device != device:
-            self._neg_weights = self._token_counts.to(device).clamp(min=0).pow(0.75).to(torch.float32)
-        return self._neg_weights
+    def _get_neg_cdf(self, device):
+        """Cumulative count^0.75 distribution over the vocabulary, built once:
+        drawing from it costs log(vocabulary) per sample, whereas
+        torch.multinomial re-reads the whole distribution on every call."""
+        if self._neg_cdf is None or self._neg_cdf.device != device:
+            weights = self._token_counts.clamp(min=0).pow(0.75)
+            cdf = torch.cumsum(weights, dim=0)
+            self._neg_cdf = (cdf / cdf[-1]).to(device)  # float64: exact for large vocabularies
+        return self._neg_cdf
 
     def _sample_negatives(self, n_rows, device):
         """(n_rows, neg_samples) negative token ids."""
         if self.negative_sampling == "unigram":
-            weights = self._get_neg_weights(device)
-            return torch.multinomial(
-                weights, n_rows * self.neg_samples, replacement=True
-            ).view(n_rows, self.neg_samples)
+            cdf = self._get_neg_cdf(device)
+            draws = torch.rand(n_rows * self.neg_samples, device=device, dtype=cdf.dtype)
+            # the first token whose cumulative share exceeds the draw; tokens
+            # with count 0 add nothing to the CDF and are never drawn
+            tokens = torch.searchsorted(cdf, draws, right=True).clamp_(max=self.vocab_size - 1)
+            return tokens.view(n_rows, self.neg_samples)
         return torch.randint(0, self.vocab_size, (n_rows, self.neg_samples), device=device)
 
     def forward(self, center, context, negative):
@@ -156,9 +162,11 @@ class SkipGram(L.LightningModule):
         self._pair_templates[length] = template
         return template
 
-    def _expand_skipgram(self, vertices, predicates):
+    def _expand_skipgram(self, vertices, predicates, with_offsets=False):
         """All skip-gram (center, context) pairs of a batch of walks, built on
-        the GPU. A walk is the sequence v0, p0, v1, p1, ..., cut where its
+        the GPU, and with ``with_offsets`` each pair's offset (context
+        position minus center position, in [-window, window] without 0).
+        A walk is the sequence v0, p0, v1, p1, ..., cut where its
         vertices hit the ``-1`` padding; with ``sample > 0`` each token
         occurrence is dropped with probability 1 - p_keep, and with it every
         pair it is part of."""
@@ -184,6 +192,9 @@ class SkipGram(L.LightningModule):
             kept = torch.rand((n, length), device=device) < p_keep[seq.clamp(min=0)]
             keep = keep & kept[:, ii] & kept[:, jj]
         keep = keep.reshape(-1)
+        if with_offsets:
+            offsets = (jj - ii).repeat(n)
+            return center[keep], context[keep], offsets[keep]
         return center[keep], context[keep]
 
     def training_step(self, batch, batch_idx):
@@ -192,13 +203,13 @@ class SkipGram(L.LightningModule):
             center, context = self._expand_skipgram(first, second)
         else:
             center, context = first.long(), second.long()
-        if center.numel() == 0:
-            # every pair of the batch was subsampled away (only possible for
-            # tiny batches): a zero loss leaves the embeddings unchanged
-            return torch.zeros((), device=center.device, requires_grad=True)
+        # A batch whose pairs were all subsampled away (possible for tiny
+        # batches) runs through the same computation on empty tensors: its zero
+        # loss stays connected to the embeddings, so every DDP rank still joins
+        # the gradient all-reduce (a detached zero would leave the others waiting).
         negative = self._sample_negatives(center.size(0), center.device)
         loss = self(center, context, negative)
-        self.log("train_loss", loss / center.size(0), prog_bar=True)
+        self.log("train_loss", loss / max(1, center.size(0)), prog_bar=True)
         return loss
 
     def configure_optimizers(self):
@@ -237,6 +248,124 @@ class SkipGram(L.LightningModule):
                 embedding.weight.grad = grad
             else:
                 grad.clamp_(-clip, clip)
+
+
+class CBOWNegativeSampling(SkipGram):
+    """CBOW with negative sampling, trained like `SkipGram` (summed loss, SGD
+    with linear decay, clipping, subsampling, unigram negatives), as gensim's
+    ``sg=0`` with ``cbow_mean=1`` does.
+
+    Each position of a walk is one example: the mean of the input embeddings
+    of the tokens within ``window`` of it predicts the token there. Batches
+    are ``(vertices, predicates)`` walk rows; the examples are built on the
+    GPU.
+    """
+
+    def _context_template_for(self, length, device):
+        """(length, 2 * window) positions around each centre position, -1
+        where the window runs past the sequence; cached per length."""
+        key = ("cbow", length)
+        cached = self._pair_templates.get(key)
+        if cached is not None and cached.device == device:
+            return cached
+        offsets = [d for d in range(-self.window, self.window + 1) if d != 0]
+        rows = [[i + d if 0 <= i + d < length else -1 for d in offsets] for i in range(length)]
+        template = torch.as_tensor(rows, dtype=torch.long, device=device)
+        self._pair_templates[key] = template
+        return template
+
+    def _expand_cbow(self, vertices, predicates):
+        """(context, mask, center) of every example in a batch of walks:
+        context (m, 2 * window) token ids, mask (m, 2 * window) which of them
+        count, center (m,) the token to predict. Positions past a walk's end
+        and token occurrences dropped by subsampling take part in nothing;
+        examples without any context are left out."""
+        n, n_vertices = vertices.shape
+        length = 2 * n_vertices - 1
+        device = vertices.device
+        seq = torch.full((n, length), -1, dtype=torch.long, device=device)
+        seq[:, 0::2] = vertices
+        seq[:, 1::2] = predicates
+        padded = vertices.eq(-1)
+        first_pad = torch.where(
+            padded.any(dim=1),
+            padded.long().argmax(dim=1),
+            torch.full((n,), n_vertices, device=device, dtype=torch.long),
+        )
+        valid_len = (2 * first_pad - 1).clamp(min=0)
+        positions = torch.arange(length, device=device)
+        live = positions.unsqueeze(0) < valid_len.unsqueeze(1)  # (n, length)
+        if self.sample > 0:
+            p_keep = self._get_p_keep(device)
+            live &= torch.rand((n, length), device=device) < p_keep[seq.clamp(min=0)]
+        template = self._context_template_for(length, device)  # (length, 2w)
+        in_range = template >= 0
+        context = seq[:, template.clamp(min=0)]  # (n, length, 2w)
+        mask = in_range.unsqueeze(0) & live[:, template.clamp(min=0)]
+        keep = live & mask.any(dim=2)  # centre counts and has some context
+        return context[keep], mask[keep], seq[keep]
+
+    def _cbow_loss(self, context, mask, center):
+        weights = mask.to(self.in_embeddings.weight.dtype)
+        # masked slots may hold the -1 padding: look up row 0 there, weight 0
+        summed = (self.in_embeddings(context.clamp(min=0)) * weights.unsqueeze(-1)).sum(dim=1)
+        hidden = summed / weights.sum(dim=1, keepdim=True)  # (m, dim)
+        positive = (hidden * self.output_embeddings(center)).sum(dim=1)
+        negative = self._sample_negatives(center.size(0), center.device)
+        negative_scores = torch.bmm(self.output_embeddings(negative), hidden.unsqueeze(-1)).squeeze(-1)
+        loss = self.loss_fn(positive, torch.ones_like(positive))
+        loss = loss + self.loss_fn(negative_scores, torch.zeros_like(negative_scores)).sum(dim=1)
+        return loss.sum()
+
+    def training_step(self, batch, batch_idx):
+        vertices, predicates = batch
+        context, mask, center = self._expand_cbow(vertices, predicates)
+        # empty batches stay connected to the embeddings, see SkipGram.training_step
+        loss = self._cbow_loss(context, mask, center)
+        self.log("train_loss", loss / max(1, center.size(0)), prog_bar=True)
+        return loss
+
+
+class OrderAwareSkipGram(SkipGram):
+    """Order-aware skip-gram (structured skip-gram, as in RDF2Vec_oa): one
+    output embedding per relative position, so the model learns not only
+    which tokens occur near a token but where (for walks: which hop, and
+    whether a vertex or a predicate). Trained like `SkipGram`, from batches
+    of ``(vertices, predicates)`` walk rows.
+
+    The 2 * ``window`` output tables (offsets -window..-1, 1..window) are one
+    sparse embedding of 2 * window * vocab_size rows; row
+    ``offset_index * vocab_size + token``. The returned embeddings are the
+    input table, as for `SkipGram`.
+    """
+
+    def __init__(self, vocab_size, embedding_dim, neg_samples, window=5, **kwargs):
+        super().__init__(vocab_size, embedding_dim, neg_samples, window=window, **kwargs)
+        self.output_embeddings = nn.Embedding(
+            2 * window * vocab_size, embedding_dim, sparse=self.use_sparse
+        )
+        bound = 1.0 / embedding_dim
+        nn.init.uniform_(self.output_embeddings.weight, -bound, bound)
+
+    def _offset_rows(self, offsets, tokens):
+        """Rows of the output table: offsets -w..-1 map to 0..w-1, 1..w to w..2w-1."""
+        index = torch.where(offsets < 0, offsets + self.window, offsets + self.window - 1)
+        return index * self.vocab_size + tokens
+
+    def training_step(self, batch, batch_idx):
+        first, second = batch
+        if first.dim() != 2:
+            raise ValueError("order-aware skip-gram trains on walks, not on flat (center, context) pairs")
+        center, context, offsets = self._expand_skipgram(first, second, with_offsets=True)
+        # empty batches stay connected to the embeddings, see SkipGram.training_step
+        negatives = self._sample_negatives(center.size(0), center.device)
+        loss = self(
+            center,
+            self._offset_rows(offsets, context),
+            self._offset_rows(offsets.unsqueeze(1), negatives),
+        )
+        self.log("train_loss", loss / max(1, center.size(0)), prog_bar=True)
+        return loss
 
 
 class CBOW(L.LightningModule):
@@ -286,368 +415,3 @@ class CBOW(L.LightningModule):
     def get_embeddings(self):
         """The input embedding table, which is the one returned as embeddings."""
         return self.in_embeddings.weight.data
-
-
-class OrderAwareSkipgram(L.LightningModule):
-    def __init__(
-        self,
-        vocab_size,
-        embedding_dim,
-        neg_samples,
-        max_distance=5,
-        learning_rate=0.003,
-        use_sparse=False,
-    ):
-        super().__init__()
-        self.save_hyperparameters()
-        self.vocab_size = vocab_size
-        self.embedding_dim = embedding_dim
-        self.neg_samples = neg_samples
-        self.max_distance = max_distance
-        self.learning_rate = learning_rate
-        self.use_sparse = use_sparse
-
-        # Center word embeddings
-        self.in_embeddings = nn.Embedding(vocab_size, embedding_dim, sparse=use_sparse)
-
-        # Context embeddings with position-specific weights
-        # We create separate output embeddings for each possible distance
-        self.output_embeddings = nn.ModuleList(
-            [
-                nn.Embedding(vocab_size, embedding_dim, sparse=use_sparse)
-                for _ in range(2 * max_distance + 1)  # -max_distance to +max_distance
-            ]
-        )
-
-        # Position embeddings to encode relative distance
-        self.position_embeddings = nn.Embedding(2 * max_distance + 1, embedding_dim)
-
-        # Initialize embeddings
-        bound = 1.0 / embedding_dim
-        nn.init.uniform_(self.in_embeddings.weight, -bound, bound)
-        nn.init.uniform_(self.position_embeddings.weight, -bound, bound)
-
-        for output_emb in self.output_embeddings:
-            nn.init.uniform_(output_emb.weight, -bound, bound)
-
-        self.loss_fn = nn.BCEWithLogitsLoss(reduction="none")
-
-    def _get_position_index(self, distance):
-        """Convert relative distance to position index"""
-        return distance + self.max_distance
-
-    def forward(self, center, context, distances, negative, neg_distances=None):
-        """
-        Args:
-            center: (batch_size,) center word indices
-            context: (batch_size,) context word indices
-            distances: (batch_size,) relative distances from center to context
-            negative: (batch_size, neg_samples) negative sample indices
-            neg_distances: (batch_size, neg_samples) distances for negative samples
-        """
-        batch_size = center.size(0)
-
-        # Get center embeddings
-        center_embed = self.in_embeddings(center)  # (batch_size, embed_dim)
-
-        # Get position-aware context embeddings
-        pos_indices = self._get_position_index(distances)  # (batch_size,)
-
-        # Compute positive scores with position awareness
-        pos_logits = []
-        for i in range(batch_size):
-            pos_idx = pos_indices[i].item()
-            context_embed = self.output_embeddings[pos_idx](
-                context[i : i + 1]
-            )  # (1, embed_dim)
-            pos_embed = self.position_embeddings(
-                pos_indices[i : i + 1]
-            )  # (1, embed_dim)
-
-            # Combine context and position embeddings
-            combined_embed = context_embed + pos_embed
-
-            # Compute similarity score
-            logit = (center_embed[i : i + 1] * combined_embed).sum(dim=1)
-            pos_logits.append(logit)
-
-        pos_logits = torch.cat(pos_logits, dim=0)  # (batch_size,)
-        pos_targets = torch.ones_like(pos_logits)
-        pos_loss = self.loss_fn(pos_logits, pos_targets)
-
-        # Compute negative scores
-        if neg_distances is None:
-            # Sample random distances for negative samples
-            neg_distances = torch.randint(
-                -self.max_distance,
-                self.max_distance + 1,
-                (batch_size, self.neg_samples),
-                device=center.device,
-            )
-
-        neg_pos_indices = self._get_position_index(
-            neg_distances
-        )  # (batch_size, neg_samples)
-
-        neg_logits = []
-        for i in range(batch_size):
-            center_i = center_embed[i : i + 1]  # (1, embed_dim)
-            neg_logits_i = []
-
-            for j in range(self.neg_samples):
-                pos_idx = neg_pos_indices[i, j].item()
-                neg_embed = self.output_embeddings[pos_idx](
-                    negative[i : i + 1, j : j + 1]
-                )  # (1, 1, embed_dim)
-                neg_pos_embed = self.position_embeddings(
-                    neg_pos_indices[i : i + 1, j : j + 1]
-                )  # (1, 1, embed_dim)
-
-                # Combine negative context and position embeddings
-                combined_neg_embed = neg_embed.squeeze(1) + neg_pos_embed.squeeze(
-                    1
-                )  # (1, embed_dim)
-
-                # Compute similarity score
-                logit = (center_i * combined_neg_embed).sum(dim=1)
-                neg_logits_i.append(logit)
-
-            neg_logits.append(torch.cat(neg_logits_i, dim=0))
-
-        neg_logits = torch.stack(neg_logits, dim=0)  # (batch_size, neg_samples)
-        neg_targets = torch.zeros_like(neg_logits)
-        neg_loss = self.loss_fn(neg_logits, neg_targets).sum(dim=1)
-
-        return torch.mean(pos_loss + neg_loss)
-
-    def training_step(self, batch, batch_idx):
-        if len(batch) == 3:
-            center, context, distances = batch
-            neg_distances = None
-        else:
-            center, context, distances, neg_distances = batch
-
-        batch_size = center.size(0)
-
-        # Generate negative samples
-        negative = torch.randint(
-            0, self.vocab_size, (batch_size, self.neg_samples), device=self.device
-        )
-
-        # Generate negative distances if not provided
-        if neg_distances is None:
-            neg_distances = torch.randint(
-                -self.max_distance,
-                self.max_distance + 1,
-                (batch_size, self.neg_samples),
-                device=self.device,
-            )
-
-        loss = self(center, context, distances, negative, neg_distances)
-        self.log("train_loss", loss, prog_bar=True)
-        return loss
-
-    def configure_optimizers(self):
-        opt_function = torch.optim.SparseAdam if self.use_sparse else torch.optim.Adam
-        return opt_function(self.parameters(), lr=self.learning_rate)
-
-    def get_embeddings(self):
-        """Return the center word embeddings for downstream tasks"""
-        return self.in_embeddings.weight.data
-
-    def get_context_embeddings(self, distance=0):
-        """Get context embeddings for a specific distance"""
-        pos_idx = self._get_position_index(torch.tensor(distance))
-        return self.output_embeddings[pos_idx.item()].weight.data
-
-
-class OrderAwareCBOW(L.LightningModule):
-    def __init__(
-        self,
-        vocab_size,
-        embedding_dim,
-        neg_samples,
-        max_distance=5,
-        learning_rate=0.003,
-        use_sparse=False,
-    ):
-        super().__init__()
-        self.save_hyperparameters()
-        self.vocab_size = vocab_size
-        self.embedding_dim = embedding_dim
-        self.neg_samples = neg_samples
-        self.max_distance = max_distance
-        self.learning_rate = learning_rate
-        self.use_sparse = use_sparse
-
-        # Context word embeddings with position-specific weights
-        self.in_embeddings = nn.ModuleList(
-            [
-                nn.Embedding(vocab_size, embedding_dim, sparse=use_sparse)
-                for _ in range(2 * max_distance + 1)  # -max_distance to +max_distance
-            ]
-        )
-
-        # Output embeddings for center words
-        self.output_embeddings = nn.Embedding(
-            vocab_size, embedding_dim, sparse=use_sparse
-        )
-
-        # Position embeddings to encode relative distance
-        self.position_embeddings = nn.Embedding(2 * max_distance + 1, embedding_dim)
-
-        # Initialize embeddings
-        bound = 1.0 / embedding_dim
-        for input_emb in self.in_embeddings:
-            nn.init.uniform_(input_emb.weight, -bound, bound)
-        nn.init.uniform_(self.output_embeddings.weight, -bound, bound)
-        nn.init.uniform_(self.position_embeddings.weight, -bound, bound)
-
-        self.loss_fn = nn.BCEWithLogitsLoss(reduction="none")
-
-    def _get_position_index(self, distance):
-        """Convert relative distance to position index"""
-        return distance + self.max_distance
-
-    def forward(
-        self, context_words, context_distances, center, negative, neg_distances=None
-    ):
-        """
-        Args:
-            context_words: (batch_size, context_size) context word indices
-            context_distances: (batch_size, context_size) relative distances from center to each context word
-            center: (batch_size,) center word indices
-            negative: (batch_size, neg_samples) negative sample indices
-            neg_distances: (batch_size, neg_samples) distances for negative samples (not used in CBOW)
-        """
-        batch_size, context_size = context_words.size()
-
-        # Get position-aware context embeddings and combine them
-        context_embeds = []
-        for i in range(batch_size):
-            batch_context_embeds = []
-            for j in range(context_size):
-                # Get position index for this context word
-                distance = context_distances[i, j]
-                pos_idx = self._get_position_index(distance).item()
-
-                # Get context embedding from position-specific embedding matrix
-                ctx_embed = self.in_embeddings[pos_idx](
-                    context_words[i : i + 1, j : j + 1]
-                )  # (1, 1, embed_dim)
-                pos_embed = self.position_embeddings(
-                    self._get_position_index(distance).unsqueeze(0)
-                )  # (1, embed_dim)
-
-                # Combine context and position embeddings
-                combined_embed = ctx_embed.squeeze(1) + pos_embed  # (1, embed_dim)
-                batch_context_embeds.append(combined_embed)
-
-            # Average the context embeddings for this batch item
-            avg_context = torch.mean(
-                torch.cat(batch_context_embeds, dim=0), dim=0, keepdim=True
-            )  # (1, embed_dim)
-            context_embeds.append(avg_context)
-
-        context_embeds = torch.cat(context_embeds, dim=0)  # (batch_size, embed_dim)
-
-        # Get center word embeddings
-        center_embed = self.output_embeddings(center)  # (batch_size, embed_dim)
-
-        # Compute positive scores
-        pos_logits = (context_embeds * center_embed).sum(dim=1)  # (batch_size,)
-        pos_targets = torch.ones_like(pos_logits)
-        pos_loss = self.loss_fn(pos_logits, pos_targets)
-
-        # Compute negative scores
-        negative_embed = self.output_embeddings(
-            negative
-        )  # (batch_size, neg_samples, embed_dim)
-
-        # Expand context embeddings to match negative samples shape
-        context_embeds_expanded = context_embeds.unsqueeze(
-            1
-        )  # (batch_size, 1, embed_dim)
-
-        # Compute negative logits
-        neg_logits = (context_embeds_expanded * negative_embed).sum(
-            dim=2
-        )  # (batch_size, neg_samples)
-        neg_targets = torch.zeros_like(neg_logits)
-        neg_loss = self.loss_fn(neg_logits, neg_targets).sum(dim=1)
-
-        return torch.mean(pos_loss + neg_loss)
-
-    def training_step(self, batch, batch_idx):
-        if len(batch) == 3:
-            context_words, context_distances, center = batch
-        else:
-            context_words, context_distances, center, _ = (
-                batch  # Ignore neg_distances if provided
-            )
-
-        batch_size = center.size(0)
-
-        # Generate negative samples
-        negative = torch.randint(
-            0, self.vocab_size, (batch_size, self.neg_samples), device=self.device
-        )
-
-        loss = self(context_words, context_distances, center, negative)
-        self.log("train_loss", loss, prog_bar=True)
-        return loss
-
-    def configure_optimizers(self):
-        opt_function = torch.optim.SparseAdam if self.use_sparse else torch.optim.Adam
-        return opt_function(self.parameters(), lr=self.learning_rate)
-
-    def get_embeddings(self):
-        """Return the center word embeddings for downstream tasks"""
-        return self.output_embeddings.weight.data
-
-    def get_context_embeddings(self, distance=0):
-        """Get context embeddings for a specific distance"""
-        pos_idx = self._get_position_index(torch.tensor(distance))
-        return self.in_embeddings[pos_idx.item()].weight.data
-
-    def predict_center(self, context_words, context_distances, top_k=5):
-        """Predict the most likely center words given context"""
-        self.eval()
-        with torch.no_grad():
-            batch_size, context_size = context_words.size()
-
-            # Get position-aware context embeddings
-            context_embeds = []
-            for i in range(batch_size):
-                batch_context_embeds = []
-                for j in range(context_size):
-                    distance = context_distances[i, j]
-                    pos_idx = self._get_position_index(distance).item()
-
-                    ctx_embed = self.in_embeddings[pos_idx](
-                        context_words[i : i + 1, j : j + 1]
-                    )
-                    pos_embed = self.position_embeddings(
-                        self._get_position_index(distance).unsqueeze(0)
-                    )
-
-                    combined_embed = ctx_embed.squeeze(1) + pos_embed
-                    batch_context_embeds.append(combined_embed)
-
-                avg_context = torch.mean(
-                    torch.cat(batch_context_embeds, dim=0), dim=0, keepdim=True
-                )
-                context_embeds.append(avg_context)
-
-            context_embeds = torch.cat(context_embeds, dim=0)
-
-            # Compute similarity with all center words
-            all_center_embeds = self.output_embeddings.weight  # (vocab_size, embed_dim)
-            scores = torch.mm(
-                context_embeds, all_center_embeds.t()
-            )  # (batch_size, vocab_size)
-
-            # Get top-k predictions
-            _, top_indices = torch.topk(scores, top_k, dim=1)
-
-            return top_indices

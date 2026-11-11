@@ -5,9 +5,8 @@ import cugraph
 import lightning as L
 import torch
 import dask
-from lightning.pytorch.tuner import Tuner
 from .helper.functions import _generate_vocab, cudf_to_torch_tensor
-from .embedders.word2vec import SkipGram, CBOW
+from .embedders.word2vec import CBOW, CBOWNegativeSampling, OrderAwareSkipGram, SkipGram
 from .embedders.word2vec_loader import (
     CBOWDataModule,
     InMemoryWalkSeqDataModule,
@@ -15,6 +14,7 @@ from .embedders.word2vec_loader import (
     SkipGramDataModule,
     WalkSequenceDataModule,
     _flat_list_array_to_2d,
+    skipgram_pairs_per_walk,
     walks_per_pair_batch,
 )
 from .reader.kg_file_reader import KGFileReader
@@ -28,7 +28,7 @@ from .corpus.walk_corpus import (
 from .logger import build_tracker
 import cudf
 from loguru import logger
-from .config import DEFAULT_BATCH_SIZE, RDF2VecConfig
+from .config import MIN_STEPS_PER_EPOCH, RDF2VecConfig
 from dataclasses import dataclass
 
 
@@ -90,15 +90,22 @@ def _check_walk_files(walks: WalkParquet) -> None:
         )
 
 
-def _walk_token_counts(batches, vocab_size: int):
-    """Occurrences of each token in walks given as `(vertices, predicates)`
-    tensor pairs of shape (n, depth + 1) and (n, depth), as a numpy int64
-    array of length `vocab_size`. Positions after a walk's end (vertex -1,
-    and the predicate before it) are not counted. Uses torch, on whatever
-    device the tensors are on."""
+def _pairs_in_sequence(length: int, window: int) -> int:
+    """Ordered skip-gram pairs (i, j), 0 < |i - j| <= window, in a sequence
+    of `length` tokens."""
+    return 2 * sum(length - d for d in range(1, min(window, length - 1) + 1))
+
+
+def _walk_statistics(batches, vocab_size: int, window: int):
+    """Token counts and skip-gram pair count of walks given as
+    `(vertices, predicates)` tensor pairs of shape (n, depth + 1) and
+    (n, depth). Returns a numpy int64 array of length `vocab_size` and an
+    int. Positions after a walk's end (vertex -1, and the predicate before
+    it) are not counted. Uses torch, on whatever device the tensors are on."""
     import numpy as np
 
     counts = torch.zeros(vocab_size, dtype=torch.int64)
+    n_pairs = 0
     for vertices, predicates in batches:
         vertices = vertices.long()
         predicates = predicates.long()
@@ -107,7 +114,12 @@ def _walk_token_counts(batches, vocab_size: int):
             tokens = tokens[tokens >= 0]
             if tokens.numel():
                 counts += torch.bincount(tokens, minlength=vocab_size)[:vocab_size].cpu()
-    return counts.numpy().astype(np.int64)
+        # a walk with k vertices is a sequence of 2k - 1 tokens
+        n_vertices = torch.bincount((vertices >= 0).sum(dim=1), minlength=vertices.shape[1] + 1).cpu()
+        n_pairs += sum(
+            int(n) * _pairs_in_sequence(2 * k - 1, window) for k, n in enumerate(n_vertices.tolist()) if k >= 2
+        )
+    return counts.numpy().astype(np.int64), n_pairs
 
 
 def _parquet_walk_batches(walks_path: str, chunk_rows: int = 1 << 20):
@@ -128,13 +140,6 @@ def _parquet_walk_batches(walks_path: str, chunk_rows: int = 1 << 20):
             predicates = _flat_list_array_to_2d(batch.column("predicates"))
             if len(vertices):
                 yield torch.from_numpy(vertices), torch.from_numpy(predicates)
-
-
-def _tunes_batch_size(config: RDF2VecConfig) -> bool:
-    """Whether single-GPU training runs Lightning's batch-size tuner: only
-    when it is enabled and no explicit `batch_size` is set, which the tuner
-    would otherwise replace."""
-    return config.tune_batch_size and config.batch_size is None
 
 
 def _checked_weights(kg_data):
@@ -836,7 +841,7 @@ class GPU_RDF2Vec:
         if self.config.backend == "gensim":
             self._with_walk_sequences(edge_df, walk_vertices, self._fit_via_gensim)
             return
-        if self.config.embedding_model == "skipgram" and self.config.walk_strategy == "random":
+        if self.config.walk_strategy == "random":
             self._with_walk_sequences(edge_df, walk_vertices, self._fit_via_pytorch_sequences)
             return
         walk_corpus = self.walk_generation(
@@ -897,13 +902,11 @@ class GPU_RDF2Vec:
             shutil.rmtree(walk_dir, ignore_errors=True)
 
     def _fit_via_pytorch_sequences(self, walk_sequences) -> None:
-        """Train PyTorch skip-gram from walks as sequences: a cudf frame on one
+        """Train PyTorch skip-gram or CBOW from walks as sequences: a cudf frame on one
         GPU (kept in GPU memory), or a `WalkParquet` with ``multi_gpu`` (the
         Dask client is closed first, then DDP reads the files). Each batch
         holds about ``batch_size`` (center, context) pairs, built on the GPU
         from its walks."""
-        if self.config.tune_batch_size:
-            raise NotImplementedError("tune_batch_size is not implemented yet for skip-gram on random walks")
         if hasattr(self.word2idx, "compute"):
             self.word2idx = self.word2idx.compute()
         vocab_size = self.word2idx.shape[0]
@@ -914,10 +917,19 @@ class GPU_RDF2Vec:
             first = next(_parquet_walk_batches(walk_sequences.path, chunk_rows=1), None)
             if first is None:
                 raise ValueError(f"no walks in {walk_sequences.path}")
-            walks_per_batch = walks_per_pair_batch(
-                self.config.batch_size, first[0].shape[1] - 1, self.config.window_size
+            token_counts, n_pairs = _walk_statistics(
+                _parquet_walk_batches(walk_sequences.path), vocab_size, self.config.window_size
             )
-            token_counts = _walk_token_counts(_parquet_walk_batches(walk_sequences.path), vocab_size)
+            # Every DDP rank must run the same number of steps, or one blocks
+            # in the gradient all-reduce. Lightning starts the other ranks by
+            # running the script again, so after fit() they may hold walks of
+            # their own: size batches from what all ranks agree on, the walk
+            # count and the pairs of a full-length walk, not the exact pairs.
+            depth = first[0].shape[1] - 1
+            pairs_bound = walk_sequences.n_walks * skipgram_pairs_per_walk(depth, self.config.window_size)
+            walks_per_batch = walks_per_pair_batch(
+                self._effective_batch_size(pairs_bound // max(1, n_gpus)), depth, self.config.window_size
+            )
             # every rank trains on n_walks // n_gpus walks (see _WalkSeqIterable)
             per_rank = walk_sequences.n_walks // max(1, n_gpus)
             steps_per_epoch = max(1, -(-per_rank // walks_per_batch))
@@ -946,23 +958,45 @@ class GPU_RDF2Vec:
             walks = datamodule._iterable
             if walks.vertices.shape[0] == 0:
                 raise ValueError("no walks to train on")
+            token_counts, n_pairs = _walk_statistics(
+                [(walks.vertices, walks.predicates)], vocab_size, self.config.window_size
+            )
             walks_per_batch = walks_per_pair_batch(
-                self.config.batch_size, walks.vertices.shape[1] - 1, self.config.window_size
+                self._effective_batch_size(n_pairs), walks.vertices.shape[1] - 1, self.config.window_size
             )
             datamodule.emit_batch_size = walks.emit_batch_size = walks_per_batch
-            token_counts = _walk_token_counts([(walks.vertices, walks.predicates)], vocab_size)
             n_walks = int(walks.vertices.shape[0])
             steps_per_epoch = max(1, -(-n_walks // walks_per_batch))
         self._walked_mask = token_counts > 0
         logger.info(
-            f"PyTorch skip-gram: {n_walks:,} walks on {n_gpus} GPU(s), {walks_per_batch:,} walks "
-            f"(~{self.config.batch_size:,} pairs) per step, {steps_per_epoch:,} steps per epoch; "
+            f"PyTorch {self.config.embedding_model}: {n_walks:,} walks on {n_gpus} GPU(s), {walks_per_batch:,} walks "
+            f"(~{n_pairs * walks_per_batch // max(1, n_walks):,} pairs) per step, "
+            f"{steps_per_epoch:,} steps per epoch; "
             f"{int(self._walked_mask.sum()):,} of {vocab_size:,} tokens occur in the walks"
         )
         with self.tracker.stage("Word2Vec_Training"):
             self._train_pytorch_sequences(
                 datamodule, token_counts=token_counts, steps_per_epoch=steps_per_epoch, n_gpus=n_gpus
             )
+
+    def _effective_batch_size(self, n_pairs: int) -> int:
+        """``batch_size``, but at most 1/MIN_STEPS_PER_EPOCH of the `n_pairs`
+        training pairs (per GPU), so a small corpus still gets that many SGD
+        steps per epoch: with the summed loss and clipped gradients, a handful
+        of steps leave the vectors near their random start."""
+        batch = self.config.batch_size
+        cap = max(1, -(-n_pairs // MIN_STEPS_PER_EPOCH))
+        if batch <= cap:
+            return batch
+        message = (
+            f"batch_size {batch:,} is more than 1/{MIN_STEPS_PER_EPOCH} of the {n_pairs:,} "
+            f"training pairs; using {cap:,} so each epoch has {MIN_STEPS_PER_EPOCH} steps"
+        )
+        if "batch_size" in self.config.model_fields_set:
+            logger.warning(message)
+        else:
+            logger.info(message)
+        return cap
 
     def _close_dask_client(self) -> None:
         """Destroy cuGraph's comms and close the Dask client, freeing the GPUs
@@ -980,13 +1014,19 @@ class GPU_RDF2Vec:
         logger.info("Dask client closed; starting training")
 
     def _train_pytorch_sequences(self, datamodule, *, token_counts, steps_per_epoch, n_gpus):
-        """Fit `SkipGram` on a datamodule yielding `(vertices, predicates)`
-        batches. Sparse embeddings on one GPU; DDP needs dense gradients for
-        its all-reduce, so several GPUs train dense tables."""
+        """Fit `SkipGram` or `CBOWNegativeSampling` on a datamodule yielding
+        `(vertices, predicates)` batches. Sparse embeddings on one GPU; DDP
+        needs dense gradients for its all-reduce, so several GPUs train dense
+        tables."""
         torch.set_float32_matmul_precision("high")
         if self.config.reproducible:
             L.seed_everything(self.config.random_state, workers=True)
-        model = SkipGram(
+        model_class = {
+            "skipgram": SkipGram,
+            "cbow": CBOWNegativeSampling,
+            "order_aware_skipgram": OrderAwareSkipGram,
+        }[self.config.embedding_model]
+        model = model_class(
             vocab_size=self.word2idx.shape[0],
             embedding_dim=self.config.vector_size,
             neg_samples=self.config.negative_samples,
@@ -1020,7 +1060,7 @@ class GPU_RDF2Vec:
                 "window_size": self.config.window_size,
                 "epochs": self.config.epochs,
                 "negative_samples": self.config.negative_samples,
-                "embedding_model": "skipgram",
+                "embedding_model": self.config.embedding_model,
                 "learning_rate": self.config.learning_rate,
                 "min_learning_rate": self.config.min_learning_rate,
                 "batch_size": self.config.batch_size,
@@ -1136,15 +1176,26 @@ class GPU_RDF2Vec:
         n_gpus = torch.cuda.device_count()
         with self.tracker.stage("Word2Vec_Training"):
             if self.config.embedding_model == "skipgram":
+                from glob import glob
+                import pyarrow.parquet as pq
+
+                files = glob(os.path.join(walk_path, "**", "*.parquet"), recursive=True)
+                per_rank = sum(pq.read_metadata(f).num_rows for f in files) // max(1, n_gpus)
+                batch_size = self._effective_batch_size(per_rank)
                 word2vec_model = SkipGram(
                     vocab_size=self.word2idx.shape[0],
                     embedding_dim=self.config.vector_size,
                     neg_samples=self.config.negative_samples,
                     learning_rate=self.config.learning_rate,
+                    # DDP all-reduces gradients, which needs dense ones
+                    use_sparse=n_gpus == 1,
+                    epochs=self.config.epochs,
+                    min_learning_rate=self.config.min_learning_rate,
+                    steps_per_epoch=max(1, -(-per_rank // batch_size)),
                 )
                 datamodule = ParquetSkipGramDataModule(
                     parquet_path=walk_path,
-                    batch_size=self.config.batch_size or DEFAULT_BATCH_SIZE,
+                    batch_size=batch_size,
                 )
             elif self.config.embedding_model == "cbow":
                 # CBOW multi-GPU parquet path: read on single GPU and use
@@ -1165,7 +1216,8 @@ class GPU_RDF2Vec:
                 max_epochs=self.config.epochs,
                 log_every_n_steps=1,
                 accelerator="gpu",
-                precision="16-mixed",
+                # SkipGram sums its loss over the batch: keep it in fp32
+                precision=32,
                 devices=n_gpus,
                 strategy=strategy,
                 num_nodes=self.config.num_nodes,
@@ -1183,20 +1235,20 @@ class GPU_RDF2Vec:
         with self.tracker.stage("Word2Vec_Training"):
             if self.config.embedding_model == "skipgram":
                 context_tensor = cudf_to_torch_tensor(walk_corpus, "context")
+                batch_size = self._effective_batch_size(len(context_tensor))
                 word2vec_model = SkipGram(
                     vocab_size=self.word2idx.shape[0],
                     embedding_dim=self.config.vector_size,
                     neg_samples=self.config.negative_samples,
                     learning_rate=self.config.learning_rate,
+                    epochs=self.config.epochs,
+                    min_learning_rate=self.config.min_learning_rate,
+                    steps_per_epoch=max(1, -(-len(context_tensor) // batch_size)),
                 )
                 datamodule = SkipGramDataModule(
                     center_tensor=center_tensor,
                     context_tensor=context_tensor,
-                    batch_size=(
-                        self.config.batch_size
-                        if self.config.batch_size
-                        else max(1, len(context_tensor) // 100)
-                    ),
+                    batch_size=batch_size,
                 )
             elif self.config.embedding_model == "cbow":
                 word2vec_model = CBOW(
@@ -1220,11 +1272,7 @@ class GPU_RDF2Vec:
                 datamodule = CBOWDataModule(
                     center_tensor=center_tensor,
                     context_tensor=context_tensor,
-                    batch_size=(
-                        self.config.batch_size
-                        if self.config.batch_size
-                        else max(1, len(context_tensor) // 100)
-                    ),
+                    batch_size=self._effective_batch_size(len(context_tensor)),
                 )
             else:
                 raise ValueError(
@@ -1237,21 +1285,12 @@ class GPU_RDF2Vec:
                 max_epochs=self.config.epochs,
                 log_every_n_steps=1,
                 accelerator="gpu",
-                precision="16-mixed",
+                # SkipGram sums its loss over the batch: keep it in fp32
+                precision=32 if self.config.embedding_model == "skipgram" else "16-mixed",
                 devices=1,
                 num_nodes=self.config.num_nodes,
                 enable_checkpointing=False,
             )
-            if _tunes_batch_size(self.config):
-                tuner = Tuner(trainer)
-                tuner.scale_batch_size(
-                    word2vec_model,
-                    mode="power",
-                    datamodule=datamodule,
-                    steps_per_trial=1,
-                    init_val=max(1, len(center_tensor) // 200),
-                    max_trials=12,
-                )
             trainer.fit(word2vec_model, datamodule)
             self.tracker.log_model_pytorch(
                 word2vec_model, artifact_path="word2vec_model"
@@ -1430,9 +1469,9 @@ class GPU_RDF2Vec:
         """Train the Word2Vec model on walks written by `prepare_corpus`.
 
         Needs no graph and no `load_data`: the vocabulary is read from
-        *vocab_path*. Supports skip-gram with ``backend="pytorch"`` (one
-        GPU, or DDP across all GPUs of the node with ``multi_gpu``; no Dask
-        client is needed) and both models with ``backend="gensim"``. Get the
+        *vocab_path*. Trains skip-gram or CBOW, with ``backend="pytorch"``
+        on one GPU or with DDP across all GPUs of the node (``multi_gpu``; no
+        Dask client is needed), or with ``backend="gensim"``. Get the
         embeddings with `transform` afterwards.
 
         Parameters
@@ -1446,8 +1485,6 @@ class GPU_RDF2Vec:
         ------
         FileNotFoundError
             If either path does not exist.
-        NotImplementedError
-            For CBOW with ``backend="pytorch"``, which trains on pairs.
         """
         from glob import glob
         import pyarrow.parquet as pq
@@ -1455,10 +1492,6 @@ class GPU_RDF2Vec:
         for path in (walks_path, vocab_path):
             if not os.path.exists(path):
                 raise FileNotFoundError(path)
-        if self.config.backend == "pytorch" and self.config.embedding_model != "skipgram":
-            raise NotImplementedError(
-                "fit_from_walks trains skip-gram with backend='pytorch'; use backend='gensim' for CBOW"
-            )
         self.word2idx = cudf.read_parquet(vocab_path)[["token", "word"]]
         files = sorted(set(
             glob(os.path.join(walks_path, "*.parquet"))
@@ -1595,7 +1628,22 @@ class GPU_RDF2Vec:
                     neg_samples=config.negative_samples,
                     learning_rate=config.learning_rate,
                 )
-            elif config.embedding_model == "cbow":
+            elif config.embedding_model == "order_aware_skipgram":
+                model = OrderAwareSkipGram(
+                    vocab_size=instance.word2idx.shape[0],
+                    embedding_dim=config.vector_size,
+                    neg_samples=config.negative_samples,
+                    window=config.window_size,
+                    learning_rate=config.learning_rate,
+                )
+            elif config.embedding_model == "cbow" and config.walk_strategy == "random":
+                model = CBOWNegativeSampling(
+                    vocab_size=instance.word2idx.shape[0],
+                    embedding_dim=config.vector_size,
+                    neg_samples=config.negative_samples,
+                    learning_rate=config.learning_rate,
+                )
+            elif config.embedding_model == "cbow":  # BFS walks train the softmax CBOW
                 model = CBOW(
                     vocab_size=instance.word2idx.shape[0],
                     embedding_dim=config.vector_size,

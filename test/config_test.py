@@ -21,7 +21,6 @@ def test_default_config():
         generate_artifact=False,
         cpu_count=20,
         backend="pytorch",
-        tune_batch_size=True,
         num_nodes=1,
         tracker="none",
         tracker_kwargs={},
@@ -70,12 +69,13 @@ def test_config_reject_invalid_tracker():
     assert "none" in msg
 
 
-def test_multi_gpu_cbow_needs_gensim():
-    """Multi-GPU CBOW pairs on the PyTorch backend lose their context windows."""
-    with pytest.raises(ValueError, match="multi-GPU CBOW"):
-        RDF2VecConfig(multi_gpu=True, embedding_model="cbow", backend="pytorch")
-    RDF2VecConfig(multi_gpu=True, embedding_model="cbow", backend="gensim")
-    RDF2VecConfig(multi_gpu=False, embedding_model="cbow", backend="pytorch")
+def test_multi_gpu_cbow_on_bfs_walks_needs_gensim():
+    """BFS walks reach PyTorch CBOW as pairs, which lose their context windows."""
+    with pytest.raises(ValueError, match="multi-GPU CBOW on BFS walks"):
+        RDF2VecConfig(multi_gpu=True, embedding_model="cbow", backend="pytorch", walk_strategy="bfs")
+    RDF2VecConfig(multi_gpu=True, embedding_model="cbow", backend="pytorch")  # random walks
+    RDF2VecConfig(multi_gpu=True, embedding_model="cbow", backend="gensim", walk_strategy="bfs")
+    RDF2VecConfig(multi_gpu=False, embedding_model="cbow", backend="pytorch", walk_strategy="bfs")
 
 
 def test_learning_rate_defaults():
@@ -84,8 +84,9 @@ def test_learning_rate_defaults():
     assert RDF2VecConfig(backend="pytorch").learning_rate == 0.025
     assert RDF2VecConfig(backend="gensim").learning_rate == 0.025
     assert RDF2VecConfig(backend="gensim", embedding_model="cbow").learning_rate == 0.025
-    # PyTorch CBOW uses Adam on a mean loss
-    assert RDF2VecConfig(embedding_model="cbow").learning_rate == 0.0001
+    assert RDF2VecConfig(embedding_model="cbow").learning_rate == 0.025
+    # CBOW on BFS walks still uses Adam on a mean loss
+    assert RDF2VecConfig(embedding_model="cbow", walk_strategy="bfs").learning_rate == 0.0001
 
 
 def test_training_defaults_match_gensim():
@@ -96,20 +97,20 @@ def test_training_defaults_match_gensim():
         RDF2VecConfig(sample=-0.1)
 
 
-def test_batch_size_default_and_tuning_are_exclusive():
+def test_batch_size_default():
     assert RDF2VecConfig().batch_size == 32_768
-    assert RDF2VecConfig().tune_batch_size is False
     assert RDF2VecConfig(batch_size=4096).batch_size == 4096
-    tuned = RDF2VecConfig(tune_batch_size=True)
-    assert tuned.batch_size is None
-    with pytest.raises(ValueError, match="leave batch_size unset"):
-        RDF2VecConfig(tune_batch_size=True, batch_size=4096)
+    restored = RDF2VecConfig.model_validate_json(RDF2VecConfig().model_dump_json())
+    assert restored.batch_size == 32_768
 
 
-def test_resolved_batch_size_round_trips():
-    for config in (RDF2VecConfig(), RDF2VecConfig(tune_batch_size=True)):
-        restored = RDF2VecConfig.model_validate_json(config.model_dump_json())
-        assert restored.batch_size == config.batch_size
+def test_tune_batch_size_is_deprecated_and_ignored():
+    assert RDF2VecConfig().tune_batch_size is False
+    with pytest.warns(FutureWarning, match="tune_batch_size is deprecated"):
+        config = RDF2VecConfig(tune_batch_size=True)
+    assert config.batch_size == 32_768
+    with pytest.warns(FutureWarning):
+        assert RDF2VecConfig(tune_batch_size=True, batch_size=4096).batch_size == 4096
 
 
 def test_explicit_learning_rate_is_kept():
@@ -122,3 +123,19 @@ def test_resolved_learning_rate_round_trips():
     config = RDF2VecConfig(backend="gensim")
     restored = RDF2VecConfig.model_validate_json(config.model_dump_json())
     assert restored.learning_rate == 0.025
+
+
+def test_cpu_count_defaults_to_the_available_cores():
+    import os
+
+    assert RDF2VecConfig().cpu_count == len(os.sched_getaffinity(0))
+    assert RDF2VecConfig(cpu_count=3).cpu_count == 3
+
+
+def test_order_aware_skipgram_needs_pytorch_and_random_walks():
+    config = RDF2VecConfig(embedding_model="order_aware_skipgram")
+    assert config.learning_rate == 0.025
+    with pytest.raises(ValueError, match="needs backend='pytorch'"):
+        RDF2VecConfig(embedding_model="order_aware_skipgram", backend="gensim")
+    with pytest.raises(ValueError, match="needs walk_strategy='random'"):
+        RDF2VecConfig(embedding_model="order_aware_skipgram", walk_strategy="bfs")

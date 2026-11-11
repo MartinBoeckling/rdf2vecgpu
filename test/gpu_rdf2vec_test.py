@@ -96,14 +96,39 @@ def test_fit_transform_walk_vertices_defaults_to_none():
     assert inspect.signature(GPU_RDF2Vec.fit_transform).parameters["walk_vertices"].default is None
 
 
-def test_batch_size_tuner_keeps_explicit_batch_size():
-    """The tuner replaces the batch size it tunes, so it must not run when one is set."""
-    from src.rdf2vecgpu.config import RDF2VecConfig
-    from src.rdf2vecgpu.gpu_rdf2vec import _tunes_batch_size
+def test_pairs_in_sequence_matches_the_window_template():
+    from src.rdf2vecgpu.embedders.word2vec_loader import skipgram_pairs_per_walk
+    from src.rdf2vecgpu.gpu_rdf2vec import _pairs_in_sequence
 
-    assert _tunes_batch_size(RDF2VecConfig(tune_batch_size=True))
-    assert not _tunes_batch_size(RDF2VecConfig())
-    assert not _tunes_batch_size(RDF2VecConfig(batch_size=4096))
+    for depth in (1, 2, 4, 8):
+        for window in (1, 2, 5, 20):
+            assert _pairs_in_sequence(2 * depth + 1, window) == skipgram_pairs_per_walk(depth, window)
+    assert _pairs_in_sequence(1, 5) == 0
+
+
+def test_walk_statistics_count_tokens_and_pairs_of_walks_as_they_end():
+    import torch
+
+    from src.rdf2vecgpu.gpu_rdf2vec import _pairs_in_sequence, _walk_statistics
+
+    # 1 -p5-> 2 -p6-> 3; 4 -p7-> 0 then ended (padding predicate 9 is not counted); 8 alone
+    vertices = torch.tensor([[1, 2, 3], [4, 0, -1], [8, -1, -1]])
+    predicates = torch.tensor([[5, 6], [7, 9], [9, 9]])
+    counts, n_pairs = _walk_statistics([(vertices, predicates)], vocab_size=10, window=2)
+    assert counts.tolist() == [1, 1, 1, 1, 1, 1, 1, 1, 1, 0]
+    assert n_pairs == _pairs_in_sequence(5, 2) + _pairs_in_sequence(3, 2)
+
+
+@pytest.mark.gpu
+def test_batch_size_is_capped_to_one_hundredth_of_the_pairs():
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    default = GPU_RDF2Vec()
+    assert default._effective_batch_size(100_000_000) == 32_768
+    assert default._effective_batch_size(1_000_000) == 10_000
+    assert default._effective_batch_size(150) == 2
+    assert default._effective_batch_size(0) == 1
+    assert GPU_RDF2Vec(batch_size=64)._effective_batch_size(1_000_000) == 64
 
 
 @pytest.mark.gpu
@@ -179,15 +204,20 @@ def _small_kg(tmp_path):
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("backend", ["pytorch", "gensim"])
-def test_prepare_corpus_then_fit_from_walks(tmp_path, backend):
+@pytest.mark.parametrize(
+    "backend, model",
+    [("pytorch", "skipgram"), ("pytorch", "cbow"), ("pytorch", "order_aware_skipgram"), ("gensim", "skipgram")],
+)
+def test_prepare_corpus_then_fit_from_walks(tmp_path, backend, model):
     if backend == "gensim":
         pytest.importorskip("gensim")
     import cudf
 
     from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
 
-    settings = dict(backend=backend, epochs=1, vector_size=4, window_size=2, walk_number=3, walk_depth=3)
+    settings = dict(
+        backend=backend, embedding_model=model, epochs=1, vector_size=4, window_size=2, walk_number=3, walk_depth=3
+    )
     preparer = GPU_RDF2Vec(**settings)
     edges = preparer.load_data(_small_kg(tmp_path))
     walks_path, vocab_path = preparer.prepare_corpus(edges, str(tmp_path / "corpus"))
@@ -205,17 +235,11 @@ def test_prepare_corpus_then_fit_from_walks(tmp_path, backend):
 
 
 @pytest.mark.gpu
-def test_fit_from_walks_errors(tmp_path):
+def test_fit_from_walks_needs_both_files(tmp_path):
     from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
 
     with pytest.raises(FileNotFoundError):
         GPU_RDF2Vec().fit_from_walks(str(tmp_path / "missing"), str(tmp_path / "missing.parquet"))
-    _write_walks(tmp_path / "walks", 2, "part.0.parquet")
-    (tmp_path / "vocab.parquet").write_bytes(b"")
-    with pytest.raises(NotImplementedError, match="CBOW"):
-        GPU_RDF2Vec(embedding_model="cbow").fit_from_walks(
-            str(tmp_path / "walks"), str(tmp_path / "vocab.parquet")
-        )
 
 
 @pytest.mark.gpu
