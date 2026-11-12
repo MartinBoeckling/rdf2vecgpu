@@ -17,9 +17,10 @@ class SkipGram(L.LightningModule):
       (gensim's ``alpha`` schedule). SGD keeps no per-parameter state, and with
       ``use_sparse=True`` each step only touches the rows of the batch.
     * Gradients are clipped per component to ``grad_clip_value`` after the
-      backward pass. With a summed loss a few very frequent tokens (typically
-      predicates) collect a large gradient in every batch; unclipped, their
-      step can overflow.
+      backward pass, as a guard: with a summed loss a few very frequent tokens
+      (typically predicates) collect a large gradient in every batch. The clip
+      must stay loose; at 0.1 it cut the updates of frequent tokens so much
+      that downstream quality dropped clearly below gensim's. 0 turns it off.
     * ``sample`` drops frequent token occurrences as gensim's ``sample`` does,
       and ``negative_sampling="unigram"`` draws negatives from the corpus
       frequencies to the power 0.75. Both need ``token_counts``.
@@ -42,7 +43,7 @@ class SkipGram(L.LightningModule):
         lr_decay="linear",
         window=5,
         steps_per_epoch=None,
-        grad_clip_value=0.1,
+        grad_clip_value=1.0,
         sample=0.0,
         negative_sampling="uniform",
         token_counts=None,

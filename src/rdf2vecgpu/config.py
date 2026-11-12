@@ -127,6 +127,13 @@ class RDF2VecConfig(BaseModel):
         jRDF2Vec does by default). Used by skip-gram on random walks with
         ``backend="pytorch"`` and by ``backend="gensim"``.
 
+    grad_clip_value : float, default 1.0
+        Per-component clip of the summed batch gradient for the PyTorch
+        skip-gram, order-aware skip-gram and CBOW models, as a guard against
+        overflowing steps for very frequent tokens. 0 turns it off. Values
+        well below 1 slow the learning of frequent tokens and lower embedding
+        quality. Not used by ``backend="gensim"``.
+
     backend : {"pytorch", "gensim"}, default "pytorch"
         Word2Vec trainer. ``"pytorch"`` trains on the GPU(s) with PyTorch
         Lightning. ``"gensim"`` trains on the CPU with gensim (install the
@@ -213,6 +220,7 @@ class RDF2VecConfig(BaseModel):
     learning_rate: Optional[float] = Field(default=None, gt=0)
     min_learning_rate: float = Field(default=0.0001, gt=0)
     sample: float = Field(default=0.001, ge=0)
+    grad_clip_value: float = Field(default=1.0, ge=0)
     backend: Literal["pytorch", "gensim"] = "pytorch"
     # library settings
     random_state: int = Field(default=42, ge=0)

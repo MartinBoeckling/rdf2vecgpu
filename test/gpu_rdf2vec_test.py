@@ -216,7 +216,8 @@ def test_prepare_corpus_then_fit_from_walks(tmp_path, backend, model):
     from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
 
     settings = dict(
-        backend=backend, embedding_model=model, epochs=1, vector_size=4, window_size=2, walk_number=3, walk_depth=3
+        backend=backend, embedding_model=model, epochs=1, vector_size=4, window_size=2, walk_number=3, walk_depth=3,
+        grad_clip_value=0.3,
     )
     preparer = GPU_RDF2Vec(**settings)
     edges = preparer.load_data(_small_kg(tmp_path))
@@ -228,6 +229,8 @@ def test_prepare_corpus_then_fit_from_walks(tmp_path, backend, model):
 
     trainer = GPU_RDF2Vec(**settings)  # a fresh instance: no graph, no load_data
     trainer.fit_from_walks(walks_path, vocab_path)
+    if backend == "pytorch":
+        assert trainer.word2vec_model.grad_clip_value == 0.3
     emb = trainer.transform()
     assert len(emb) == len(preparer.word2idx)
     vectors = emb[[f"embedding_{i}" for i in range(4)]].to_pandas().to_numpy()

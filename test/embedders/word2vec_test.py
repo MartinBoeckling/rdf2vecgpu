@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from src.rdf2vecgpu.embedders.word2vec import CBOW, SkipGram
+from src.rdf2vecgpu.embedders.word2vec import CBOW, CBOWNegativeSampling, OrderAwareSkipGram, SkipGram
 
 
 def _skipgram(**kwargs):
@@ -77,6 +77,12 @@ def test_skipgram_clips_coalesced_sparse_grad():
     off.in_embeddings.weight.grad = torch.sparse_coo_tensor(idx, val, size=(10, 4))
     off.on_after_backward()
     assert torch.allclose(off.in_embeddings.weight.grad.coalesce().to_dense()[1], torch.full((4,), 0.6))
+
+
+def test_models_clip_at_one_by_default():
+    # a clip of 0.1 cut the updates of frequent tokens and lowered KGrEAT scores
+    for cls in (SkipGram, CBOWNegativeSampling, OrderAwareSkipGram):
+        assert cls(vocab_size=10, embedding_dim=4, neg_samples=1, window=2).grad_clip_value == 1.0
 
 
 def test_skipgram_clips_dense_grad():

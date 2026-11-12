@@ -97,6 +97,13 @@ def test_training_defaults_match_gensim():
         RDF2VecConfig(sample=-0.1)
 
 
+def test_grad_clip_value_default_and_validation():
+    assert RDF2VecConfig().grad_clip_value == 1.0
+    assert RDF2VecConfig(grad_clip_value=0).grad_clip_value == 0
+    with pytest.raises(ValueError):
+        RDF2VecConfig(grad_clip_value=-1)
+
+
 def test_batch_size_default():
     assert RDF2VecConfig().batch_size == 32_768
     assert RDF2VecConfig(batch_size=4096).batch_size == 4096

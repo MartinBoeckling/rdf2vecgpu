@@ -1036,6 +1036,7 @@ class GPU_RDF2Vec:
             min_learning_rate=self.config.min_learning_rate,
             window=self.config.window_size,
             steps_per_epoch=steps_per_epoch,
+            grad_clip_value=self.config.grad_clip_value,
             sample=self.config.sample,
             negative_sampling="unigram",
             token_counts=token_counts,
@@ -1065,6 +1066,7 @@ class GPU_RDF2Vec:
                 "min_learning_rate": self.config.min_learning_rate,
                 "batch_size": self.config.batch_size,
                 "sample": self.config.sample,
+                "grad_clip_value": self.config.grad_clip_value,
                 "backend": "pytorch",
             }
         )
@@ -1192,6 +1194,7 @@ class GPU_RDF2Vec:
                     epochs=self.config.epochs,
                     min_learning_rate=self.config.min_learning_rate,
                     steps_per_epoch=max(1, -(-per_rank // batch_size)),
+                    grad_clip_value=self.config.grad_clip_value,
                 )
                 datamodule = ParquetSkipGramDataModule(
                     parquet_path=walk_path,
@@ -1244,6 +1247,7 @@ class GPU_RDF2Vec:
                     epochs=self.config.epochs,
                     min_learning_rate=self.config.min_learning_rate,
                     steps_per_epoch=max(1, -(-len(context_tensor) // batch_size)),
+                    grad_clip_value=self.config.grad_clip_value,
                 )
                 datamodule = SkipGramDataModule(
                     center_tensor=center_tensor,
