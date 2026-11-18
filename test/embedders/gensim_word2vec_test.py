@@ -9,6 +9,7 @@ installed, mirroring the user-facing import gate in
 from __future__ import annotations
 
 import sys
+import warnings
 import tempfile
 from pathlib import Path
 
@@ -150,6 +151,124 @@ def test_walk_corpus_drops_walks_below_min_length(tmp_path: Path):
     # Only the second walk survives.
     assert len(out) == 1
     assert out[0] == ["0", "10", "1", "11", "2", "12", "3"]
+
+
+def _expected_walks(vertex_rows, predicate_rows, id_to_word=None):
+    """What `WalkCorpus` must yield, written walk by walk: cut at the first
+    negative vertex, drop walks with fewer than 2 vertices, interleave
+    v0, p0, v1, ..., v_end and turn tokens into strings (or look them up)."""
+    out = []
+    for vs, ps in zip(vertex_rows, predicate_rows):
+        end = next((i for i, v in enumerate(vs) if v < 0), len(vs))
+        if end < 2:
+            continue
+        tokens = []
+        for i in range(end):
+            tokens.append(int(vs[i]))
+            if i < end - 1:
+                tokens.append(int(ps[i]))
+        out.append([str(t) if id_to_word is None else id_to_word[t] for t in tokens])
+    return out
+
+
+def _random_walk_rows(rng, n, depth, n_vertices=50, n_predicates=10):
+    """`n` fixed-length walks; about a third end early (vertices padded with -1,
+    predicates past the end padded with -1), some with fewer than 2 vertices."""
+    vertex_rows, predicate_rows = [], []
+    for _ in range(n):
+        vs = rng.integers(0, n_vertices, depth + 1).tolist()
+        ps = rng.integers(n_vertices, n_vertices + n_predicates, depth).tolist()
+        if rng.random() < 0.35:
+            end = int(rng.integers(1, depth + 1))
+            vs[end:] = [-1] * (depth + 1 - end)
+            ps[max(end - 1, 0):] = [-1] * (depth - max(end - 1, 0))
+        vertex_rows.append(vs)
+        predicate_rows.append(ps)
+    return vertex_rows, predicate_rows
+
+
+def _write_walk_files(walks_dir: Path, vertex_rows, predicate_rows, n_files, predicate_type=None):
+    walks_dir.mkdir()
+    bounds = np.linspace(0, len(vertex_rows), n_files + 1).astype(int)
+    for k, (a, b) in enumerate(zip(bounds[:-1], bounds[1:])):
+        predicates = pa.array(predicate_rows[a:b], type=predicate_type)
+        table = pa.table({"vertices": vertex_rows[a:b], "predicates": predicates})
+        pq.write_table(table, walks_dir / f"part.{k}.parquet")
+
+
+@pytest.mark.parametrize("int_tokens", [True, False])
+@pytest.mark.parametrize("batch_size", [7, 1_000])
+def test_walk_corpus_matches_walk_by_walk_reading(tmp_path: Path, int_tokens, batch_size):
+    """Several files, early-ending and too-short walks, batches that split files
+    unevenly: the output is exactly the walk-by-walk definition."""
+    rng = np.random.default_rng(0)
+    vertex_rows, predicate_rows = _random_walk_rows(rng, n=600, depth=6)
+    _write_walk_files(tmp_path / "walks", vertex_rows, predicate_rows, n_files=3)
+    id_to_word = None if int_tokens else np.array([f"w{t}" for t in range(60)], dtype=object)
+
+    corpus = WalkCorpus(
+        str(tmp_path / "walks"), id_to_word=id_to_word, batch_size=batch_size, int_tokens=int_tokens
+    )
+
+    assert list(corpus) == _expected_walks(vertex_rows, predicate_rows, id_to_word)
+
+
+def test_walk_corpus_can_be_iterated_once_per_epoch(tmp_path: Path):
+    """gensim iterates the corpus once for the vocabulary and once per epoch."""
+    rng = np.random.default_rng(1)
+    vertex_rows, predicate_rows = _random_walk_rows(rng, n=50, depth=4)
+    _write_walk_files(tmp_path / "walks", vertex_rows, predicate_rows, n_files=1)
+    corpus = WalkCorpus(str(tmp_path / "walks"), id_to_word=None, batch_size=8, int_tokens=True)
+
+    assert list(corpus) == list(corpus) == _expected_walks(vertex_rows, predicate_rows)
+
+
+def test_walk_corpus_reads_float_predicates(tmp_path: Path):
+    """Predicates stored as floats (cuGraph's edge-weight slot) become int tokens."""
+    rng = np.random.default_rng(2)
+    vertex_rows, predicate_rows = _random_walk_rows(rng, n=100, depth=4)
+    _write_walk_files(
+        tmp_path / "walks", vertex_rows, predicate_rows, n_files=1, predicate_type=pa.list_(pa.float32())
+    )
+    corpus = WalkCorpus(str(tmp_path / "walks"), id_to_word=None, batch_size=30, int_tokens=True)
+
+    assert list(corpus) == _expected_walks(vertex_rows, predicate_rows)
+
+
+def test_walk_corpus_reads_null_predicates_past_the_walk_end(tmp_path: Path):
+    """Nulls instead of -1 after a walk's end are ignored like -1."""
+    vertex_rows = [[0, 1, -1, -1], [2, 3, 4, 5], [6, -1, -1, -1]]
+    predicate_rows = [[10, None, None], [11, 12, 13], [None, None, None]]
+    _write_walk_files(tmp_path / "walks", vertex_rows, predicate_rows, n_files=1)
+    corpus = WalkCorpus(str(tmp_path / "walks"), id_to_word=None, int_tokens=True)
+
+    assert list(corpus) == [["0", "10", "1"], ["2", "11", "3", "12", "4", "13", "5"]]
+
+
+def test_walk_corpus_reads_nan_predicates_past_the_walk_end(tmp_path: Path):
+    """Float predicates padded with NaN after a walk's end are ignored like -1."""
+    vertex_rows = [[0, 1, -1, -1], [2, 3, 4, 5]]
+    predicate_rows = [[10.0, np.nan, np.nan], [11.0, 12.0, 13.0]]
+    _write_walk_files(
+        tmp_path / "walks", vertex_rows, predicate_rows, n_files=1, predicate_type=pa.list_(pa.float32())
+    )
+    corpus = WalkCorpus(str(tmp_path / "walks"), id_to_word=None, int_tokens=True)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")   # no "invalid value encountered in cast"
+        walks = list(corpus)
+
+    assert walks == [["0", "10", "1"], ["2", "11", "3", "12", "4", "13", "5"]]
+
+
+def test_walk_corpus_reads_walks_of_different_lengths(tmp_path: Path):
+    """Walk lists of different lengths in one batch (files written already trimmed)."""
+    vertex_rows = [[0, 1, 2], [3, 4], [5, 6, 7, 8], [9]]
+    predicate_rows = [[10, 11], [12], [13, 14, 15], []]
+    _write_walk_files(tmp_path / "walks", vertex_rows, predicate_rows, n_files=1)
+    corpus = WalkCorpus(str(tmp_path / "walks"), id_to_word=None, int_tokens=True)
+
+    assert list(corpus) == _expected_walks(vertex_rows, predicate_rows)
 
 
 def test_load_id_to_word_requires_contiguous_tokens():
