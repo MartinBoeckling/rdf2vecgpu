@@ -412,21 +412,29 @@ class WalkSequenceDataModule(L.LightningDataModule):
 
 
 class _InMemoryWalkSeq(IterableDataset):
-    """GPU-resident sibling of `_WalkSeqIterable`: turns the cuDF list columns
-    into 2-D GPU int tensors once (DLPack, no copy off the GPU), then yields
-    `emit_batch_size`-row `(vertices, predicates)` slices in a new random
-    order each epoch. Single GPU only: the whole corpus sits on one GPU."""
+    """GPU-resident sibling of `_WalkSeqIterable`: holds the walks as 2-D GPU
+    int tensors, either given as ``(vertices, predicates)`` matrices (used as
+    they are, e.g. the int32 matrices of `SingleGPUWalkCorpus.walk_matrices`)
+    or turned once from the cuDF list columns of a walks frame (DLPack, no
+    copy off the GPU), then yields `emit_batch_size`-row `(vertices,
+    predicates)` batches in a new random order each epoch. Single GPU only:
+    the whole corpus sits on one GPU."""
 
-    def __init__(self, cudf_df, *, emit_batch_size, shuffle=True, seed=0):
+    def __init__(self, walks, *, emit_batch_size, shuffle=True, seed=0):
         super().__init__()
-        for col in ("vertices", "predicates"):
-            if col not in cudf_df.columns:
-                raise ValueError(f"in-memory walks frame missing '{col}' list column")
-        n = len(cudf_df)
-        # Every walk has the same list length (cuGraph pads ended walks with
-        # -1), so the flat leaves reshape to (n, length).
-        self.vertices = self._as_matrix(cudf_df["vertices"], n)
-        self.predicates = self._as_matrix(cudf_df["predicates"], n)
+        if isinstance(walks, tuple):
+            self.vertices, self.predicates = walks
+            if len(self.vertices) != len(self.predicates):
+                raise ValueError("vertices and predicates hold different numbers of walks")
+        else:
+            for col in ("vertices", "predicates"):
+                if col not in walks.columns:
+                    raise ValueError(f"in-memory walks frame missing '{col}' list column")
+            n = len(walks)
+            # Every walk has the same list length (cuGraph pads ended walks with
+            # -1), so the flat leaves reshape to (n, length).
+            self.vertices = self._as_matrix(walks["vertices"], n)
+            self.predicates = self._as_matrix(walks["predicates"], n)
         self.emit_batch_size = int(emit_batch_size)
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
@@ -454,23 +462,27 @@ class _InMemoryWalkSeq(IterableDataset):
             generator = torch.Generator(device=self.vertices.device)
             generator.manual_seed(self.seed + self._epoch)
             order = torch.randperm(n, generator=generator, device=self.vertices.device)
-            vertices, predicates = self.vertices[order], self.predicates[order]
-        else:
-            vertices, predicates = self.vertices, self.predicates
+            # gather each batch from the permutation rather than permuting the
+            # whole corpus: that copy would double the corpus in GPU memory
+            for start in range(0, n, self.emit_batch_size):
+                rows = order[start : start + self.emit_batch_size]
+                yield self.vertices[rows], self.predicates[rows]
+            return
         step = self.emit_batch_size
         for start in range(0, n, step):
-            yield vertices[start : start + step], predicates[start : start + step]
+            yield self.vertices[start : start + step], self.predicates[start : start + step]
 
 
 class InMemoryWalkSeqDataModule(L.LightningDataModule):
-    """Feeds `(vertices, predicates)` GPU int tensors straight from an in-memory
-    cuDF walks-as-sequences frame — the GPU-resident counterpart of
+    """Feeds `(vertices, predicates)` GPU int tensors straight from walks in GPU
+    memory — a cuDF walks-as-sequences frame or a ``(vertices, predicates)``
+    pair of GPU int matrices — the GPU-resident counterpart of
     `WalkSequenceDataModule`. num_workers is forced to 0: the batches are CUDA
     tensors, which cannot cross DataLoader worker processes."""
 
-    def __init__(self, cudf_df, *, emit_batch_size, shuffle=True, seed=0):
+    def __init__(self, walks, *, emit_batch_size, shuffle=True, seed=0):
         super().__init__()
-        self.cudf_df = cudf_df
+        self.walks = walks
         self.emit_batch_size = emit_batch_size
         self.shuffle = shuffle
         self.seed = seed
@@ -478,7 +490,7 @@ class InMemoryWalkSeqDataModule(L.LightningDataModule):
 
     def setup(self, stage=None):
         self._iterable = _InMemoryWalkSeq(
-            self.cudf_df,
+            self.walks,
             emit_batch_size=self.emit_batch_size,
             shuffle=self.shuffle,
             seed=self.seed,

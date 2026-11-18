@@ -212,3 +212,108 @@ def test_walks_decode_predicate_tokens_above_float32_range():
     P = walks["predicates"].list.leaves.values_host.reshape(len(walks), 3)
     steps = {(int(v), int(o), int(p)) for v, o, p in zip(V[:, :-1].ravel(), V[:, 1:].ravel(), P.ravel()) if o >= 0}
     assert steps and steps <= legit
+
+
+def _coded_graph():
+    """A small MultiGraph on `encode_predicates` codes, with parallel edges and a
+    dead end (vertex 3), plus the set of its (subject, object, predicate) edges."""
+    from cugraph import MultiGraph
+
+    edge_df = cudf.DataFrame(
+        {
+            "subject": cudf.Series([0, 0, 1, 2, 2], dtype="int32"),
+            "predicate": cudf.Series([40, 41, 42, 43, 44], dtype="int64"),
+            "object": cudf.Series([1, 1, 2, 0, 3], dtype="int32"),
+        }
+    )
+    tokens = edge_df["predicate"].unique().sort_values().values_host
+    edge_df["pcode"] = encode_predicates(edge_df["predicate"], tokens)
+    graph = MultiGraph(directed=True)
+    graph.from_cudf_edgelist(edge_df, source="subject", destination="object", edge_attr="pcode", renumber=False)
+    legit = {(int(r.subject), int(r.object), int(r.predicate)) for r in edge_df.to_pandas().itertuples()}
+    return SingleGPUWalkCorpus(graph, window_size=2, code_to_token=predicate_code_table(tokens)), legit
+
+
+def _check_walks(V, P, starts, walk_number, legit):
+    """Every start vertex begins `walk_number` walks, every step is an edge of
+    the graph with its predicate, and ended walks are padded with -1."""
+    import numpy as np
+
+    assert sorted(V[:, 0].tolist()) == sorted(np.repeat(starts, walk_number).tolist())
+    steps = [(int(v), int(o), int(p)) for v, o, p in zip(V[:, :-1].ravel(), V[:, 1:].ravel(), P.ravel()) if o >= 0]
+    assert steps and set(steps) <= legit
+    ended = V[:, 1:] < 0
+    assert (V[:, 1:][np.cumsum(ended, axis=1) > 0] == -1).all()  # once ended, stays ended
+
+
+@pytest.mark.gpu
+def test_decode_predicates_returns_int32_tokens():
+    """Predicate tokens are decoded straight to int32 (vocabulary tokens fit:
+    cuDF caps the vocabulary at 2^31 rows), without int64 copies of the walks."""
+    from src.rdf2vecgpu.corpus.walk_corpus import _decode_predicates
+
+    table = predicate_code_table([5, 9, 300_000_001])
+    out = _decode_predicates(cp.asarray([1, 0, 3, 2], dtype=cp.float32), table)
+    assert out.dtype == cp.int32
+    assert out.tolist() == [5, 0, 300_000_001, 9]
+    with pytest.raises(ValueError):
+        _decode_predicates(cp.asarray([1.5], dtype=cp.float32), table)
+    with pytest.raises(ValueError):
+        _decode_predicates(cp.asarray([4], dtype=cp.float32), table)
+
+
+@pytest.mark.gpu
+def test_single_gpu_walks_come_in_chunks_of_int32_matrices():
+    """`walk_chunks` walks `walks_per_chunk` walks (whole start vertices) per
+    cuGraph call and yields int32 (vertices, predicates) matrices."""
+    corpus, legit = _coded_graph()
+    starts = cudf.Series([0, 1, 2], dtype="int32")
+
+    chunks = list(corpus.walk_chunks(starts, walk_number=20, walk_depth=3, random_state=0, walks_per_chunk=45))
+
+    assert [len(v) for v, _ in chunks] == [40, 20]  # 2 start vertices x 20 walks, then 1
+    for v, p in chunks:
+        assert v.dtype == cp.int32 and p.dtype == cp.int32
+        assert v.shape[1] == 4 and p.shape[1] == 3
+    V = cp.concatenate([v for v, _ in chunks]).get()
+    P = cp.concatenate([p for _, p in chunks]).get()
+    _check_walks(V, P, [0, 1, 2], 20, legit)
+
+
+@pytest.mark.gpu
+def test_single_gpu_walk_matrices_hold_every_chunk():
+    import torch
+
+    corpus, legit = _coded_graph()
+    vertices, predicates = corpus.walk_matrices(
+        cudf.Series([0, 1, 2], dtype="int32"), walk_number=20, walk_depth=3, random_state=0, walks_per_chunk=20
+    )
+    assert vertices.is_cuda and vertices.dtype == torch.int32 and predicates.dtype == torch.int32
+    assert vertices.shape == (60, 4) and predicates.shape == (60, 3)
+    _check_walks(vertices.cpu().numpy(), predicates.cpu().numpy(), [0, 1, 2], 20, legit)
+
+
+@pytest.mark.gpu
+def test_single_gpu_write_walk_sequences_writes_each_chunk(tmp_path):
+    """Walks written chunk by chunk to parquet, in the schema of the multi-GPU
+    writer, so the corpus never has to fit on the GPU at once."""
+    import numpy as np
+    import pyarrow.parquet as pq
+
+    corpus, legit = _coded_graph()
+    out = tmp_path / "walks"
+    n = corpus.write_walk_sequences(
+        cudf.Series([0, 1, 2], dtype="int32"), walk_number=20, walk_depth=3, random_state=0,
+        out_dir=str(out), walks_per_chunk=20,
+    )
+    assert n == 60
+    files = sorted(out.glob("part.*.parquet"))
+    assert len(files) == 3
+    table = pq.read_table(out)
+    assert table.num_rows == 60
+    V = np.array(table.column("vertices").to_pylist())
+    P = np.array(table.column("predicates").to_pylist())
+    _check_walks(V, P, [0, 1, 2], 20, legit)
+    with pytest.raises(ValueError, match="already holds parquet"):
+        corpus.write_walk_sequences(cudf.Series([0], dtype="int32"), walk_number=1, walk_depth=3,
+                                    random_state=0, out_dir=str(out))

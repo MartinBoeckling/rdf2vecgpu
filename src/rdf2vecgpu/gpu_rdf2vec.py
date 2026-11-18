@@ -21,9 +21,12 @@ from .reader.kg_file_reader import KGFileReader
 from .corpus.walk_corpus import (
     SingleGPUWalkCorpus,
     MultiGPUWalkCorpus,
+    _fixed_width_lists,
     encode_predicates,
     predicate_code_table,
+    walk_chunk_matrices,
     weighted_edge_index,
+    write_walk_chunks,
 )
 from .logger import build_tracker
 import cudf
@@ -96,17 +99,24 @@ def _pairs_in_sequence(length: int, window: int) -> int:
     return 2 * sum(length - d for d in range(1, min(window, length - 1) + 1))
 
 
-def _walk_statistics(batches, vocab_size: int, window: int):
+def _walk_statistics(batches, vocab_size: int, window: int, rows_per_slice: int = 1 << 23):
     """Token counts and skip-gram pair count of walks given as
     `(vertices, predicates)` tensor pairs of shape (n, depth + 1) and
     (n, depth). Returns a numpy int64 array of length `vocab_size` and an
     int. Positions after a walk's end (vertex -1, and the predicate before
-    it) are not counted. Uses torch, on whatever device the tensors are on."""
+    it) are not counted. Uses torch, on whatever device the tensors are on,
+    `rows_per_slice` walks at a time: the int64 copies it works on stay
+    small even when one pair holds a whole single-GPU corpus."""
     import numpy as np
+
+    def slices():
+        for vertices, predicates in batches:
+            for start in range(0, len(vertices), rows_per_slice):
+                yield vertices[start:start + rows_per_slice], predicates[start:start + rows_per_slice]
 
     counts = torch.zeros(vocab_size, dtype=torch.int64)
     n_pairs = 0
-    for vertices, predicates in batches:
+    for vertices, predicates in slices():
         vertices = vertices.long()
         predicates = predicates.long()
         reached = vertices[:, 1 : predicates.shape[1] + 1] >= 0
@@ -715,7 +725,8 @@ class GPU_RDF2Vec:
         return walk_corpus
 
     def walk_generation_sequences(
-        self, edge_df: cudf.DataFrame, walk_vertices: cudf.Series = None, out_dir: Optional[str] = None
+        self, edge_df: cudf.DataFrame, walk_vertices: cudf.Series = None, out_dir: Optional[str] = None,
+        *, as_matrices: bool = False,
     ):
         """Walks-as-sequences output for the gensim training backend.
 
@@ -725,14 +736,19 @@ class GPU_RDF2Vec:
         Gensim builds its own skip-gram windows internally, so it wants the
         raw walk sequences, not pre-computed pairs.
 
-        Only the "random" walk strategy is supported for the gensim backend
-        in this release — bfs walks would need a parallel BFS-to-sequences
-        path on the corpus classes.
+        Random walks give ``walk_number`` walks per start vertex; BFS walks
+        (one GPU only) one walk per leaf of each start vertex's BFS tree, the
+        root-to-leaf path (`SingleGPUWalkCorpus.bfs_chunks`), padded like
+        random walks that ended early.
 
-        With ``multi_gpu`` and `out_dir`, the walks are written by the GPUs
-        straight to that parquet directory in chunks
-        (`MultiGPUWalkCorpus.write_walk_sequences`) and a `WalkParquet` is
-        returned instead of a dask frame.
+        With `out_dir`, the walks are written straight to that parquet
+        directory in chunks (`MultiGPUWalkCorpus.write_walk_sequences` with
+        ``multi_gpu``, `SingleGPUWalkCorpus.write_walk_sequences` without) and
+        a `WalkParquet` is returned instead of a frame. With ``as_matrices``
+        (one GPU, no `out_dir`) the walks come back as a ``(vertices,
+        predicates)`` pair of GPU int32 torch matrices, built chunk by chunk
+        (`SingleGPUWalkCorpus.walk_matrices`), the form the PyTorch trainer
+        keeps in GPU memory.
         """
         with self.tracker.stage("Walk_Generation"):
             if self.config.multi_gpu:
@@ -751,23 +767,39 @@ class GPU_RDF2Vec:
                     code_to_token=self._code_to_token,
                     edge_index=self._edge_index,
                 )
-            if self.config.walk_strategy != "random":
+            bfs = self.config.walk_strategy == "bfs"
+            if bfs and self.config.multi_gpu:
                 raise NotImplementedError(
-                    f"backend='gensim' currently supports walk_strategy='random' "
-                    f"only (got {self.config.walk_strategy!r}). bfs+gensim would "
-                    f"need a parallel sequences output on bfs_walk."
+                    "BFS walks as sequences (backend='gensim', prepare_corpus) need multi_gpu=False; "
+                    "multi-GPU BFS trains with backend='pytorch' from skip-gram pairs"
                 )
             walk_vertices = self._resolve_walk_vertices(walk_vertices)
             n = self.config.walk_number
-            if self.config.multi_gpu and out_dir is not None:
+            depth, seed = self.config.walk_depth, self.config.random_state
+            if bfs:
+                chunks = walk_instance.bfs_chunks(edge_df, walk_vertices, walk_depth=depth, random_state=seed)
+                if out_dir is not None:
+                    walk_sequences = WalkParquet(out_dir, write_walk_chunks(chunks, out_dir, depth))
+                else:
+                    vertices, predicates = walk_chunk_matrices(chunks, depth)
+                    if as_matrices:
+                        walk_sequences = (vertices, predicates)
+                    else:
+                        import cupy
+
+                        walk_sequences = cudf.DataFrame({
+                            "vertices": _fixed_width_lists(cupy.asarray(vertices)),
+                            "predicates": _fixed_width_lists(cupy.asarray(predicates)),
+                        })
+            elif out_dir is not None:
                 n_walks = walk_instance.write_walk_sequences(
-                    walk_vertices,
-                    walk_number=n,
-                    walk_depth=self.config.walk_depth,
-                    random_state=self.config.random_state,
-                    out_dir=out_dir,
+                    walk_vertices, walk_number=n, walk_depth=depth, random_state=seed, out_dir=out_dir,
                 )
                 walk_sequences = WalkParquet(out_dir, n_walks)
+            elif as_matrices and not self.config.multi_gpu:
+                walk_sequences = walk_instance.walk_matrices(
+                    walk_vertices, walk_number=n, walk_depth=depth, random_state=seed,
+                )
             else:
                 if hasattr(walk_vertices, "map_partitions"):
                     walk_vertices = walk_vertices.map_partitions(
@@ -804,8 +836,8 @@ class GPU_RDF2Vec:
         temporary Parquet directory under ``$TMPDIR``, the Dask client is
         closed, and training runs with DDP across all GPUs. CBOW and BFS walks
         are turned into pairs first. With ``backend="gensim"`` the walks are
-        kept as sequences and gensim trains on the CPU; with ``multi_gpu``
-        they are written to Parquet the same way.
+        written to a temporary Parquet directory chunk by chunk and gensim
+        trains on the CPU.
 
         Parameters
         ----------
@@ -821,7 +853,8 @@ class GPU_RDF2Vec:
         RuntimeError
             If no graph has been built yet (call `load_data` first).
         NotImplementedError
-            If ``walk_strategy="bfs"`` is combined with ``backend="gensim"``.
+            If ``walk_strategy="bfs"`` is combined with ``backend="gensim"``
+            and ``multi_gpu``.
 
         Notes
         -----
@@ -839,10 +872,15 @@ class GPU_RDF2Vec:
         # streaming and trains on CPU; pytorch consumes (center, context)
         # skip-gram pairs and trains on GPU via Lightning.
         if self.config.backend == "gensim":
-            self._with_walk_sequences(edge_df, walk_vertices, self._fit_via_gensim)
+            # gensim reads the walks from parquet: written there chunk by chunk,
+            # they never have to fit on the GPU at once
+            self._with_walk_sequences(edge_df, walk_vertices, self._fit_via_gensim, on_disk=True)
             return
-        if self.config.walk_strategy == "random":
-            self._with_walk_sequences(edge_df, walk_vertices, self._fit_via_pytorch_sequences)
+        if self.config.walk_strategy == "random" or not self.config.multi_gpu:
+            # random walks, and BFS walks on one GPU, train from walk sequences
+            self._with_walk_sequences(
+                edge_df, walk_vertices, self._fit_via_pytorch_sequences, on_disk=self.config.multi_gpu
+            )
             return
         walk_corpus = self.walk_generation(
             edge_df=edge_df,
@@ -883,15 +921,15 @@ class GPU_RDF2Vec:
                 walk_corpus = walk_corpus.compute()
             self._fit_from_tensors(walk_corpus)
 
-    def _with_walk_sequences(self, edge_df, walk_vertices, train) -> None:
-        """Generate walk sequences and pass them to `train`. Multi-GPU walks
-        are written by the GPUs to a temporary parquet directory (removed
-        afterwards) and passed as a `WalkParquet`."""
+    def _with_walk_sequences(self, edge_df, walk_vertices, train, *, on_disk: bool) -> None:
+        """Generate walk sequences and pass them to `train`: with `on_disk`
+        written to a temporary parquet directory (removed afterwards) and
+        passed as a `WalkParquet`, otherwise (one GPU) as GPU int32 matrices."""
         import shutil
         import tempfile
 
-        if not self.config.multi_gpu:
-            train(self.walk_generation_sequences(edge_df=edge_df, walk_vertices=walk_vertices))
+        if not on_disk:
+            train(self.walk_generation_sequences(edge_df=edge_df, walk_vertices=walk_vertices, as_matrices=True))
             return
         walk_dir = tempfile.mkdtemp(prefix="rdf2vec_walks_")
         try:
@@ -902,8 +940,9 @@ class GPU_RDF2Vec:
             shutil.rmtree(walk_dir, ignore_errors=True)
 
     def _fit_via_pytorch_sequences(self, walk_sequences) -> None:
-        """Train PyTorch skip-gram or CBOW from walks as sequences: a cudf frame on one
-        GPU (kept in GPU memory), or a `WalkParquet` with ``multi_gpu`` (the
+        """Train PyTorch skip-gram or CBOW from walks as sequences: on one GPU
+        a ``(vertices, predicates)`` pair of GPU int matrices or a cudf walks
+        frame (kept in GPU memory), or a `WalkParquet` with ``multi_gpu`` (the
         Dask client is closed first, then DDP reads the files). Each batch
         holds about ``batch_size`` (center, context) pairs, built on the GPU
         from its walks."""
@@ -1458,15 +1497,8 @@ class GPU_RDF2Vec:
         out = os.path.abspath(out_dir)
         os.makedirs(out, exist_ok=True)
         walks_path = os.path.join(out, "walks")
-        if self.config.multi_gpu:
-            # the GPUs write their walks straight to walks_path
-            self.walk_generation_sequences(edge_df, walk_vertices, out_dir=walks_path)
-        else:
-            walks = self.walk_generation_sequences(edge_df, walk_vertices)
-            if hasattr(walks, "compute"):
-                walks = walks.compute()
-            os.makedirs(walks_path, exist_ok=True)
-            walks.to_parquet(os.path.join(walks_path, "part.0.parquet"), index=False)
+        # the walks are written straight to walks_path, chunk by chunk
+        self.walk_generation_sequences(edge_df, walk_vertices, out_dir=walks_path)
         word2idx = self.word2idx.compute() if hasattr(self.word2idx, "compute") else self.word2idx
         vocab_path = os.path.join(out, "word2idx.parquet")
         word2idx[["token", "word"]].to_parquet(vocab_path, index=False)

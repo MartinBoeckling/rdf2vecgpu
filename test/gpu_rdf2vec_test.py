@@ -119,6 +119,23 @@ def test_walk_statistics_count_tokens_and_pairs_of_walks_as_they_end():
     assert n_pairs == _pairs_in_sequence(5, 2) + _pairs_in_sequence(3, 2)
 
 
+def test_walk_statistics_count_large_int32_corpora_in_row_slices():
+    """The whole single-GPU corpus is one `(vertices, predicates)` pair of int32
+    matrices; it is counted a slice of rows at a time (an int64 copy of all
+    of it ran out of GPU memory on Wikidata5M), with the same result."""
+    import torch
+
+    from src.rdf2vecgpu.gpu_rdf2vec import _walk_statistics
+
+    g = torch.Generator().manual_seed(0)
+    vertices = torch.randint(0, 50, (1000, 5), generator=g, dtype=torch.int32)
+    predicates = torch.randint(50, 60, (1000, 4), generator=g, dtype=torch.int32)
+    vertices[::3, 2:] = -1
+    whole = _walk_statistics([(vertices.long(), predicates.long())], vocab_size=60, window=3)
+    sliced = _walk_statistics([(vertices, predicates)], vocab_size=60, window=3, rows_per_slice=7)
+    assert sliced[0].tolist() == whole[0].tolist() and sliced[1] == whole[1]
+
+
 @pytest.mark.gpu
 def test_batch_size_is_capped_to_one_hundredth_of_the_pairs():
     from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
@@ -268,3 +285,68 @@ def test_pytorch_progress_bar_refreshes_when_the_loss_is_logged(tmp_path):
 
     trainer = model.word2vec_model.trainer
     assert trainer.progress_bar_callback.refresh_rate == trainer.log_every_n_steps > 1
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("backend", ["pytorch", "gensim"])
+def test_single_gpu_fit_and_prepare_corpus_walk_in_chunks(tmp_path, monkeypatch, backend):
+    """With a small chunk size the single-GPU walks come in several chunks, and
+    fit / prepare_corpus still see all of them (20 start vertices x 3 walks)."""
+    if backend == "gensim":
+        pytest.importorskip("gensim")
+    import pyarrow.parquet as pq
+
+    from src.rdf2vecgpu.corpus import walk_corpus
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    monkeypatch.setattr(walk_corpus, "SINGLE_GPU_WALKS_PER_CHUNK", 7)  # 2 start vertices per chunk
+    chunks = []
+    original = walk_corpus.SingleGPUWalkCorpus.walk_chunks
+
+    def counting(self, *args, **kwargs):
+        for chunk in original(self, *args, **kwargs):
+            chunks.append(len(chunk[0]))
+            yield chunk
+
+    monkeypatch.setattr(walk_corpus.SingleGPUWalkCorpus, "walk_chunks", counting)
+    settings = dict(backend=backend, epochs=1, vector_size=4, window_size=2, walk_number=3, walk_depth=3)
+
+    model = GPU_RDF2Vec(**settings)
+    model.fit(model.load_data(_small_kg(tmp_path)))
+    assert chunks == [6] * 10
+    vectors = model.transform()[[f"embedding_{i}" for i in range(4)]].to_pandas().to_numpy()
+    assert np.isfinite(vectors).all() and np.abs(vectors).sum() > 0
+
+    chunks.clear()
+    preparer = GPU_RDF2Vec(**settings)
+    walks_path, _ = preparer.prepare_corpus(preparer.load_data(_small_kg(tmp_path)), str(tmp_path / "corpus"))
+    assert chunks == [6] * 10
+    assert pq.read_table(walks_path).num_rows == 60
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "backend, model", [("pytorch", "skipgram"), ("pytorch", "cbow"), ("gensim", "skipgram")]
+)
+def test_single_gpu_bfs_walks_train_like_random_walks(tmp_path, backend, model):
+    """BFS walks are walk sequences like random walks (root-to-leaf paths,
+    -1 padded): every trainer takes them, and prepare_corpus writes them."""
+    if backend == "gensim":
+        pytest.importorskip("gensim")
+    import pyarrow.parquet as pq
+
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    settings = dict(backend=backend, embedding_model=model, walk_strategy="bfs", epochs=1, vector_size=4,
+                    window_size=2, walk_depth=3)
+    rdf = GPU_RDF2Vec(**settings)
+    rdf.fit(rdf.load_data(_small_kg(tmp_path)))
+    vectors = rdf.transform()[[f"embedding_{i}" for i in range(4)]].to_pandas().to_numpy()
+    assert np.isfinite(vectors).all() and np.abs(vectors).sum() > 0
+
+    preparer = GPU_RDF2Vec(**settings)
+    walks_path, _ = preparer.prepare_corpus(preparer.load_data(_small_kg(tmp_path)), str(tmp_path / "corpus"))
+    walks = pq.read_table(walks_path)
+    # the 20-vertex cycle: from each vertex one path of 3 steps
+    assert walks.num_rows == 20
+    assert all(len(v) == 4 and -1 not in v for v in walks.column("vertices").to_pylist())

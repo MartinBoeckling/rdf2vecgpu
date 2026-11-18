@@ -256,3 +256,28 @@ def test_gpu_batches_cover_every_row_once_per_epoch():
         seen = torch.cat([b[0] for b in batches])
         assert sorted(seen.tolist()) == list(range(1000))
         assert torch.equal(torch.cat([b[1] for b in batches]), seen + 5000)  # rows stay paired
+
+
+@pytest.mark.gpu
+def test_inmemory_walkseq_takes_int32_matrices_and_shuffles_every_epoch():
+    """Walks given as (vertices, predicates) GPU matrices: each epoch yields
+    every walk once, rows stay paired, the order changes between epochs, and
+    the int32 matrices are not copied to int64."""
+    import torch
+    from src.rdf2vecgpu.embedders.word2vec_loader import InMemoryWalkSeqDataModule
+
+    vertices = torch.arange(1000, device="cuda", dtype=torch.int32).repeat_interleave(4).view(1000, 4)
+    predicates = (vertices[:, :3] + 5000).contiguous()
+    dm = InMemoryWalkSeqDataModule((vertices, predicates), emit_batch_size=128, shuffle=True, seed=3)
+    dm.setup()
+    assert dm._iterable.vertices.data_ptr() == vertices.data_ptr()  # used as given
+    orders = []
+    for _ in range(2):
+        batches = list(dm.train_dataloader())
+        assert [len(b[0]) for b in batches] == [128] * 7 + [104]
+        v = torch.cat([b[0] for b in batches])
+        p = torch.cat([b[1] for b in batches])
+        assert sorted(v[:, 0].tolist()) == list(range(1000))
+        assert torch.equal(p, v[:, :3] + 5000)
+        orders.append(v[:, 0].tolist())
+    assert orders[0] != orders[1]
