@@ -254,3 +254,17 @@ def test_multi_gpu_without_client_only_fails_when_reading(tmp_path):
     assert model.client is None
     with pytest.raises(ValueError, match="needs a Dask client"):
         model.read_data(_small_kg(tmp_path))
+
+
+@pytest.mark.gpu
+def test_pytorch_progress_bar_refreshes_when_the_loss_is_logged(tmp_path):
+    """The progress bar redraws only on the steps the loss is logged (every
+    `log_every_n_steps`); redrawing it on every step costs a sizeable share
+    of a small training step."""
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    model = GPU_RDF2Vec(epochs=1, vector_size=4, window_size=2, walk_number=3, walk_depth=3)
+    model.fit(model.load_data(_small_kg(tmp_path)))
+
+    trainer = model.word2vec_model.trainer
+    assert trainer.progress_bar_callback.refresh_rate == trainer.log_every_n_steps > 1

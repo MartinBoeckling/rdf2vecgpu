@@ -1042,9 +1042,13 @@ class GPU_RDF2Vec:
             token_counts=token_counts,
         )
         self.tracker.log_pytorch()
+        log_every = 50
         trainer = L.Trainer(
             max_epochs=self.config.epochs,
-            log_every_n_steps=50,
+            log_every_n_steps=log_every,
+            # redraw the bar when the loss is logged, not on every step (that
+            # costs about a tenth of a small step)
+            callbacks=[L.pytorch.callbacks.TQDMProgressBar(refresh_rate=log_every)],
             accelerator="gpu",
             precision=32,
             devices=n_gpus,

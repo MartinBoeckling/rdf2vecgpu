@@ -197,7 +197,9 @@ class SkipGram(L.LightningModule):
             p_keep = self._get_p_keep(device)
             kept = torch.rand((n, length), device=device) < p_keep[seq.clamp(min=0)]
             keep = keep & kept[:, ii] & kept[:, jj]
-        keep = keep.reshape(-1)
+        # one index for all outputs: a boolean mask per output would make the
+        # host wait for the GPU once per output to learn the result's size
+        keep = keep.reshape(-1).nonzero().squeeze(1)
         if with_offsets:
             offsets = (jj - ii).repeat(n)
             return center[keep], context[keep], offsets[keep]
@@ -215,8 +217,18 @@ class SkipGram(L.LightningModule):
         # the gradient all-reduce (a detached zero would leave the others waiting).
         negative = self._sample_negatives(center.size(0), center.device)
         loss = self(center, context, negative, negative != context.unsqueeze(1))
-        self.log("train_loss", loss / max(1, center.size(0)), prog_bar=True)
+        self._log_loss(loss, center.size(0))
         return loss
+
+    def _log_loss(self, loss, n_examples):
+        """Log the mean loss per example, on the steps where the Trainer writes
+        step metrics (every ``log_every_n_steps``; values logged on the other
+        steps are dropped). A `self.log` call costs a sizeable share of a
+        small training step, so the other steps skip it."""
+        trainer = self._trainer
+        every = trainer.log_every_n_steps if trainer is not None else 1
+        if every and (self.global_step + 1) % every == 0:
+            self.log("train_loss", loss / max(1, n_examples), prog_bar=True)
 
     def configure_optimizers(self):
         optimizer = torch.optim.SGD(self.parameters(), lr=self.learning_rate)
@@ -309,7 +321,12 @@ class CBOWNegativeSampling(SkipGram):
         context = seq[:, template.clamp(min=0)]  # (n, length, 2w)
         mask = in_range.unsqueeze(0) & live[:, template.clamp(min=0)]
         keep = live & mask.any(dim=2)  # centre counts and has some context
-        return context[keep], mask[keep], seq[keep]
+        keep = keep.reshape(-1).nonzero().squeeze(1)  # one wait for the GPU, see _expand_skipgram
+        return (
+            context.reshape(-1, context.shape[-1])[keep],
+            mask.reshape(-1, mask.shape[-1])[keep],
+            seq.reshape(-1)[keep],
+        )
 
     def _cbow_loss(self, context, mask, center):
         weights = mask.to(self.in_embeddings.weight.dtype)
@@ -330,7 +347,7 @@ class CBOWNegativeSampling(SkipGram):
         context, mask, center = self._expand_cbow(vertices, predicates)
         # empty batches stay connected to the embeddings, see SkipGram.training_step
         loss = self._cbow_loss(context, mask, center)
-        self.log("train_loss", loss / max(1, center.size(0)), prog_bar=True)
+        self._log_loss(loss, center.size(0))
         return loss
 
 
@@ -372,7 +389,7 @@ class OrderAwareSkipGram(SkipGram):
             self._offset_rows(offsets.unsqueeze(1), negatives),
             negatives != context.unsqueeze(1),
         )
-        self.log("train_loss", loss / max(1, center.size(0)), prog_bar=True)
+        self._log_loss(loss, center.size(0))
         return loss
 
 

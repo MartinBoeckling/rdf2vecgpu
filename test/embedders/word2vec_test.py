@@ -1,5 +1,7 @@
 """SkipGram (sum loss, SGD with linear decay, gradient clipping, on-GPU pair
 expansion of walks, subsampling, unigram negatives) and CBOW embeddings."""
+import warnings
+
 import lightning as L
 import numpy as np
 import pytest
@@ -360,3 +362,75 @@ def test_negatives_equal_to_the_positive_token_are_left_out():
     )
     got = m(center, context, negative, negative != context.unsqueeze(1))
     assert torch.allclose(got, expected)
+
+
+def _gpu_waits(run):
+    """How many times `run()` makes the host wait for the GPU."""
+    torch.cuda.synchronize()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        torch.cuda.set_sync_debug_mode("warn")
+        try:
+            run()
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+    return sum("called a synchronizing CUDA operation" in str(w.message) for w in caught)
+
+
+def _gpu_walk_batch():
+    g = torch.Generator(device="cuda").manual_seed(0)
+    vertices = torch.randint(0, 40, (64, 5), device="cuda", generator=g)
+    predicates = torch.randint(40, 50, (64, 4), device="cuda", generator=g)
+    vertices[::3, 3:] = -1  # some walks end early
+    return vertices, predicates
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("with_offsets", [False, True])
+def test_expand_skipgram_waits_for_the_gpu_once(with_offsets):
+    """Building a batch's pairs waits for the GPU once (to learn how many pairs
+    survive); every further wait stalls the step's kernel queue."""
+    m = SkipGram(vocab_size=50, embedding_dim=4, neg_samples=1, window=2,
+                 sample=0.05, token_counts=np.arange(1, 51)).cuda()
+    vertices, predicates = _gpu_walk_batch()
+    m._expand_skipgram(vertices, predicates, with_offsets=with_offsets)  # builds the cached tables
+
+    assert _gpu_waits(lambda: m._expand_skipgram(vertices, predicates, with_offsets=with_offsets)) == 1
+
+
+@pytest.mark.gpu
+def test_expand_cbow_waits_for_the_gpu_once():
+    m = CBOWNegativeSampling(vocab_size=50, embedding_dim=4, neg_samples=1, window=2,
+                             sample=0.05, token_counts=np.arange(1, 51)).cuda()
+    vertices, predicates = _gpu_walk_batch()
+    m._expand_cbow(vertices, predicates)  # builds the cached tables
+
+    assert _gpu_waits(lambda: m._expand_cbow(vertices, predicates)) == 1
+
+
+@pytest.mark.parametrize("model_class", [SkipGram, CBOWNegativeSampling, OrderAwareSkipGram])
+def test_loss_is_logged_only_on_the_steps_the_trainer_writes(model_class, tmp_path):
+    """Lightning writes step metrics every `log_every_n_steps` steps and drops
+    values logged in between, so the models log only on those steps (a
+    `self.log` call costs a sizeable share of a small training step)."""
+    import csv
+
+    from lightning.pytorch.loggers import CSVLogger
+
+    g = torch.Generator().manual_seed(0)
+    vertices = torch.randint(0, 10, (400, 3), generator=g)
+    predicates = torch.randint(10, 20, (400, 2), generator=g)
+    loader = DataLoader(TensorDataset(vertices, predicates), batch_size=20)
+    model = model_class(vocab_size=20, embedding_dim=4, neg_samples=2, window=2)
+    calls = []
+    original_log = model.log
+    model.log = lambda *args, **kwargs: (calls.append(model.global_step), original_log(*args, **kwargs))
+    trainer = L.Trainer(max_steps=20, log_every_n_steps=5, accelerator="cpu", enable_checkpointing=False,
+                        enable_progress_bar=False, logger=CSVLogger(tmp_path, name="", version=""))
+    trainer.fit(model, loader)
+
+    assert calls == [4, 9, 14, 19]
+    with open(tmp_path / "metrics.csv") as handle:
+        written = [int(row["step"]) for row in csv.DictReader(handle) if row.get("train_loss")]
+    assert written == [4, 9, 14, 19]
+    assert "train_loss" in trainer.callback_metrics
