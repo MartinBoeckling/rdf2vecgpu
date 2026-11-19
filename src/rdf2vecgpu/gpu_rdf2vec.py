@@ -93,18 +93,22 @@ def _check_walk_files(walks: WalkParquet) -> None:
         )
 
 
-def _pairs_in_sequence(length: int, window: int) -> int:
+def _pairs_in_sequence(length: int, window: int, shrink: bool = False):
     """Ordered skip-gram pairs (i, j), 0 < |i - j| <= window, in a sequence
-    of `length` tokens."""
+    of `length` tokens; with ``shrink`` (each centre's window drawn uniformly
+    from 1..window) the expected count, a float."""
+    if shrink:
+        return sum(2 * (length - d) * (window - d + 1) / window for d in range(1, min(window, length - 1) + 1))
     return 2 * sum(length - d for d in range(1, min(window, length - 1) + 1))
 
 
-def _walk_statistics(batches, vocab_size: int, window: int, rows_per_slice: int = 1 << 23):
+def _walk_statistics(batches, vocab_size: int, window: int, rows_per_slice: int = 1 << 23,
+                     shrink: bool = False):
     """Token counts and skip-gram pair count of walks given as
     `(vertices, predicates)` tensor pairs of shape (n, depth + 1) and
     (n, depth). Returns a numpy int64 array of length `vocab_size` and an
-    int. Positions after a walk's end (vertex -1, and the predicate before
-    it) are not counted. Uses torch, on whatever device the tensors are on,
+    int (expected pairs with ``shrink``, rounded). Positions after a walk's
+    end (vertex -1, and the predicate before it) are not counted. Uses torch, on whatever device the tensors are on,
     `rows_per_slice` walks at a time: the int64 copies it works on stay
     small even when one pair holds a whole single-GPU corpus."""
     import numpy as np
@@ -127,9 +131,10 @@ def _walk_statistics(batches, vocab_size: int, window: int, rows_per_slice: int 
         # a walk with k vertices is a sequence of 2k - 1 tokens
         n_vertices = torch.bincount((vertices >= 0).sum(dim=1), minlength=vertices.shape[1] + 1).cpu()
         n_pairs += sum(
-            int(n) * _pairs_in_sequence(2 * k - 1, window) for k, n in enumerate(n_vertices.tolist()) if k >= 2
+            int(n) * _pairs_in_sequence(2 * k - 1, window, shrink)
+            for k, n in enumerate(n_vertices.tolist()) if k >= 2
         )
-    return counts.numpy().astype(np.int64), n_pairs
+    return counts.numpy().astype(np.int64), round(n_pairs)
 
 
 def _parquet_walk_batches(walks_path: str, chunk_rows: int = 1 << 20):
@@ -957,7 +962,8 @@ class GPU_RDF2Vec:
             if first is None:
                 raise ValueError(f"no walks in {walk_sequences.path}")
             token_counts, n_pairs = _walk_statistics(
-                _parquet_walk_batches(walk_sequences.path), vocab_size, self.config.window_size
+                _parquet_walk_batches(walk_sequences.path), vocab_size, self.config.window_size,
+                shrink=self.config.shrink_window,
             )
             # Every DDP rank must run the same number of steps, or one blocks
             # in the gradient all-reduce. Lightning starts the other ranks by
@@ -965,9 +971,12 @@ class GPU_RDF2Vec:
             # their own: size batches from what all ranks agree on, the walk
             # count and the pairs of a full-length walk, not the exact pairs.
             depth = first[0].shape[1] - 1
-            pairs_bound = walk_sequences.n_walks * skipgram_pairs_per_walk(depth, self.config.window_size)
+            pairs_bound = int(walk_sequences.n_walks * skipgram_pairs_per_walk(
+                depth, self.config.window_size, self.config.shrink_window
+            ))
             walks_per_batch = walks_per_pair_batch(
-                self._effective_batch_size(pairs_bound // max(1, n_gpus)), depth, self.config.window_size
+                self._effective_batch_size(pairs_bound // max(1, n_gpus)), depth, self.config.window_size,
+                shrink=self.config.shrink_window,
             )
             # every rank trains on n_walks // n_gpus walks (see _WalkSeqIterable)
             per_rank = walk_sequences.n_walks // max(1, n_gpus)
@@ -998,10 +1007,12 @@ class GPU_RDF2Vec:
             if walks.vertices.shape[0] == 0:
                 raise ValueError("no walks to train on")
             token_counts, n_pairs = _walk_statistics(
-                [(walks.vertices, walks.predicates)], vocab_size, self.config.window_size
+                [(walks.vertices, walks.predicates)], vocab_size, self.config.window_size,
+                shrink=self.config.shrink_window,
             )
             walks_per_batch = walks_per_pair_batch(
-                self._effective_batch_size(n_pairs), walks.vertices.shape[1] - 1, self.config.window_size
+                self._effective_batch_size(n_pairs), walks.vertices.shape[1] - 1, self.config.window_size,
+                shrink=self.config.shrink_window,
             )
             datamodule.emit_batch_size = walks.emit_batch_size = walks_per_batch
             n_walks = int(walks.vertices.shape[0])
@@ -1076,6 +1087,7 @@ class GPU_RDF2Vec:
             window=self.config.window_size,
             steps_per_epoch=steps_per_epoch,
             grad_clip_value=self.config.grad_clip_value,
+            shrink_window=self.config.shrink_window,
             sample=self.config.sample,
             negative_sampling="unigram",
             token_counts=token_counts,
@@ -1110,6 +1122,7 @@ class GPU_RDF2Vec:
                 "batch_size": self.config.batch_size,
                 "sample": self.config.sample,
                 "grad_clip_value": self.config.grad_clip_value,
+                "shrink_window": self.config.shrink_window,
                 "backend": "pytorch",
             }
         )

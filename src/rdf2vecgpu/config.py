@@ -127,6 +127,14 @@ class RDF2VecConfig(BaseModel):
         jRDF2Vec does by default). Used by skip-gram on random walks with
         ``backend="pytorch"`` and by ``backend="gensim"``.
 
+    shrink_window : bool, default False
+        Draw each centre token's context window uniformly from
+        1..``window_size``, as word2vec and gensim do ("reduced windows"),
+        instead of always using the full window, for the PyTorch skip-gram,
+        order-aware skip-gram and CBOW models. Near tokens then weigh more
+        than far ones, and a walk gives 33-40% fewer pairs (batches are
+        sized by the expected count). ``backend="gensim"`` always shrinks.
+
     grad_clip_value : float, default 1.0
         Per-component clip of the summed batch gradient for the PyTorch
         skip-gram, order-aware skip-gram and CBOW models, as a guard against
@@ -220,6 +228,7 @@ class RDF2VecConfig(BaseModel):
     learning_rate: Optional[float] = Field(default=None, gt=0)
     min_learning_rate: float = Field(default=0.0001, gt=0)
     sample: float = Field(default=0.001, ge=0)
+    shrink_window: bool = False
     grad_clip_value: float = Field(default=1.0, ge=0)
     backend: Literal["pytorch", "gensim"] = "pytorch"
     # library settings

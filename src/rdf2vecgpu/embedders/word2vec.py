@@ -47,6 +47,7 @@ class SkipGram(L.LightningModule):
         sample=0.0,
         negative_sampling="uniform",
         token_counts=None,
+        shrink_window=False,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["token_counts"])
@@ -64,6 +65,7 @@ class SkipGram(L.LightningModule):
         self.window = window
         self.steps_per_epoch = steps_per_epoch
         self.grad_clip_value = grad_clip_value
+        self.shrink_window = bool(shrink_window)
         self.sample = float(sample)
         self.negative_sampling = negative_sampling
         if token_counts is not None:
@@ -193,6 +195,10 @@ class SkipGram(L.LightningModule):
         center = seq[:, ii].reshape(-1)
         context = seq[:, jj].reshape(-1)
         keep = (ii.unsqueeze(0) < valid_len.unsqueeze(1)) & (jj.unsqueeze(0) < valid_len.unsqueeze(1))
+        if self.shrink_window:
+            # one window per centre token, uniform in 1..window (word2vec's reduced windows)
+            reach = torch.randint(1, self.window + 1, (n, length), device=device)
+            keep = keep & ((jj - ii).abs().unsqueeze(0) <= reach[:, ii])
         if self.sample > 0:
             p_keep = self._get_p_keep(device)
             kept = torch.rand((n, length), device=device) < p_keep[seq.clamp(min=0)]
@@ -320,6 +326,13 @@ class CBOWNegativeSampling(SkipGram):
         in_range = template >= 0
         context = seq[:, template.clamp(min=0)]  # (n, length, 2w)
         mask = in_range.unsqueeze(0) & live[:, template.clamp(min=0)]
+        if self.shrink_window:
+            # one window per centre token, uniform in 1..window, see _expand_skipgram
+            distance = torch.tensor(
+                [abs(d) for d in range(-self.window, self.window + 1) if d != 0], device=device
+            )
+            reach = torch.randint(1, self.window + 1, (n, length), device=device)
+            mask &= distance.view(1, 1, -1) <= reach.unsqueeze(-1)
         keep = live & mask.any(dim=2)  # centre counts and has some context
         keep = keep.reshape(-1).nonzero().squeeze(1)  # one wait for the GPU, see _expand_skipgram
         return (

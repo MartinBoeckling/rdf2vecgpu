@@ -434,3 +434,58 @@ def test_loss_is_logged_only_on_the_steps_the_trainer_writes(model_class, tmp_pa
         written = [int(row["step"]) for row in csv.DictReader(handle) if row.get("train_loss")]
     assert written == [4, 9, 14, 19]
     assert "train_loss" in trainer.callback_metrics
+
+
+def _windows_per_center(center_pos, context_pos, walk_of_pair):
+    """{(walk, center position): sorted context distances} of expanded pairs."""
+    out = {}
+    for w, c, x in zip(walk_of_pair, center_pos, context_pos):
+        out.setdefault((w, c), []).append(abs(x - c))
+    return {k: sorted(v) for k, v in out.items()}
+
+
+def test_shrink_window_draws_one_window_per_center_like_word2vec():
+    """With shrink_window, each centre token takes the contexts within a window
+    b drawn uniformly from 1..window (word2vec's reduced windows): its
+    contexts are every position within b on both sides, and b = d for a
+    centre in the middle of a long walk with probability 1/window."""
+    window, n, length = 3, 4000, 4
+    m = SkipGram(vocab_size=10_000, embedding_dim=4, neg_samples=1, window=window, shrink_window=True)
+    # token = walk * 9 + position, so pairs tell their walk and positions apart
+    seq = torch.arange(n * (2 * length + 1)).view(n, 2 * length + 1) % (2 * length + 1)
+    walk = torch.arange(n).unsqueeze(1)
+    vertices = walk * 100 + seq[:, 0::2]
+    predicates = walk * 100 + seq[:, 1::2]
+    center, context = m._expand_skipgram(vertices, predicates)
+    windows = _windows_per_center((center % 100).tolist(), (context % 100).tolist(), (center // 100).tolist())
+    middle = [d for (w, c), d in windows.items() if c == 4]  # 4 positions free on both sides
+    sizes = [max(d) for d in middle]
+    for d in middle:  # both sides, every distance up to the drawn window
+        assert d == sorted([k for k in range(1, max(d) + 1)] * 2)
+    share = np.bincount(sizes, minlength=window + 1)[1:] / len(sizes)
+    assert np.allclose(share, 1 / window, atol=0.03)
+    assert len(middle) == n  # every centre keeps at least distance 1
+
+
+def test_shrink_window_off_keeps_the_full_window():
+    m = SkipGram(vocab_size=20, embedding_dim=4, neg_samples=1, window=2)
+    assert m.shrink_window is False
+    center, _ = m._expand_skipgram(torch.tensor([[1, 2, 3]] * 50), torch.tensor([[10, 11]] * 50))
+    assert center.numel() == 50 * 14  # sequence of 5 tokens, window 2: 14 ordered pairs
+
+
+def test_cbow_shrink_window_masks_one_window_per_center():
+    from src.rdf2vecgpu.embedders.word2vec import CBOWNegativeSampling
+
+    window, n = 3, 3000
+    m = CBOWNegativeSampling(vocab_size=50, embedding_dim=4, neg_samples=1, window=window, shrink_window=True)
+    vertices = torch.tensor([[1, 2, 3, 4, 5]]).repeat(n, 1)
+    predicates = torch.tensor([[11, 12, 13, 14]]).repeat(n, 1)
+    context, mask, center = m._expand_cbow(vertices, predicates)
+    offsets = torch.tensor([d for d in range(-window, window + 1) if d != 0])
+    middle = center == 3  # position 4 of 9: room on both sides
+    used = mask[middle]
+    sizes = (used * offsets.abs()).max(dim=1).values
+    assert torch.equal(used, offsets.abs().unsqueeze(0) <= sizes.unsqueeze(1))  # contiguous, both sides
+    share = torch.bincount(sizes, minlength=window + 1)[1:].double() / len(sizes)
+    assert torch.allclose(share, torch.full((window,), 1 / window, dtype=torch.double), atol=0.03)

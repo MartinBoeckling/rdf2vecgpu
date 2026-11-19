@@ -146,3 +146,8 @@ def test_order_aware_skipgram_needs_pytorch_and_random_walks():
         RDF2VecConfig(embedding_model="order_aware_skipgram", backend="gensim")
     with pytest.raises(ValueError, match="needs walk_strategy='random'"):
         RDF2VecConfig(embedding_model="order_aware_skipgram", walk_strategy="bfs")
+
+
+def test_shrink_window_default_off():
+    assert RDF2VecConfig().shrink_window is False
+    assert RDF2VecConfig(shrink_window=True).shrink_window is True

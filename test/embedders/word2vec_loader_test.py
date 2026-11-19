@@ -281,3 +281,19 @@ def test_inmemory_walkseq_takes_int32_matrices_and_shuffles_every_epoch():
         assert torch.equal(p, v[:, :3] + 5000)
         orders.append(v[:, 0].tolist())
     assert orders[0] != orders[1]
+
+
+def test_pair_counts_with_shrunk_windows_are_the_expected_counts():
+    """With shrink_window a pair at distance d survives with probability
+    (window - d + 1) / window; batches are sized by that expected count."""
+    from src.rdf2vecgpu.embedders.word2vec_loader import skipgram_pairs_per_walk, walks_per_pair_batch
+
+    for depth, window in ((4, 5), (12, 5), (2, 3)):
+        length = 2 * depth + 1
+        brute = sum(
+            (window - abs(i - j) + 1) / window
+            for i in range(length) for j in range(length) if 0 < abs(i - j) <= window
+        )
+        assert skipgram_pairs_per_walk(depth, window, shrink=True) == pytest.approx(brute)
+        assert skipgram_pairs_per_walk(depth, window, shrink=False) == skipgram_pairs_per_walk(depth, window)
+        assert walks_per_pair_batch(32_768, depth, window, shrink=True) == int(32_768 // brute)

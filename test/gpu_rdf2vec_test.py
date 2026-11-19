@@ -119,6 +119,20 @@ def test_walk_statistics_count_tokens_and_pairs_of_walks_as_they_end():
     assert n_pairs == _pairs_in_sequence(5, 2) + _pairs_in_sequence(3, 2)
 
 
+def test_walk_statistics_expected_pairs_with_shrunk_windows():
+    import torch
+
+    from src.rdf2vecgpu.gpu_rdf2vec import _pairs_in_sequence, _walk_statistics
+
+    assert _pairs_in_sequence(9, 5, shrink=True) == pytest.approx(
+        sum((5 - abs(i - j) + 1) / 5 for i in range(9) for j in range(9) if 0 < abs(i - j) <= 5)
+    )
+    vertices = torch.tensor([[1, 2, 3], [4, 0, -1]])
+    predicates = torch.tensor([[5, 6], [7, 9]])
+    _, n_pairs = _walk_statistics([(vertices, predicates)], vocab_size=10, window=2, shrink=True)
+    assert n_pairs == round(_pairs_in_sequence(5, 2, shrink=True) + _pairs_in_sequence(3, 2, shrink=True))
+
+
 def test_walk_statistics_count_large_int32_corpora_in_row_slices():
     """The whole single-GPU corpus is one `(vertices, predicates)` pair of int32
     matrices; it is counted a slice of rows at a time (an int64 copy of all
@@ -350,3 +364,12 @@ def test_single_gpu_bfs_walks_train_like_random_walks(tmp_path, backend, model):
     # the 20-vertex cycle: from each vertex one path of 3 steps
     assert walks.num_rows == 20
     assert all(len(v) == 4 and -1 not in v for v in walks.column("vertices").to_pylist())
+
+
+@pytest.mark.gpu
+def test_shrink_window_reaches_the_pytorch_model(tmp_path):
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    rdf = GPU_RDF2Vec(epochs=1, vector_size=4, window_size=2, walk_number=3, walk_depth=3, shrink_window=True)
+    rdf.fit(rdf.load_data(_small_kg(tmp_path)))
+    assert rdf.word2vec_model.shrink_window is True
