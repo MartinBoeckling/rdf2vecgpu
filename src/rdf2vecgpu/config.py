@@ -87,10 +87,15 @@ class RDF2VecConfig(BaseModel):
         backend; None means 32768. Training uses at most 1/100 of the
         training pairs (per GPU) per step, so every epoch has at least 100
         steps; a larger value is reduced, with a warning when set explicitly.
-        Skip-gram on random walks fills each step with whole walks, so a step
-        holds about ``batch_size`` pairs (fewer when walks end early or
-        ``sample`` drops tokens). Larger batches train faster with slightly
-        lower embedding quality. Not used by ``backend="gensim"``.
+        Training on walk sequences fills each step with whole walks, as many
+        as hold about ``batch_size`` pairs on average after walks that end
+        early and ``sample`` subsampling are taken into account (estimated
+        from the walks before training), so the step size in pairs does not
+        depend on the walk depth. With ``multi_gpu`` DDP training all GPUs
+        must agree on the step count, so steps are sized for full-length
+        walks without subsampling and hold fewer pairs. Larger batches
+        train faster with slightly lower embedding quality. Not used by
+        ``backend="gensim"``.
 
     vector_size : int, default 256
         Dimensionality of the output embeddings.

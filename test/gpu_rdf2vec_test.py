@@ -150,6 +150,123 @@ def test_walk_statistics_count_large_int32_corpora_in_row_slices():
     assert sliced[0].tolist() == whole[0].tolist() and sliced[1] == whole[1]
 
 
+def _random_walks(n=1000, depth=4, seed=0):
+    """int32 walks over vertices 0..49 and predicates 50..59, every third
+    ending after its second vertex and every seventh after its first."""
+    import torch
+
+    g = torch.Generator().manual_seed(seed)
+    # skewed vertex ids, so subsampling keeps tokens with different chances
+    vertices = (torch.rand((n, depth + 1), generator=g) ** 3 * 50).to(torch.int32)
+    predicates = torch.randint(50, 60, (n, depth), generator=g, dtype=torch.int32)
+    vertices[::3, 2:] = -1
+    vertices[::7, 1:] = -1
+    return vertices, predicates
+
+
+def test_expected_pairs_without_subsampling_are_the_pair_count():
+    from src.rdf2vecgpu.gpu_rdf2vec import _expected_pairs, _walk_statistics
+
+    vertices, predicates = _random_walks()
+    for window in (1, 2, 5):
+        for shrink in (False, True):
+            _, n_pairs = _walk_statistics([(vertices, predicates)], vocab_size=60, window=window, shrink=shrink)
+            assert _expected_pairs(vertices, predicates, window, shrink) == pytest.approx(n_pairs, abs=0.5)
+
+
+def test_walk_statistics_with_subsampling_count_the_pairs_expected_to_survive():
+    """A subsampled token occurrence takes all its pairs with it, so a pair
+    survives with the product of both tokens' keep probabilities."""
+    import torch
+
+    from src.rdf2vecgpu.embedders.word2vec import subsample_keep_probability
+    from src.rdf2vecgpu.gpu_rdf2vec import _walk_statistics
+
+    vertices, predicates = _random_walks()
+    counts, n_pairs = _walk_statistics([(vertices, predicates)], vocab_size=60, window=3)
+    keep = subsample_keep_probability(torch.from_numpy(counts), 0.01).double().tolist()
+    assert min(keep) < 0.5  # subsampling matters on this corpus
+    for shrink in (False, True):
+        expected = 0.0
+        for v, p in zip(vertices.tolist(), predicates.tolist()):
+            k = v.index(-1) if -1 in v else len(v)
+            tokens = [t for pair in zip(v[:k], p[:k - 1] + [None]) for t in pair if t is not None]
+            for i in range(len(tokens)):
+                for j in range(len(tokens)):
+                    d = abs(i - j)
+                    if 0 < d <= 3:
+                        weight = (3 - d + 1) / 3 if shrink else 1.0
+                        expected += weight * keep[tokens[i]] * keep[tokens[j]]
+        sub_counts, sub_pairs = _walk_statistics(
+            [(vertices, predicates)], vocab_size=60, window=3, shrink=shrink, sample=0.01
+        )
+        assert sub_counts.tolist() == counts.tolist()
+        assert sub_pairs == pytest.approx(expected, abs=1)
+        assert sub_pairs < n_pairs
+
+
+def test_walk_statistics_measure_subsampling_on_every_kth_walk():
+    """With `n_walks` given, the surviving share comes from every k-th walk
+    of the whole corpus (k = n_walks // sample_walks), across slices."""
+    import torch
+
+    from src.rdf2vecgpu.embedders.word2vec import subsample_keep_probability
+    from src.rdf2vecgpu.gpu_rdf2vec import _expected_pairs, _walk_statistics
+
+    vertices, predicates = _random_walks()
+    counts, n_pairs = _walk_statistics([(vertices, predicates)], vocab_size=60, window=3)
+    keep = subsample_keep_probability(torch.from_numpy(counts), 0.01)
+    rows = slice(0, None, 10)
+    share = (_expected_pairs(vertices[rows], predicates[rows], 3, keep_probability=keep)
+             / _expected_pairs(vertices[rows], predicates[rows], 3))
+    halves = [(vertices[:333], predicates[:333]), (vertices[333:], predicates[333:])]
+    _, estimate = _walk_statistics(halves, vocab_size=60, window=3, rows_per_slice=7, sample=0.01,
+                                   n_walks=1000, sample_walks=100)
+    assert estimate == round(n_pairs * share)
+
+
+def test_walks_per_step_hold_about_the_batch_in_expected_pairs():
+    from src.rdf2vecgpu.gpu_rdf2vec import _walks_per_step
+
+    assert _walks_per_step(32_768, 327_680, 1000) == 100
+    assert _walks_per_step(32_768, 3_276_800, 1000) == 10
+    assert _walks_per_step(10, 3_276_800, 1000) == 1  # never 0
+    assert _walks_per_step(32_768, 1000, 1000) == 1000  # never more than all walks
+    assert _walks_per_step(32_768, 0, 1000) == 1000
+
+
+@pytest.mark.gpu
+def test_pytorch_steps_are_sized_by_the_pairs_training_builds(tmp_path, monkeypatch):
+    """One GPU: walks per step come from the expected pairs after early walk
+    ends and subsampling, not from the pairs of a full-length walk."""
+    from src.rdf2vecgpu.embedders.word2vec_loader import walks_per_pair_batch
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec, _walk_statistics, _walks_per_step
+
+    class Stop(Exception):
+        pass
+
+    seen = {}
+
+    def record(self, datamodule, *, token_counts, steps_per_epoch, n_gpus):
+        seen.update(datamodule=datamodule, steps=steps_per_epoch)
+        raise Stop
+
+    monkeypatch.setattr(GPU_RDF2Vec, "_train_pytorch_sequences", record)
+    # batch 4 stays under the 1/100-of-the-pairs cap of this tiny corpus
+    rdf = GPU_RDF2Vec(epochs=1, vector_size=4, window_size=2, walk_number=50, walk_depth=3, batch_size=4)
+    with pytest.raises(Stop):
+        rdf.fit(rdf.load_data(_small_kg(tmp_path)))
+    walks = seen["datamodule"]._iterable
+    n_walks = int(walks.vertices.shape[0])
+    _, n_pairs = _walk_statistics([(walks.vertices, walks.predicates)], rdf.word2idx.shape[0], 2,
+                                  sample=rdf.config.sample, n_walks=n_walks)
+    assert rdf._effective_batch_size(n_pairs) == 4
+    assert walks.emit_batch_size == _walks_per_step(4, n_pairs, n_walks)
+    # subsampling drops most pairs of this tiny corpus: more walks per step
+    assert walks.emit_batch_size > 2 * walks_per_pair_batch(4, 3, 2)
+    assert seen["steps"] == -(-n_walks // walks.emit_batch_size)
+
+
 @pytest.mark.gpu
 def test_batch_size_is_capped_to_one_hundredth_of_the_pairs():
     from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec

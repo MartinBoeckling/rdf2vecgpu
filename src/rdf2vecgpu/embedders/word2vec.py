@@ -6,6 +6,17 @@ import numpy as np
 from torch.nn import functional as F
 
 
+def subsample_keep_probability(counts, sample):
+    """Keep probability per token for frequent-token subsampling, as in
+    gensim: with corpus frequency z = count / total, (sqrt(z / sample) + 1)
+    * sample / z, at most 1 (tokens rarer than ``sample`` are always kept).
+    `counts` is a tensor of token counts; returns float32 on its device."""
+    counts = counts.to(torch.float64)
+    z = (counts / counts.sum().clamp(min=1.0)).clamp(min=1e-30)
+    p = (torch.sqrt(z / sample) + 1.0) * (sample / z)
+    return p.clamp(max=1.0).to(torch.float32)
+
+
 class SkipGram(L.LightningModule):
     """Skip-gram with negative sampling, trained the way word2vec and gensim do.
 
@@ -106,10 +117,7 @@ class SkipGram(L.LightningModule):
         gensim: with corpus frequency z, (sqrt(z / sample) + 1) * sample / z,
         at most 1 (tokens rarer than ``sample`` are always kept)."""
         if self._p_keep is None or self._p_keep.device != device:
-            counts = self._token_counts.to(device)
-            z = (counts / counts.sum().clamp(min=1.0)).clamp(min=1e-30)
-            p = (torch.sqrt(z / self.sample) + 1.0) * (self.sample / z)
-            self._p_keep = p.clamp(max=1.0).to(torch.float32)
+            self._p_keep = subsample_keep_probability(self._token_counts.to(device), self.sample)
         return self._p_keep
 
     def _get_neg_cdf(self, device):

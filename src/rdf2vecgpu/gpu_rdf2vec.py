@@ -6,7 +6,13 @@ import lightning as L
 import torch
 import dask
 from .helper.functions import _generate_vocab, cudf_to_torch_tensor
-from .embedders.word2vec import CBOW, CBOWNegativeSampling, OrderAwareSkipGram, SkipGram
+from .embedders.word2vec import (
+    CBOW,
+    CBOWNegativeSampling,
+    OrderAwareSkipGram,
+    SkipGram,
+    subsample_keep_probability,
+)
 from .embedders.word2vec_loader import (
     CBOWDataModule,
     InMemoryWalkSeqDataModule,
@@ -102,13 +108,56 @@ def _pairs_in_sequence(length: int, window: int, shrink: bool = False):
     return 2 * sum(length - d for d in range(1, min(window, length - 1) + 1))
 
 
+def _walk_sequence_matrix(vertices, predicates):
+    """The interleaved token sequences v0, p0, v1, p1, ... of walks as an
+    (n, 2 * (depth + 1) - 1) int64 matrix, and the length each walk really
+    has: positions from the first ``-1`` vertex on (and the predicate before
+    it) are past the walk's end."""
+    n, n_vertices = vertices.shape
+    seq = torch.full((n, 2 * n_vertices - 1), -1, dtype=torch.long, device=vertices.device)
+    seq[:, 0::2] = vertices
+    seq[:, 1::2] = predicates[:, : n_vertices - 1]
+    padded = vertices.eq(-1)
+    first_pad = torch.where(
+        padded.any(dim=1),
+        padded.long().argmax(dim=1),
+        torch.full((n,), n_vertices, dtype=torch.long, device=vertices.device),
+    )
+    return seq, (2 * first_pad - 1).clamp(min=0)
+
+
+def _expected_pairs(vertices, predicates, window: int, shrink: bool = False, keep_probability=None) -> float:
+    """Expected skip-gram pairs (i, j), 0 < |i - j| <= window, of walks as
+    the models build them: only positions before a walk's end, each token
+    occurrence kept with probability ``keep_probability[token]`` (all kept
+    when None), and with ``shrink`` a pair at distance d kept with
+    probability (window - d + 1) / window."""
+    seq, valid_len = _walk_sequence_matrix(vertices.long(), predicates.long())
+    positions = torch.arange(seq.shape[1], device=seq.device)
+    p = (positions.unsqueeze(0) < valid_len.unsqueeze(1)).to(torch.float64)
+    if keep_probability is not None:
+        p = p * keep_probability.to(seq.device, torch.float64)[seq.clamp(min=0)]
+    total = 0.0
+    for d in range(1, min(window, seq.shape[1] - 1) + 1):
+        weight = (window - d + 1) / window if shrink else 1.0
+        total += 2 * weight * float((p[:, :-d] * p[:, d:]).sum())
+    return total
+
+
 def _walk_statistics(batches, vocab_size: int, window: int, rows_per_slice: int = 1 << 23,
-                     shrink: bool = False):
+                     shrink: bool = False, sample: float = 0.0, n_walks=None,
+                     sample_walks: int = 1 << 18):
     """Token counts and skip-gram pair count of walks given as
     `(vertices, predicates)` tensor pairs of shape (n, depth + 1) and
     (n, depth). Returns a numpy int64 array of length `vocab_size` and an
-    int (expected pairs with ``shrink``, rounded). Positions after a walk's
-    end (vertex -1, and the predicate before it) are not counted. Uses torch, on whatever device the tensors are on,
+    int: the expected pairs a training epoch builds. Positions after a
+    walk's end (vertex -1, and the predicate before it) are not counted;
+    with ``shrink`` pairs count with their chance to fall in the drawn
+    window. With ``sample > 0`` (frequent-token subsampling, which drops a
+    token occurrence and every pair it is in) the count is scaled by the
+    share of pairs that survive subsampling, measured on every k-th walk so
+    that about `sample_walks` of the `n_walks` walks are used (all when
+    `n_walks` is None). Uses torch, on whatever device the tensors are on,
     `rows_per_slice` walks at a time: the int64 copies it works on stay
     small even when one pair holds a whole single-GPU corpus."""
     import numpy as np
@@ -118,9 +167,16 @@ def _walk_statistics(batches, vocab_size: int, window: int, rows_per_slice: int 
             for start in range(0, len(vertices), rows_per_slice):
                 yield vertices[start:start + rows_per_slice], predicates[start:start + rows_per_slice]
 
+    stride = max(1, int(n_walks) // sample_walks) if n_walks else 1
+    kept_rows = []
+    seen = 0
     counts = torch.zeros(vocab_size, dtype=torch.int64)
     n_pairs = 0
     for vertices, predicates in slices():
+        if sample > 0:
+            first = (-seen) % stride  # global row index divisible by stride
+            kept_rows.append((vertices[first::stride], predicates[first::stride]))
+        seen += len(vertices)
         vertices = vertices.long()
         predicates = predicates.long()
         reached = vertices[:, 1 : predicates.shape[1] + 1] >= 0
@@ -134,7 +190,25 @@ def _walk_statistics(batches, vocab_size: int, window: int, rows_per_slice: int 
             int(n) * _pairs_in_sequence(2 * k - 1, window, shrink)
             for k, n in enumerate(n_vertices.tolist()) if k >= 2
         )
+    if sample > 0 and n_pairs > 0:
+        keep = subsample_keep_probability(counts, sample)
+        all_pairs = survive = 0.0
+        for vertices, predicates in kept_rows:
+            if len(vertices):
+                all_pairs += _expected_pairs(vertices, predicates, window, shrink)
+                survive += _expected_pairs(vertices, predicates, window, shrink, keep)
+        if all_pairs > 0:
+            n_pairs *= survive / all_pairs
     return counts.numpy().astype(np.int64), round(n_pairs)
+
+
+def _walks_per_step(batch_pairs: int, n_pairs: int, n_walks: int) -> int:
+    """Walks per training step so that a step holds about `batch_pairs` of
+    the `n_pairs` expected pairs of `n_walks` walks; at least 1 and at most
+    all walks."""
+    if n_pairs <= 0:
+        return max(1, n_walks)
+    return max(1, min(n_walks, int(batch_pairs * n_walks // n_pairs)))
 
 
 def _parquet_walk_batches(walks_path: str, chunk_rows: int = 1 << 20):
@@ -963,21 +1037,28 @@ class GPU_RDF2Vec:
                 raise ValueError(f"no walks in {walk_sequences.path}")
             token_counts, n_pairs = _walk_statistics(
                 _parquet_walk_batches(walk_sequences.path), vocab_size, self.config.window_size,
-                shrink=self.config.shrink_window,
+                shrink=self.config.shrink_window, sample=self.config.sample, n_walks=walk_sequences.n_walks,
             )
-            # Every DDP rank must run the same number of steps, or one blocks
-            # in the gradient all-reduce. Lightning starts the other ranks by
-            # running the script again, so after fit() they may hold walks of
-            # their own: size batches from what all ranks agree on, the walk
-            # count and the pairs of a full-length walk, not the exact pairs.
-            depth = first[0].shape[1] - 1
-            pairs_bound = int(walk_sequences.n_walks * skipgram_pairs_per_walk(
-                depth, self.config.window_size, self.config.shrink_window
-            ))
-            walks_per_batch = walks_per_pair_batch(
-                self._effective_batch_size(pairs_bound // max(1, n_gpus)), depth, self.config.window_size,
-                shrink=self.config.shrink_window,
-            )
+            if n_gpus * self.config.num_nodes <= 1:
+                # one process: size steps by the expected pairs, as in memory
+                walks_per_batch = _walks_per_step(
+                    self._effective_batch_size(n_pairs), n_pairs, walk_sequences.n_walks
+                )
+            else:
+                # Every DDP rank must run the same number of steps, or one
+                # blocks in the gradient all-reduce. Lightning starts the other
+                # ranks by running the script again, so after fit() they may
+                # hold walks of their own: size batches from what all ranks
+                # agree on, the walk count and the pairs of a full-length walk
+                # without subsampling, not the expected pairs.
+                depth = first[0].shape[1] - 1
+                pairs_bound = int(walk_sequences.n_walks * skipgram_pairs_per_walk(
+                    depth, self.config.window_size, self.config.shrink_window
+                ))
+                walks_per_batch = walks_per_pair_batch(
+                    self._effective_batch_size(pairs_bound // max(1, n_gpus)), depth, self.config.window_size,
+                    shrink=self.config.shrink_window,
+                )
             # every rank trains on n_walks // n_gpus walks (see _WalkSeqIterable)
             per_rank = walk_sequences.n_walks // max(1, n_gpus)
             steps_per_epoch = max(1, -(-per_rank // walks_per_batch))
@@ -1006,16 +1087,15 @@ class GPU_RDF2Vec:
             walks = datamodule._iterable
             if walks.vertices.shape[0] == 0:
                 raise ValueError("no walks to train on")
+            n_walks = int(walks.vertices.shape[0])
             token_counts, n_pairs = _walk_statistics(
                 [(walks.vertices, walks.predicates)], vocab_size, self.config.window_size,
-                shrink=self.config.shrink_window,
+                shrink=self.config.shrink_window, sample=self.config.sample, n_walks=n_walks,
             )
-            walks_per_batch = walks_per_pair_batch(
-                self._effective_batch_size(n_pairs), walks.vertices.shape[1] - 1, self.config.window_size,
-                shrink=self.config.shrink_window,
-            )
+            # a step holds about batch_size of the pairs training really
+            # builds (after early walk ends and subsampling), at any depth
+            walks_per_batch = _walks_per_step(self._effective_batch_size(n_pairs), n_pairs, n_walks)
             datamodule.emit_batch_size = walks.emit_batch_size = walks_per_batch
-            n_walks = int(walks.vertices.shape[0])
             steps_per_epoch = max(1, -(-n_walks // walks_per_batch))
         self._walked_mask = token_counts > 0
         logger.info(
