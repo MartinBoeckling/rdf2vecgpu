@@ -5,6 +5,138 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — unreleased
+
+Faster training and closer parity with jRDF2Vec. PyTorch skip-gram trains
+from the walks as sequences on the GPU instead of expanding them into pairs
+up front, trains like word2vec (SGD, linearly decaying learning rate,
+subsampling) and gains CBOW and order-aware skip-gram on walk sequences.
+Walks can be generated once and trained on later (`prepare_corpus` /
+`fit_from_walks`). On FB15k-237 (100 walks, depth 4, 5 epochs) PyTorch on
+one RTX A6000 now takes 43 s end to end, 3.1x faster than jRDF2Vec with 16
+CPU threads on the same machine; 0.5.0 took 594 s, 4.6x slower than
+jRDF2Vec. Across FB15k-237 runs of 100–1000 walks and depth 4–12, 0.6.0 is
+2.9–3.6x faster than jRDF2Vec and 40–90x faster than pyRDF2Vec (see the
+performance page). Walk corpora larger than cuDF's 2^31-element column limit
+now train on one GPU.
+
+### Added
+
+- `prepare_corpus(edge_df, out_dir)` writes the walks (Parquet, one row per
+  walk with `vertices` / `predicates` token lists) and `word2idx.parquet`;
+  `fit_from_walks(walks_path, vocab_path)` trains on them without a graph or
+  `load_data`, with PyTorch on one GPU or DDP across the node's GPUs, or with
+  gensim. This is jRDF2Vec's `-onlyWalks` / `-onlyTraining`: walks can be
+  generated once and trained on several times, and multi-GPU training needs
+  no Dask client, since the processes Lightning starts per GPU only read the
+  files. `GPU_RDF2Vec(multi_gpu=True)` no longer requires a client at
+  construction; `read_data` / `load_data` raise without one.
+- `embedding_model="order_aware_skipgram"` (RDF2Vec_oa, Ling et al. 2015):
+  one output embedding per position in the context window. PyTorch and random
+  walks only.
+- PyTorch CBOW with negative sampling on walk sequences (gensim's `sg=0`,
+  `cbow_mean=1`), on one GPU, with DDP and via `fit_from_walks`.
+- New `RDF2VecConfig` options:
+  - `sample` (default 0.001): frequent-token subsampling as gensim's
+    `sample`; also passed to the gensim backend.
+  - `min_learning_rate` (default 0.0001): the learning rate decays linearly
+    to it over training (gensim's `min_alpha`).
+  - `grad_clip_value` (default 1.0, 0 turns it off): per-component gradient
+    clip of the PyTorch models.
+  - `shrink_window` (default False): draw each centre token's window
+    uniformly from 1..`window_size`, as word2vec and gensim do. About a third
+    fewer pairs and 30-36% less training time on FB15k-237, but lower
+    embedding quality in our checks, so it is off by default.
+- BFS walks on one GPU are walk sequences like random walks (one
+  root-to-leaf path per leaf of each root's BFS tree), so they train with the
+  same sequence trainers and also work with gensim and `prepare_corpus`.
+
+### Changed
+
+- **`batch_size` means real training pairs per step.** It defaults to 32768
+  (Lightning's batch-size tuner and its 8192 cap are gone). On one process,
+  steps are sized from the pairs training actually builds after walks that
+  end early and `sample` subsampling, estimated before training, so a step
+  holds about `batch_size` pairs at every walk depth. Before, the count
+  assumed full-length walks that kept every token, so a step held ~15k pairs
+  at depth 4 and ~8k at depth 12, and deeper walks took more steps: the same
+  `batch_size` now gives fewer, larger steps. DDP keeps the full-walk bound,
+  because all ranks must agree on the step count. A step uses at most 1/100
+  of the training pairs per GPU (at least 100 steps per epoch); an explicit
+  `batch_size` reduced by this rule is logged as a warning.
+- PyTorch skip-gram, CBOW and order-aware skip-gram train like word2vec /
+  gensim: summed loss, sparse SGD with a linearly decaying learning rate,
+  unigram^0.75 negatives, output tables initialised to zero, and negatives
+  equal to the target left out of the loss. `learning_rate` defaults to
+  0.025 for every model; only PyTorch CBOW on BFS walks keeps Adam with
+  0.0001.
+- Tokens that occur in no walk are not trained and come back from
+  `transform()` as zeros, also after `save()` / `load()`
+  (`walked_tokens.npy`).
+- `cpu_count` (gensim threads) defaults to the CPU cores available to the
+  process instead of 4.
+- Single-GPU walks are generated in chunks of at most 25 M walks per cuGraph
+  call and kept as int32 matrices. PyTorch trains on them in GPU memory; gensim
+  and `prepare_corpus` write each chunk straight to Parquet.
+- Multi-GPU PyTorch CBOW is only refused on BFS walks now (it trains on
+  random walks).
+
+### Deprecated
+
+- `tune_batch_size` is ignored and raises a `FutureWarning`; it will be
+  removed in 0.7.0. Set `batch_size` instead.
+
+### Removed
+
+- The looped `OrderAwareSkipgram` / `OrderAwareCBOW` models and their
+  DataModules, which the config could not reach.
+
+### Fixed
+
+- The PyTorch gradient clip of 0.1 per component cut the updates of frequent
+  tokens (predicates, hub entities) by orders of magnitude, so embedding
+  quality dropped below gensim's. With 1.0, on the KGrEAT tasks on DBpedia
+  2016 (RDF2Vec Light, 3 seeds), skip-gram matches or beats gensim on all ten,
+  and CBOW and order-aware skip-gram are on par with gensim and wang2vec's
+  structured skip-gram (see the performance page of the docs).
+- Single-GPU random walks on large graphs ran out of GPU memory within
+  seconds, for both trainers, or exceeded cuDF's 2^31-element column limit.
+- Single-GPU BFS walks ran out of GPU memory on FB15k-237 and
+  random_graph_10000 (depth 4).
+- A DDP batch whose pairs were all subsampled away detached the loss from
+  the embeddings, which left that rank out of the gradient all-reduce and hung
+  the others until the NCCL timeout.
+- Start vertices passed to `fit()` are cast to the graph's vertex dtype
+  (token ids of a small vocabulary are int8, which cuGraph rejects).
+
+### Performance
+
+End to end on one RTX A6000, median of 3 runs, 5 epochs, 16 CPU threads for
+the CPU trainers, seconds, all on the same machine (0.5.0 ran out of GPU
+memory at 500 walks of depth 8 and at 1000 walks of depth 4):
+
+| FB15k-237, random walks | 0.6.0 PyTorch | 0.6.0 gensim | 0.5.0 PyTorch | jRDF2Vec | pyRDF2Vec |
+|---|---|---|---|---|---|
+| 100 walks, depth 4 | 42.6 | 82.1 | 593.6 | 130.2 | 1,728 |
+| 100 walks, depth 12 | 71.1 | 131.4 | 1,291.3 | 217.1 | 3,811 |
+| 500 walks, depth 4 | 160.1 | 355.8 | 2,955.6 | 574.0 | 12,226 |
+| 1000 walks, depth 8 | 491.6 | 985.5 | out of memory | 1,624.7 | 35,500 |
+
+- Training pairs are shuffled and batched on the GPU instead of through a
+  Python index list per epoch (pair-based paths: ~95 s on FB15k-237 whatever
+  the batch size).
+- Steps sized by real pairs (see `batch_size` above): skip-gram training on
+  FB15k-237 30.6 → 18.0 s at depth 4 and 108.4 → 36.4 s at depth 12.
+- The PyTorch models log the loss and redraw the progress bar only on
+  logging steps, and a batch's pairs are filtered with one index, so the host
+  waits for the GPU once per batch (~20% less training time).
+- The gensim backend reads walk batches as numpy token matrices instead of
+  building strings walk by walk in Python: one pass over 1.45 M walks
+  14.0 → 1.1 s at depth 4.
+- Unigram negatives are drawn with `torch.searchsorted` on a CDF built once
+  instead of `torch.multinomial` over the whole vocabulary every step.
+- BFS on FB15k-237 depth 4: 1,586 s end to end.
+
 ## [0.5.0] — 2026-11-09
 
 Walk-generation fixes and a chunked multi-GPU walk writer. 0.4.0 was not

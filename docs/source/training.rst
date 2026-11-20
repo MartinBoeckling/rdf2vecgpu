@@ -18,13 +18,15 @@ Below, we outline the main steps that are performed during the training process:
    for efficient graph traversal and walk generation. When ``walk_weighted=True``, cuGraph's
    ``biased_random_walks`` is used and the input must contain a ``weights`` column.
 
-3. **Data Preparation**: The generated walks are converted into a format suitable for the
-   embedding model using cuDF dataframes, which are handed off to PyTorch tensors via DLPack to
-   avoid CPU bottlenecks.
+3. **Data Preparation**: With ``backend="pytorch"`` the walks stay in GPU memory as int32 token
+   matrices. Every training step takes a shuffled batch of walks, drops frequent tokens
+   (``sample``) and builds that batch's (center, context) pairs on the GPU, so the full pair
+   list is never materialised. With ``backend="gensim"`` the walks are written to Parquet and
+   streamed to gensim.
 
-4. **Embedding Training**: The Word2Vec model is trained on the prepared walks. The package uses
-   an optimized implementation of Word2Vec that leverages GPU acceleration for faster training times
-   and allows scaling across different nodes and GPUs via PyTorch Lightning and Dask.
+4. **Embedding Training**: skip-gram, CBOW or order-aware skip-gram with negative sampling, trained
+   with PyTorch Lightning like word2vec (summed loss, sparse SGD, learning rate decaying linearly
+   from ``learning_rate`` to ``min_learning_rate``), on one GPU or with DDP across GPUs and nodes.
 
 5. **Model Saving**: After training, the learned embeddings can be saved to disk for later use.
 
@@ -46,7 +48,6 @@ Here is an example code snippet demonstrating how to train RDF2vec embeddings us
        vector_size=100,
        window_size=5,
        min_count=1,
-       learning_rate=0.01,
        negative_samples=5,
        random_state=42,
        reproducible=False,
@@ -63,6 +64,41 @@ Here is an example code snippet demonstrating how to train RDF2vec embeddings us
    gpu_rdf2vec_model.fit(edge_df=edge_data, walk_vertices=None)
 
 
+Batch size
+~~~~~~~~~~
+``batch_size`` (default 32768) is the number of (center, context) pairs per training step. On one
+GPU, the number of walks per step is chosen before training so that a step holds about
+``batch_size`` pairs after subsampling and after walks that end early, whatever the walk depth.
+Under DDP every rank must run the same number of steps, so the walks per step are sized for
+full-length walks instead, and steps hold fewer pairs than ``batch_size``. A step never uses more
+than 1/100 of the training pairs (per GPU), so every epoch has at least 100 steps.
+
+Larger batches train faster with fewer steps, at some cost in embedding quality: in our checks on
+FB15k-237, doubling the batch to 65k pairs lowered quality by about 1% at depth 4. ``shrink_window=True`` draws each window size
+uniformly from 1..``window_size`` as word2vec does: about a third fewer pairs and faster training,
+at somewhat lower embedding quality.
+
+Generating walks once and training later
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+``prepare_corpus`` writes the walks and the vocabulary to a directory, and ``fit_from_walks``
+trains from them without the graph and without ``load_data`` (as jRDF2Vec's ``-onlyWalks`` and
+``-onlyTraining``). Walks can be generated once and trained on with several configurations:
+
+.. code-block:: python
+
+   from rdf2vecgpu import GPU_RDF2Vec, RDF2VecConfig
+
+   walker = GPU_RDF2Vec(config=RDF2VecConfig(walk_depth=4, walk_number=100))
+   edge_data = walker.load_data("data/fb15k/fb15k_kg.parquet")
+   walks_path, vocab_path = walker.prepare_corpus(edge_data, "corpus/fb15k")
+
+   # later, possibly in another process
+   model = GPU_RDF2Vec(config=RDF2VecConfig(embedding_model="order_aware_skipgram", epochs=5))
+   model.fit_from_walks(walks_path, vocab_path)
+   embeddings = model.transform()
+
+``prepare_corpus`` supports random walks only.
+
 Multi-GPU training
 ~~~~~~~~~~~~~~~~~~
 With ``multi_gpu=True`` the walks are written to a temporary parquet directory
@@ -74,9 +110,14 @@ corpora can take hundreds of GB, so point ``TMPDIR`` at a disk with enough space
   node (as with a ``LocalCUDACluster``). Training stops with an error if walk
   files are missing.
 * ``backend="pytorch"`` trains with DDP. On one node, Lightning starts one
-  process per GPU itself; when SLURM starts one task per GPU
-  (``srun --ntasks-per-node=<GPUs>``), the launch is left to SLURM.
-* Multi-GPU CBOW needs ``backend="gensim"``.
+  process per GPU itself by running the training script again; when SLURM
+  starts one task per GPU (``srun --ntasks-per-node=<GPUs>``), the launch is
+  left to SLURM. Each started process repeats the script, including data
+  loading and walk generation, so for multi-GPU training it is usually better
+  to write the walks with ``prepare_corpus`` first and train with
+  ``fit_from_walks`` and ``multi_gpu=True``, which needs no Dask client.
+* Multi-GPU PyTorch CBOW is supported on random walks; on BFS walks it needs
+  ``backend="gensim"``.
 
 Pipeline stages and experiment tracking
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
