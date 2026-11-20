@@ -1,0 +1,571 @@
+{
+ "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+ "title": {
+  "text": "Speed-up of rdf2vecgpu (PyTorch) over the CPU implementations",
+  "subtitle": "rdf2vecgpu 0.6.0 · RTX A6000, 16 CPU threads · median of 3",
+  "anchor": "start"
+ },
+ "data": {
+  "values": [
+   {
+    "group": "FB15k-237",
+    "row": "100 walks, depth 4",
+    "framework": "jRDF2Vec",
+    "speedup": 3.056429644937065,
+    "ok": true,
+    "label": "3.1×",
+    "times": "42.6 s vs 2.2 min"
+   },
+   {
+    "group": "FB15k-237",
+    "row": "100 walks, depth 4",
+    "framework": "pyRDF2Vec",
+    "speedup": 40.5860651888033,
+    "ok": true,
+    "label": "40.6×",
+    "times": "42.6 s vs 28.8 min"
+   },
+   {
+    "group": "FB15k-237",
+    "row": "100 walks, depth 8",
+    "framework": "jRDF2Vec",
+    "speedup": 2.8670471768082293,
+    "ok": true,
+    "label": "2.9×",
+    "times": "62.0 s vs 3.0 min"
+   },
+   {
+    "group": "FB15k-237",
+    "row": "100 walks, depth 8",
+    "framework": "pyRDF2Vec",
+    "speedup": 45.66579600786818,
+    "ok": true,
+    "label": "45.7×",
+    "times": "62.0 s vs 47.2 min"
+   },
+   {
+    "group": "FB15k-237",
+    "row": "100 walks, depth 12",
+    "framework": "jRDF2Vec",
+    "speedup": 3.0536156443444007,
+    "ok": true,
+    "label": "3.1×",
+    "times": "71.1 s vs 3.6 min"
+   },
+   {
+    "group": "FB15k-237",
+    "row": "100 walks, depth 12",
+    "framework": "pyRDF2Vec",
+    "speedup": 53.62014631401238,
+    "ok": true,
+    "label": "53.6×",
+    "times": "71.1 s vs 1.1 h"
+   },
+   {
+    "group": "FB15k-237",
+    "row": "500 walks, depth 4",
+    "framework": "jRDF2Vec",
+    "speedup": 3.5863113832312883,
+    "ok": true,
+    "label": "3.6×",
+    "times": "2.7 min vs 9.6 min"
+   },
+   {
+    "group": "FB15k-237",
+    "row": "500 walks, depth 4",
+    "framework": "pyRDF2Vec",
+    "speedup": 76.38290016243909,
+    "ok": true,
+    "label": "76.4×",
+    "times": "2.7 min vs 3.4 h"
+   },
+   {
+    "group": "FB15k-237",
+    "row": "500 walks, depth 8",
+    "framework": "jRDF2Vec",
+    "speedup": 3.2806383064031115,
+    "ok": true,
+    "label": "3.3×",
+    "times": "4.2 min vs 13.6 min"
+   },
+   {
+    "group": "FB15k-237",
+    "row": "500 walks, depth 8",
+    "framework": "pyRDF2Vec",
+    "speedup": 69.69864079226976,
+    "ok": true,
+    "label": "69.7×",
+    "times": "4.2 min vs 4.8 h"
+   },
+   {
+    "group": "FB15k-237",
+    "row": "500 walks, depth 12",
+    "framework": "jRDF2Vec",
+    "speedup": 3.2283183597788314,
+    "ok": true,
+    "label": "3.2×",
+    "times": "5.0 min vs 16.1 min"
+   },
+   {
+    "group": "FB15k-237",
+    "row": "500 walks, depth 12",
+    "framework": "pyRDF2Vec",
+    "speedup": 86.54181423454787,
+    "ok": true,
+    "label": "86.5×",
+    "times": "5.0 min vs 7.2 h"
+   },
+   {
+    "group": "FB15k-237",
+    "row": "1000 walks, depth 4",
+    "framework": "jRDF2Vec",
+    "speedup": 3.6748716023572743,
+    "ok": true,
+    "label": "3.7×",
+    "times": "5.2 min vs 18.9 min"
+   },
+   {
+    "group": "FB15k-237",
+    "row": "1000 walks, depth 4",
+    "framework": "pyRDF2Vec",
+    "speedup": 84.82992126239074,
+    "ok": true,
+    "label": "84.8×",
+    "times": "5.2 min vs 7.3 h"
+   },
+   {
+    "group": "FB15k-237",
+    "row": "1000 walks, depth 8",
+    "framework": "jRDF2Vec",
+    "speedup": 3.3047727725773055,
+    "ok": true,
+    "label": "3.3×",
+    "times": "8.2 min vs 27.1 min"
+   },
+   {
+    "group": "FB15k-237",
+    "row": "1000 walks, depth 8",
+    "framework": "pyRDF2Vec",
+    "speedup": 72.21041470886168,
+    "ok": true,
+    "label": "72.2×",
+    "times": "8.2 min vs 9.9 h"
+   },
+   {
+    "group": "FB15k-237",
+    "row": "1000 walks, depth 12",
+    "framework": "jRDF2Vec",
+    "speedup": 3.2449525410406435,
+    "ok": true,
+    "label": "3.2×",
+    "times": "9.8 min vs 31.8 min"
+   },
+   {
+    "group": "FB15k-237",
+    "row": "1000 walks, depth 12",
+    "framework": "pyRDF2Vec",
+    "speedup": 73.4980170848851,
+    "ok": false,
+    "label": "> 73.5×",
+    "times": "9.8 min vs > 12.0 h (timed out)"
+   },
+   {
+    "group": "Synthetic graphs",
+    "row": "Barabási–Albert, 100",
+    "framework": "jRDF2Vec",
+    "speedup": 0.8506919628354233,
+    "ok": true,
+    "label": "0.85×",
+    "times": "15.4 s vs 13.1 s"
+   },
+   {
+    "group": "Synthetic graphs",
+    "row": "Barabási–Albert, 100",
+    "framework": "pyRDF2Vec",
+    "speedup": 0.134559157949451,
+    "ok": true,
+    "label": "0.13×",
+    "times": "15.4 s vs 2.1 s"
+   },
+   {
+    "group": "Synthetic graphs",
+    "row": "Barabási–Albert, 1,000",
+    "framework": "jRDF2Vec",
+    "speedup": 1.1922211105552776,
+    "ok": true,
+    "label": "1.2×",
+    "times": "16.0 s vs 19.1 s"
+   },
+   {
+    "group": "Synthetic graphs",
+    "row": "Barabási–Albert, 1,000",
+    "framework": "pyRDF2Vec",
+    "speedup": 0.17971485742871435,
+    "ok": true,
+    "label": "0.18×",
+    "times": "16.0 s vs 2.9 s"
+   },
+   {
+    "group": "Synthetic graphs",
+    "row": "Barabási–Albert, 10,000",
+    "framework": "jRDF2Vec",
+    "speedup": 1.999532579227821,
+    "ok": true,
+    "label": "2.0×",
+    "times": "42.8 s vs 85.6 s"
+   },
+   {
+    "group": "Synthetic graphs",
+    "row": "Barabási–Albert, 10,000",
+    "framework": "pyRDF2Vec",
+    "speedup": 0.3031223707581565,
+    "ok": true,
+    "label": "0.30×",
+    "times": "42.8 s vs 13.0 s"
+   },
+   {
+    "group": "Synthetic graphs",
+    "row": "Erdős–Rényi, 100",
+    "framework": "jRDF2Vec",
+    "speedup": 0.8904808002581478,
+    "ok": true,
+    "label": "0.89×",
+    "times": "15.5 s vs 13.8 s"
+   },
+   {
+    "group": "Synthetic graphs",
+    "row": "Erdős–Rényi, 100",
+    "framework": "pyRDF2Vec",
+    "speedup": 0.3251371410132301,
+    "ok": true,
+    "label": "0.33×",
+    "times": "15.5 s vs 5.0 s"
+   },
+   {
+    "group": "Synthetic graphs",
+    "row": "Erdős–Rényi, 1,000",
+    "framework": "jRDF2Vec",
+    "speedup": 1.4179031469101582,
+    "ok": true,
+    "label": "1.4×",
+    "times": "18.4 s vs 26.1 s"
+   },
+   {
+    "group": "Synthetic graphs",
+    "row": "Erdős–Rényi, 1,000",
+    "framework": "pyRDF2Vec",
+    "speedup": 13.689412468068918,
+    "ok": true,
+    "label": "13.7×",
+    "times": "18.4 s vs 4.2 min"
+   },
+   {
+    "group": "Synthetic graphs",
+    "row": "Erdős–Rényi, 10,000",
+    "framework": "jRDF2Vec",
+    "speedup": 7.039874209465564,
+    "ok": true,
+    "label": "7.0×",
+    "times": "57.6 s vs 6.8 min"
+   },
+   {
+    "group": "Synthetic graphs",
+    "row": "Erdős–Rényi, 10,000",
+    "framework": "pyRDF2Vec",
+    "speedup": 750.5734241434429,
+    "ok": false,
+    "label": "> 751×",
+    "times": "57.6 s vs > 12.0 h (timed out)"
+   },
+   {
+    "group": "Synthetic graphs",
+    "row": "Growing random, 100",
+    "framework": "jRDF2Vec",
+    "speedup": 0.8391351907856638,
+    "ok": true,
+    "label": "0.84×",
+    "times": "15.5 s vs 13.0 s"
+   },
+   {
+    "group": "Synthetic graphs",
+    "row": "Growing random, 100",
+    "framework": "pyRDF2Vec",
+    "speedup": 0.20423396177852132,
+    "ok": true,
+    "label": "0.20×",
+    "times": "15.5 s vs 3.2 s"
+   },
+   {
+    "group": "Synthetic graphs",
+    "row": "Growing random, 1,000",
+    "framework": "jRDF2Vec",
+    "speedup": 1.1354973955024774,
+    "ok": true,
+    "label": "1.1×",
+    "times": "15.7 s vs 17.9 s"
+   },
+   {
+    "group": "Synthetic graphs",
+    "row": "Growing random, 1,000",
+    "framework": "pyRDF2Vec",
+    "speedup": 0.7652140769914877,
+    "ok": true,
+    "label": "0.77×",
+    "times": "15.7 s vs 12.0 s"
+   },
+   {
+    "group": "Synthetic graphs",
+    "row": "Growing random, 10,000",
+    "framework": "jRDF2Vec",
+    "speedup": 1.8916027393233987,
+    "ok": true,
+    "label": "1.9×",
+    "times": "34.0 s vs 64.4 s"
+   },
+   {
+    "group": "Synthetic graphs",
+    "row": "Growing random, 10,000",
+    "framework": "pyRDF2Vec",
+    "speedup": 2.999617905534491,
+    "ok": true,
+    "label": "3.0×",
+    "times": "34.0 s vs 1.7 min"
+   }
+  ]
+ },
+ "facet": {
+  "row": {
+   "field": "group",
+   "type": "nominal",
+   "title": null,
+   "sort": [
+    "FB15k-237",
+    "Synthetic graphs"
+   ],
+   "header": {
+    "labelAngle": 0,
+    "labelAlign": "left",
+    "labelAnchor": "start",
+    "labelOrient": "top",
+    "labelFontSize": 12,
+    "labelFontWeight": 600
+   }
+  }
+ },
+ "spec": {
+  "width": 400,
+  "height": {
+   "step": 20
+  },
+  "layer": [
+   {
+    "mark": {
+     "type": "rule",
+     "strokeWidth": 1.5,
+     "color": "#c3c2b7"
+    },
+    "encoding": {
+     "x": {
+      "datum": 1
+     }
+    }
+   },
+   {
+    "params": [
+     {
+      "name": "pick",
+      "select": {
+       "type": "point",
+       "fields": [
+        "framework"
+       ]
+      },
+      "bind": "legend"
+     }
+    ],
+    "mark": {
+     "type": "point",
+     "size": 70,
+     "strokeWidth": 2,
+     "filled": true
+    },
+    "encoding": {
+     "x": {
+      "field": "speedup",
+      "type": "quantitative",
+      "title": "← rdf2vecgpu slower  reference time ÷ rdf2vecgpu time (log scale)  rdf2vecgpu faster →",
+      "scale": {
+       "type": "log",
+       "domain": [
+        0.1,
+        1000.0
+       ]
+      },
+      "axis": {
+       "values": [
+        0.1,
+        1.0,
+        10.0,
+        100.0,
+        1000.0
+       ],
+       "grid": true,
+       "labelExpr": "format(datum.value, '~g') + '×'"
+      }
+     },
+     "y": {
+      "field": "row",
+      "type": "ordinal",
+      "title": null,
+      "sort": [
+       "100 walks, depth 4",
+       "100 walks, depth 8",
+       "100 walks, depth 12",
+       "500 walks, depth 4",
+       "500 walks, depth 8",
+       "500 walks, depth 12",
+       "1000 walks, depth 4",
+       "1000 walks, depth 8",
+       "1000 walks, depth 12",
+       "Barabási–Albert, 100",
+       "Barabási–Albert, 1,000",
+       "Barabási–Albert, 10,000",
+       "Erdős–Rényi, 100",
+       "Erdős–Rényi, 1,000",
+       "Erdős–Rényi, 10,000",
+       "Growing random, 100",
+       "Growing random, 1,000",
+       "Growing random, 10,000"
+      ]
+     },
+     "color": {
+      "field": "framework",
+      "type": "nominal",
+      "title": null,
+      "scale": {
+       "domain": [
+        "jRDF2Vec",
+        "pyRDF2Vec"
+       ],
+       "range": [
+        "#199e70",
+        "#c98500"
+       ]
+      },
+      "legend": {
+       "orient": "top",
+       "direction": "horizontal",
+       "symbolStrokeWidth": 2,
+       "labelExpr": "'vs ' + datum.label"
+      }
+     },
+     "stroke": {
+      "field": "framework",
+      "type": "nominal",
+      "title": null,
+      "scale": {
+       "domain": [
+        "jRDF2Vec",
+        "pyRDF2Vec"
+       ],
+       "range": [
+        "#199e70",
+        "#c98500"
+       ]
+      },
+      "legend": {
+       "orient": "top",
+       "direction": "horizontal",
+       "symbolStrokeWidth": 2,
+       "labelExpr": "'vs ' + datum.label"
+      }
+     },
+     "shape": {
+      "field": "framework",
+      "type": "nominal",
+      "title": null,
+      "scale": {
+       "domain": [
+        "jRDF2Vec",
+        "pyRDF2Vec"
+       ],
+       "range": [
+        "triangle-up",
+        "diamond"
+       ]
+      }
+     },
+     "opacity": {
+      "condition": {
+       "param": "pick",
+       "empty": true,
+       "value": 1
+      },
+      "value": 0.15
+     },
+     "fillOpacity": {
+      "condition": {
+       "test": "datum.ok",
+       "value": 1
+      },
+      "value": 0
+     },
+     "tooltip": [
+      {
+       "field": "row",
+       "title": "Run"
+      },
+      {
+       "field": "framework",
+       "title": "Against"
+      },
+      {
+       "field": "label",
+       "title": "Speed-up"
+      },
+      {
+       "field": "times",
+       "title": "rdf2vecgpu vs reference"
+      }
+     ]
+    }
+   }
+  ]
+ },
+ "resolve": {
+  "scale": {
+   "y": "independent"
+  }
+ },
+ "config": {
+  "background": null,
+  "font": "system-ui, -apple-system, Segoe UI, sans-serif",
+  "view": {
+   "stroke": null
+  },
+  "title": {
+   "color": "#f0efec",
+   "subtitleColor": "#c3c2b7",
+   "fontSize": 14,
+   "fontWeight": 600
+  },
+  "axis": {
+   "labelColor": "#c3c2b7",
+   "titleColor": "#c3c2b7",
+   "gridColor": "#33332f",
+   "domainColor": "#33332f",
+   "tickColor": "#33332f",
+   "gridWidth": 1,
+   "titleFontWeight": 500
+  },
+  "header": {
+   "labelColor": "#f0efec",
+   "titleColor": "#c3c2b7",
+   "titleFontWeight": 500
+  },
+  "legend": {
+   "labelColor": "#f0efec",
+   "labelFontSize": 12
+  }
+ }
+}

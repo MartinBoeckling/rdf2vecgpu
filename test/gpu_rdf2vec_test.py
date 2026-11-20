@@ -96,15 +96,187 @@ def test_fit_transform_walk_vertices_defaults_to_none():
     assert inspect.signature(GPU_RDF2Vec.fit_transform).parameters["walk_vertices"].default is None
 
 
-def test_batch_size_tuner_keeps_explicit_batch_size():
-    """The tuner replaces the batch size it tunes, so it must not run when one is set."""
-    from src.rdf2vecgpu.config import RDF2VecConfig
-    from src.rdf2vecgpu.gpu_rdf2vec import _tunes_batch_size
+def test_pairs_in_sequence_matches_the_window_template():
+    from src.rdf2vecgpu.embedders.word2vec_loader import skipgram_pairs_per_walk
+    from src.rdf2vecgpu.gpu_rdf2vec import _pairs_in_sequence
 
-    assert _tunes_batch_size(RDF2VecConfig())
-    assert not _tunes_batch_size(RDF2VecConfig(batch_size=4096))
-    assert not _tunes_batch_size(RDF2VecConfig(tune_batch_size=False))
-    assert not _tunes_batch_size(RDF2VecConfig(batch_size=4096, tune_batch_size=False))
+    for depth in (1, 2, 4, 8):
+        for window in (1, 2, 5, 20):
+            assert _pairs_in_sequence(2 * depth + 1, window) == skipgram_pairs_per_walk(depth, window)
+    assert _pairs_in_sequence(1, 5) == 0
+
+
+def test_walk_statistics_count_tokens_and_pairs_of_walks_as_they_end():
+    import torch
+
+    from src.rdf2vecgpu.gpu_rdf2vec import _pairs_in_sequence, _walk_statistics
+
+    # 1 -p5-> 2 -p6-> 3; 4 -p7-> 0 then ended (padding predicate 9 is not counted); 8 alone
+    vertices = torch.tensor([[1, 2, 3], [4, 0, -1], [8, -1, -1]])
+    predicates = torch.tensor([[5, 6], [7, 9], [9, 9]])
+    counts, n_pairs = _walk_statistics([(vertices, predicates)], vocab_size=10, window=2)
+    assert counts.tolist() == [1, 1, 1, 1, 1, 1, 1, 1, 1, 0]
+    assert n_pairs == _pairs_in_sequence(5, 2) + _pairs_in_sequence(3, 2)
+
+
+def test_walk_statistics_expected_pairs_with_shrunk_windows():
+    import torch
+
+    from src.rdf2vecgpu.gpu_rdf2vec import _pairs_in_sequence, _walk_statistics
+
+    assert _pairs_in_sequence(9, 5, shrink=True) == pytest.approx(
+        sum((5 - abs(i - j) + 1) / 5 for i in range(9) for j in range(9) if 0 < abs(i - j) <= 5)
+    )
+    vertices = torch.tensor([[1, 2, 3], [4, 0, -1]])
+    predicates = torch.tensor([[5, 6], [7, 9]])
+    _, n_pairs = _walk_statistics([(vertices, predicates)], vocab_size=10, window=2, shrink=True)
+    assert n_pairs == round(_pairs_in_sequence(5, 2, shrink=True) + _pairs_in_sequence(3, 2, shrink=True))
+
+
+def test_walk_statistics_count_large_int32_corpora_in_row_slices():
+    """The whole single-GPU corpus is one `(vertices, predicates)` pair of int32
+    matrices; it is counted a slice of rows at a time (an int64 copy of all
+    of it ran out of GPU memory on Wikidata5M), with the same result."""
+    import torch
+
+    from src.rdf2vecgpu.gpu_rdf2vec import _walk_statistics
+
+    g = torch.Generator().manual_seed(0)
+    vertices = torch.randint(0, 50, (1000, 5), generator=g, dtype=torch.int32)
+    predicates = torch.randint(50, 60, (1000, 4), generator=g, dtype=torch.int32)
+    vertices[::3, 2:] = -1
+    whole = _walk_statistics([(vertices.long(), predicates.long())], vocab_size=60, window=3)
+    sliced = _walk_statistics([(vertices, predicates)], vocab_size=60, window=3, rows_per_slice=7)
+    assert sliced[0].tolist() == whole[0].tolist() and sliced[1] == whole[1]
+
+
+def _random_walks(n=1000, depth=4, seed=0):
+    """int32 walks over vertices 0..49 and predicates 50..59, every third
+    ending after its second vertex and every seventh after its first."""
+    import torch
+
+    g = torch.Generator().manual_seed(seed)
+    # skewed vertex ids, so subsampling keeps tokens with different chances
+    vertices = (torch.rand((n, depth + 1), generator=g) ** 3 * 50).to(torch.int32)
+    predicates = torch.randint(50, 60, (n, depth), generator=g, dtype=torch.int32)
+    vertices[::3, 2:] = -1
+    vertices[::7, 1:] = -1
+    return vertices, predicates
+
+
+def test_expected_pairs_without_subsampling_are_the_pair_count():
+    from src.rdf2vecgpu.gpu_rdf2vec import _expected_pairs, _walk_statistics
+
+    vertices, predicates = _random_walks()
+    for window in (1, 2, 5):
+        for shrink in (False, True):
+            _, n_pairs = _walk_statistics([(vertices, predicates)], vocab_size=60, window=window, shrink=shrink)
+            assert _expected_pairs(vertices, predicates, window, shrink) == pytest.approx(n_pairs, abs=0.5)
+
+
+def test_walk_statistics_with_subsampling_count_the_pairs_expected_to_survive():
+    """A subsampled token occurrence takes all its pairs with it, so a pair
+    survives with the product of both tokens' keep probabilities."""
+    import torch
+
+    from src.rdf2vecgpu.embedders.word2vec import subsample_keep_probability
+    from src.rdf2vecgpu.gpu_rdf2vec import _walk_statistics
+
+    vertices, predicates = _random_walks()
+    counts, n_pairs = _walk_statistics([(vertices, predicates)], vocab_size=60, window=3)
+    keep = subsample_keep_probability(torch.from_numpy(counts), 0.01).double().tolist()
+    assert min(keep) < 0.5  # subsampling matters on this corpus
+    for shrink in (False, True):
+        expected = 0.0
+        for v, p in zip(vertices.tolist(), predicates.tolist()):
+            k = v.index(-1) if -1 in v else len(v)
+            tokens = [t for pair in zip(v[:k], p[:k - 1] + [None]) for t in pair if t is not None]
+            for i in range(len(tokens)):
+                for j in range(len(tokens)):
+                    d = abs(i - j)
+                    if 0 < d <= 3:
+                        weight = (3 - d + 1) / 3 if shrink else 1.0
+                        expected += weight * keep[tokens[i]] * keep[tokens[j]]
+        sub_counts, sub_pairs = _walk_statistics(
+            [(vertices, predicates)], vocab_size=60, window=3, shrink=shrink, sample=0.01
+        )
+        assert sub_counts.tolist() == counts.tolist()
+        assert sub_pairs == pytest.approx(expected, abs=1)
+        assert sub_pairs < n_pairs
+
+
+def test_walk_statistics_measure_subsampling_on_every_kth_walk():
+    """With `n_walks` given, the surviving share comes from every k-th walk
+    of the whole corpus (k = n_walks // sample_walks), across slices."""
+    import torch
+
+    from src.rdf2vecgpu.embedders.word2vec import subsample_keep_probability
+    from src.rdf2vecgpu.gpu_rdf2vec import _expected_pairs, _walk_statistics
+
+    vertices, predicates = _random_walks()
+    counts, n_pairs = _walk_statistics([(vertices, predicates)], vocab_size=60, window=3)
+    keep = subsample_keep_probability(torch.from_numpy(counts), 0.01)
+    rows = slice(0, None, 10)
+    share = (_expected_pairs(vertices[rows], predicates[rows], 3, keep_probability=keep)
+             / _expected_pairs(vertices[rows], predicates[rows], 3))
+    halves = [(vertices[:333], predicates[:333]), (vertices[333:], predicates[333:])]
+    _, estimate = _walk_statistics(halves, vocab_size=60, window=3, rows_per_slice=7, sample=0.01,
+                                   n_walks=1000, sample_walks=100)
+    assert estimate == round(n_pairs * share)
+
+
+def test_walks_per_step_hold_about_the_batch_in_expected_pairs():
+    from src.rdf2vecgpu.gpu_rdf2vec import _walks_per_step
+
+    assert _walks_per_step(32_768, 327_680, 1000) == 100
+    assert _walks_per_step(32_768, 3_276_800, 1000) == 10
+    assert _walks_per_step(10, 3_276_800, 1000) == 1  # never 0
+    assert _walks_per_step(32_768, 1000, 1000) == 1000  # never more than all walks
+    assert _walks_per_step(32_768, 0, 1000) == 1000
+
+
+@pytest.mark.gpu
+def test_pytorch_steps_are_sized_by_the_pairs_training_builds(tmp_path, monkeypatch):
+    """One GPU: walks per step come from the expected pairs after early walk
+    ends and subsampling, not from the pairs of a full-length walk."""
+    from src.rdf2vecgpu.embedders.word2vec_loader import walks_per_pair_batch
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec, _walk_statistics, _walks_per_step
+
+    class Stop(Exception):
+        pass
+
+    seen = {}
+
+    def record(self, datamodule, *, token_counts, steps_per_epoch, n_gpus):
+        seen.update(datamodule=datamodule, steps=steps_per_epoch)
+        raise Stop
+
+    monkeypatch.setattr(GPU_RDF2Vec, "_train_pytorch_sequences", record)
+    # batch 4 stays under the 1/100-of-the-pairs cap of this tiny corpus
+    rdf = GPU_RDF2Vec(epochs=1, vector_size=4, window_size=2, walk_number=50, walk_depth=3, batch_size=4)
+    with pytest.raises(Stop):
+        rdf.fit(rdf.load_data(_small_kg(tmp_path)))
+    walks = seen["datamodule"]._iterable
+    n_walks = int(walks.vertices.shape[0])
+    _, n_pairs = _walk_statistics([(walks.vertices, walks.predicates)], rdf.word2idx.shape[0], 2,
+                                  sample=rdf.config.sample, n_walks=n_walks)
+    assert rdf._effective_batch_size(n_pairs) == 4
+    assert walks.emit_batch_size == _walks_per_step(4, n_pairs, n_walks)
+    # subsampling drops most pairs of this tiny corpus: more walks per step
+    assert walks.emit_batch_size > 2 * walks_per_pair_batch(4, 3, 2)
+    assert seen["steps"] == -(-n_walks // walks.emit_batch_size)
+
+
+@pytest.mark.gpu
+def test_batch_size_is_capped_to_one_hundredth_of_the_pairs():
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    default = GPU_RDF2Vec()
+    assert default._effective_batch_size(100_000_000) == 32_768
+    assert default._effective_batch_size(1_000_000) == 10_000
+    assert default._effective_batch_size(150) == 2
+    assert default._effective_batch_size(0) == 1
+    assert GPU_RDF2Vec(batch_size=64)._effective_batch_size(1_000_000) == 64
 
 
 @pytest.mark.gpu
@@ -128,3 +300,193 @@ def test_single_gpu_gensim_fit(tmp_path):
     emb = model.fit_transform(edges)
     assert emb.shape == (model.word2idx.shape[0], 4 + 2)
     assert model.word2vec_model.alpha == 0.025
+
+
+@pytest.mark.gpu
+def test_pytorch_skipgram_zeroes_unwalked_tokens_and_keeps_them_zero_after_load(tmp_path):
+    """Walk only from `a`: the tokens of the other component never occur in a
+    walk, are never trained, and come back as zeros, also after save/load."""
+    import cudf
+
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    path = tmp_path / "kg.parquet"
+    cudf.DataFrame(
+        {"subject": ["a", "b", "c"], "predicate": ["p", "p", "q"], "object": ["b", "a", "d"]}
+    ).to_parquet(path)
+    model = GPU_RDF2Vec(epochs=2, vector_size=4, window_size=2, walk_number=5, batch_size=64)
+    edges = model.load_data(str(path))
+    words = model.word2idx.to_pandas().set_index("word")["token"]
+    # the token ids of this tiny vocabulary are int8; fit must cast them for cuGraph
+    model.fit(edges, walk_vertices=cudf.Series([int(words["a"])], dtype=words.dtype))
+
+    def vectors(emb):
+        frame = emb.to_pandas().set_index("word")
+        return frame[[f"embedding_{i}" for i in range(4)]]
+
+    emb = vectors(model.transform())
+    for word in ("c", "q", "d"):
+        assert (emb.loc[word] == 0).all(), word
+    for word in ("a", "b", "p"):
+        assert (emb.loc[word] != 0).any(), word
+
+    model.save(str(tmp_path / "saved"))
+    assert (tmp_path / "saved" / "walked_tokens.npy").exists()
+    loaded = vectors(GPU_RDF2Vec.load(str(tmp_path / "saved")).transform())
+    assert np.allclose(loaded.loc[emb.index].to_numpy(), emb.to_numpy())
+
+
+def _small_kg(tmp_path):
+    import cudf
+
+    path = tmp_path / "kg.parquet"
+    subjects = [f"e{i}" for i in range(20)]
+    cudf.DataFrame(
+        {
+            "subject": subjects,
+            "predicate": ["p" if i % 2 else "q" for i in range(20)],
+            "object": [f"e{(i + 1) % 20}" for i in range(20)],
+        }
+    ).to_parquet(path)
+    return str(path)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "backend, model",
+    [("pytorch", "skipgram"), ("pytorch", "cbow"), ("pytorch", "order_aware_skipgram"), ("gensim", "skipgram")],
+)
+def test_prepare_corpus_then_fit_from_walks(tmp_path, backend, model):
+    if backend == "gensim":
+        pytest.importorskip("gensim")
+    import cudf
+
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    settings = dict(
+        backend=backend, embedding_model=model, epochs=1, vector_size=4, window_size=2, walk_number=3, walk_depth=3,
+        grad_clip_value=0.3,
+    )
+    preparer = GPU_RDF2Vec(**settings)
+    edges = preparer.load_data(_small_kg(tmp_path))
+    walks_path, vocab_path = preparer.prepare_corpus(edges, str(tmp_path / "corpus"))
+    walks = cudf.read_parquet(walks_path)
+    assert len(walks) == 20 * 3
+    assert walks["vertices"].list.len().max() == 4  # walk_depth + 1
+    assert set(cudf.read_parquet(vocab_path).columns) == {"token", "word"}
+
+    trainer = GPU_RDF2Vec(**settings)  # a fresh instance: no graph, no load_data
+    trainer.fit_from_walks(walks_path, vocab_path)
+    if backend == "pytorch":
+        assert trainer.word2vec_model.grad_clip_value == 0.3
+    emb = trainer.transform()
+    assert len(emb) == len(preparer.word2idx)
+    vectors = emb[[f"embedding_{i}" for i in range(4)]].to_pandas().to_numpy()
+    assert np.isfinite(vectors).all() and np.abs(vectors).sum() > 0
+
+
+@pytest.mark.gpu
+def test_fit_from_walks_needs_both_files(tmp_path):
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    with pytest.raises(FileNotFoundError):
+        GPU_RDF2Vec().fit_from_walks(str(tmp_path / "missing"), str(tmp_path / "missing.parquet"))
+
+
+@pytest.mark.gpu
+def test_multi_gpu_without_client_only_fails_when_reading(tmp_path):
+    """fit_from_walks needs no Dask client, so construction must not ask for one."""
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    model = GPU_RDF2Vec(multi_gpu=True)
+    assert model.client is None
+    with pytest.raises(ValueError, match="needs a Dask client"):
+        model.read_data(_small_kg(tmp_path))
+
+
+@pytest.mark.gpu
+def test_pytorch_progress_bar_refreshes_when_the_loss_is_logged(tmp_path):
+    """The progress bar redraws only on the steps the loss is logged (every
+    `log_every_n_steps`); redrawing it on every step costs a sizeable share
+    of a small training step."""
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    model = GPU_RDF2Vec(epochs=1, vector_size=4, window_size=2, walk_number=3, walk_depth=3)
+    model.fit(model.load_data(_small_kg(tmp_path)))
+
+    trainer = model.word2vec_model.trainer
+    assert trainer.progress_bar_callback.refresh_rate == trainer.log_every_n_steps > 1
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("backend", ["pytorch", "gensim"])
+def test_single_gpu_fit_and_prepare_corpus_walk_in_chunks(tmp_path, monkeypatch, backend):
+    """With a small chunk size the single-GPU walks come in several chunks, and
+    fit / prepare_corpus still see all of them (20 start vertices x 3 walks)."""
+    if backend == "gensim":
+        pytest.importorskip("gensim")
+    import pyarrow.parquet as pq
+
+    from src.rdf2vecgpu.corpus import walk_corpus
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    monkeypatch.setattr(walk_corpus, "SINGLE_GPU_WALKS_PER_CHUNK", 7)  # 2 start vertices per chunk
+    chunks = []
+    original = walk_corpus.SingleGPUWalkCorpus.walk_chunks
+
+    def counting(self, *args, **kwargs):
+        for chunk in original(self, *args, **kwargs):
+            chunks.append(len(chunk[0]))
+            yield chunk
+
+    monkeypatch.setattr(walk_corpus.SingleGPUWalkCorpus, "walk_chunks", counting)
+    settings = dict(backend=backend, epochs=1, vector_size=4, window_size=2, walk_number=3, walk_depth=3)
+
+    model = GPU_RDF2Vec(**settings)
+    model.fit(model.load_data(_small_kg(tmp_path)))
+    assert chunks == [6] * 10
+    vectors = model.transform()[[f"embedding_{i}" for i in range(4)]].to_pandas().to_numpy()
+    assert np.isfinite(vectors).all() and np.abs(vectors).sum() > 0
+
+    chunks.clear()
+    preparer = GPU_RDF2Vec(**settings)
+    walks_path, _ = preparer.prepare_corpus(preparer.load_data(_small_kg(tmp_path)), str(tmp_path / "corpus"))
+    assert chunks == [6] * 10
+    assert pq.read_table(walks_path).num_rows == 60
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "backend, model", [("pytorch", "skipgram"), ("pytorch", "cbow"), ("gensim", "skipgram")]
+)
+def test_single_gpu_bfs_walks_train_like_random_walks(tmp_path, backend, model):
+    """BFS walks are walk sequences like random walks (root-to-leaf paths,
+    -1 padded): every trainer takes them, and prepare_corpus writes them."""
+    if backend == "gensim":
+        pytest.importorskip("gensim")
+    import pyarrow.parquet as pq
+
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    settings = dict(backend=backend, embedding_model=model, walk_strategy="bfs", epochs=1, vector_size=4,
+                    window_size=2, walk_depth=3)
+    rdf = GPU_RDF2Vec(**settings)
+    rdf.fit(rdf.load_data(_small_kg(tmp_path)))
+    vectors = rdf.transform()[[f"embedding_{i}" for i in range(4)]].to_pandas().to_numpy()
+    assert np.isfinite(vectors).all() and np.abs(vectors).sum() > 0
+
+    preparer = GPU_RDF2Vec(**settings)
+    walks_path, _ = preparer.prepare_corpus(preparer.load_data(_small_kg(tmp_path)), str(tmp_path / "corpus"))
+    walks = pq.read_table(walks_path)
+    # the 20-vertex cycle: from each vertex one path of 3 steps
+    assert walks.num_rows == 20
+    assert all(len(v) == 4 and -1 not in v for v in walks.column("vertices").to_pylist())
+
+
+@pytest.mark.gpu
+def test_shrink_window_reaches_the_pytorch_model(tmp_path):
+    from src.rdf2vecgpu.gpu_rdf2vec import GPU_RDF2Vec
+
+    rdf = GPU_RDF2Vec(epochs=1, vector_size=4, window_size=2, walk_number=3, walk_depth=3, shrink_window=True)
+    rdf.fit(rdf.load_data(_small_kg(tmp_path)))
+    assert rdf.word2vec_model.shrink_window is True

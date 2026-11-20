@@ -1,0 +1,3 @@
+.bench-chart { overflow-x: auto; margin: 1rem 0 0.5rem; }
+.bench-chart img { max-width: 100%; height: auto; }
+.bench-chart svg { max-width: none; }

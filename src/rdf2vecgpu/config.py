@@ -1,8 +1,34 @@
+import os
+import warnings
 from typing import Literal, Optional
 from pydantic import BaseModel, Field, model_validator
 
 
-_DEFAULT_LEARNING_RATE = {"pytorch": 0.0001, "gensim": 0.025}
+# the PyTorch trainers sum the loss over a batch and use SGD, so the learning
+# rate is a step size per example like gensim's alpha; CBOW on BFS walks still
+# uses Adam on a mean loss
+_DEFAULT_LEARNING_RATE = {
+    ("pytorch", "skipgram"): 0.025,
+    ("pytorch", "cbow"): 0.025,
+    ("gensim", "skipgram"): 0.025,
+    ("gensim", "cbow"): 0.025,
+    ("pytorch", "order_aware_skipgram"): 0.025,
+    ("gensim", "order_aware_skipgram"): 0.025,  # rejected below; keeps the lookup total
+}
+_BFS_CBOW_LEARNING_RATE = 0.0001
+DEFAULT_BATCH_SIZE = 32_768
+# training uses at most 1/MIN_STEPS_PER_EPOCH of the pairs per step, so a
+# small corpus still gets this many SGD steps per epoch
+MIN_STEPS_PER_EPOCH = 100
+
+
+def _available_cores() -> int:
+    """CPU cores this process may run on (respects affinity and cgroup
+    pinning, e.g. a SLURM allocation), at least 1."""
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:  # not on Linux
+        return max(1, os.cpu_count() or 1)
 
 
 class RDF2VecConfig(BaseModel):
@@ -44,18 +70,32 @@ class RDF2VecConfig(BaseModel):
         is never walked; a vertex whose out-edges all weigh 0 ends the walk.
         BFS walks ignore weights.
 
-    embedding_model : {"skipgram", "cbow"}, default "skipgram"
-        Word2Vec variant used for embedding training. Multi-GPU CBOW
-        requires ``backend="gensim"``.
+    embedding_model : {"skipgram", "cbow", "order_aware_skipgram"}, default "skipgram"
+        Word2Vec variant used for embedding training, all with negative
+        sampling. ``"order_aware_skipgram"`` (RDF2Vec_oa) learns a separate
+        output embedding per position in the context window, so it also
+        captures where a token occurs relative to another; it needs
+        ``backend="pytorch"`` and random walks, and its output table has
+        ``2 * window_size`` times the rows of skip-gram's. Multi-GPU CBOW on
+        BFS walks requires ``backend="gensim"``.
 
     epochs : int, default 5
         Number of training epochs.
 
     batch_size : int or None, default None
-        Training batch size of the PyTorch backend. If None, a single-GPU run
-        uses 1/100 of the training pairs (or, with ``tune_batch_size=True``,
-        the tuner's result) and a multi-GPU run uses 512. An explicit value is
-        always used as given. Not used by ``backend="gensim"``.
+        Number of (center, context) pairs per training step of the PyTorch
+        backend; None means 32768. Training uses at most 1/100 of the
+        training pairs (per GPU) per step, so every epoch has at least 100
+        steps; a larger value is reduced, with a warning when set explicitly.
+        Training on walk sequences fills each step with whole walks, as many
+        as hold about ``batch_size`` pairs on average after walks that end
+        early and ``sample`` subsampling are taken into account (estimated
+        from the walks before training), so the step size in pairs does not
+        depend on the walk depth. With ``multi_gpu`` DDP training all GPUs
+        must agree on the step count, so steps are sized for full-length
+        walks without subsampling and hold fewer pairs. Larger batches
+        train faster with slightly lower embedding quality. Not used by
+        ``backend="gensim"``.
 
     vector_size : int, default 256
         Dimensionality of the output embeddings.
@@ -74,10 +114,38 @@ class RDF2VecConfig(BaseModel):
         Number of negative examples for negative sampling.
 
     learning_rate : float or None, default None
-        Learning rate. With ``backend="pytorch"`` it is the optimiser's
-        learning rate; with ``backend="gensim"`` it is gensim's initial
-        ``alpha``. If None, it is set to the backend's default: 0.0001 for
-        ``"pytorch"`` and 0.025 (gensim's own default) for ``"gensim"``.
+        Initial learning rate: a step size per training example that decays
+        linearly to ``min_learning_rate`` over training (gensim's ``alpha``),
+        for both backends and models. If None, it is set to 0.025 (gensim's
+        own default); PyTorch CBOW on BFS walks, which still uses Adam, gets
+        0.0001.
+
+    min_learning_rate : float, default 0.0001
+        Learning rate at the end of training, after the linear decay
+        (gensim's ``min_alpha``). Not used by PyTorch CBOW.
+
+    sample : float, default 0.001
+        Threshold for dropping occurrences of frequent tokens from the walks
+        during training, as gensim's ``sample``: a token that makes up a
+        fraction ``f`` of the walks keeps each occurrence with probability
+        ``(sqrt(f / sample) + 1) * sample / f``. 0 keeps everything (as
+        jRDF2Vec does by default). Used by skip-gram on random walks with
+        ``backend="pytorch"`` and by ``backend="gensim"``.
+
+    shrink_window : bool, default False
+        Draw each centre token's context window uniformly from
+        1..``window_size``, as word2vec and gensim do ("reduced windows"),
+        instead of always using the full window, for the PyTorch skip-gram,
+        order-aware skip-gram and CBOW models. Near tokens then weigh more
+        than far ones, and a walk gives 33-40% fewer pairs (batches are
+        sized by the expected count). ``backend="gensim"`` always shrinks.
+
+    grad_clip_value : float, default 1.0
+        Per-component clip of the summed batch gradient for the PyTorch
+        skip-gram, order-aware skip-gram and CBOW models, as a guard against
+        overflowing steps for very frequent tokens. 0 turns it off. Values
+        well below 1 slow the learning of frequent tokens and lower embedding
+        quality. Not used by ``backend="gensim"``.
 
     backend : {"pytorch", "gensim"}, default "pytorch"
         Word2Vec trainer. ``"pytorch"`` trains on the GPU(s) with PyTorch
@@ -104,15 +172,14 @@ class RDF2VecConfig(BaseModel):
         ``./vector/embeddings_<embedding_model>.parquet`` and the vocabulary
         to ``./vector/word2idx.parquet``.
 
-    cpu_count : int, default 4
+    cpu_count : int, default: the CPU cores available to the process
         Number of gensim worker threads with ``backend="gensim"``. Not used
         by the PyTorch backend.
 
-    tune_batch_size : bool, default True
-        Run Lightning's batch-size tuner (power scaling, starting from 1/200
-        of the training pairs) before single-GPU PyTorch training when
-        ``batch_size`` is None. Not used by multi-GPU training or
-        ``backend="gensim"``.
+    tune_batch_size : bool, default False
+        Deprecated and ignored; it will be removed in 0.7.0. The batch-size
+        tuner searched for the largest batch that fits in GPU memory, which is
+        no longer the limit; set ``batch_size`` instead.
 
     num_nodes : int, default 1
         Number of nodes for multi-GPU PyTorch training (Lightning
@@ -156,7 +223,7 @@ class RDF2VecConfig(BaseModel):
     walk_number: int = Field(default=100, gt=0)
     walk_weighted: bool = False
     # embedding parameter settings
-    embedding_model: Literal["skipgram", "cbow"] = "skipgram"
+    embedding_model: Literal["skipgram", "cbow", "order_aware_skipgram"] = "skipgram"
     epochs: int = Field(default=5, gt=0)
     batch_size: Optional[int] = Field(default=None, gt=0)
     vector_size: int = Field(default=256, gt=0)
@@ -164,14 +231,18 @@ class RDF2VecConfig(BaseModel):
     min_count: int = Field(default=1, ge=0)
     negative_samples: int = Field(default=5, ge=0)
     learning_rate: Optional[float] = Field(default=None, gt=0)
+    min_learning_rate: float = Field(default=0.0001, gt=0)
+    sample: float = Field(default=0.001, ge=0)
+    shrink_window: bool = False
+    grad_clip_value: float = Field(default=1.0, ge=0)
     backend: Literal["pytorch", "gensim"] = "pytorch"
     # library settings
     random_state: int = Field(default=42, ge=0)
     reproducible: bool = False
     multi_gpu: bool = False
     generate_artifact: bool = False
-    cpu_count: int = Field(default=4, gt=0)
-    tune_batch_size: bool = True
+    cpu_count: int = Field(default_factory=lambda: _available_cores(), gt=0)
+    tune_batch_size: bool = False
     num_nodes: int = Field(default=1, gt=0)
     tracker: Literal["mlflow", "wandb", "none"] = "none"
     tracker_kwargs: Optional[dict] = None
@@ -184,17 +255,48 @@ class RDF2VecConfig(BaseModel):
 
     @model_validator(mode="after")
     def _default_learning_rate(self):
-        # the two trainers need very different learning rates: gensim's
-        # `alpha` decays linearly from 0.025, the PyTorch optimiser uses 1e-4
         if self.learning_rate is None:
-            self.learning_rate = _DEFAULT_LEARNING_RATE[self.backend]
+            if self.backend == "pytorch" and self.embedding_model == "cbow" and self.walk_strategy == "bfs":
+                self.learning_rate = _BFS_CBOW_LEARNING_RATE
+            else:
+                self.learning_rate = _DEFAULT_LEARNING_RATE[(self.backend, self.embedding_model)]
+        return self
+
+    @model_validator(mode="after")
+    def _default_batch_size(self):
+        if self.tune_batch_size:
+            warnings.warn(
+                "tune_batch_size is deprecated and ignored, and will be removed in 0.7.0; "
+                f"set batch_size instead (default {DEFAULT_BATCH_SIZE})",
+                FutureWarning,
+                stacklevel=2,
+            )
+        if self.batch_size is None:
+            self.batch_size = DEFAULT_BATCH_SIZE
+        return self
+
+    @model_validator(mode="after")
+    def _check_order_aware(self):
+        if self.embedding_model == "order_aware_skipgram":
+            if self.backend != "pytorch":
+                raise ValueError("embedding_model='order_aware_skipgram' needs backend='pytorch'")
+            if self.walk_strategy != "random":
+                # BFS walks reach training as pairs, without their positions
+                raise ValueError("embedding_model='order_aware_skipgram' needs walk_strategy='random'")
         return self
 
     @model_validator(mode="after")
     def _check_multi_gpu_cbow(self):
-        if self.multi_gpu and self.backend == "pytorch" and self.embedding_model == "cbow":
-            # its training pairs lose the context windows (see `_cbow_pairs`)
+        if (
+            self.multi_gpu
+            and self.backend == "pytorch"
+            and self.embedding_model == "cbow"
+            and self.walk_strategy == "bfs"
+        ):
+            # BFS walks reach CBOW as pairs, which lose the context windows
+            # (see `_cbow_pairs`)
             raise ValueError(
-                "multi-GPU CBOW is not supported with backend='pytorch'; use backend='gensim' or a single GPU"
+                "multi-GPU CBOW on BFS walks is not supported with backend='pytorch'; "
+                "use backend='gensim', random walks or a single GPU"
             )
         return self

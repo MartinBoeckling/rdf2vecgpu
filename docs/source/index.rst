@@ -24,22 +24,27 @@ RDF2Vec implementations are described in the
    ``MultiGraph``, so parallel edges with different predicates are kept.
 
 2. **Walks** (``fit``): every start vertex (by default every subject) is repeated ``walk_number``
-   times and the walks are generated in bulk by cuGraph, uniformly or, with ``walk_weighted=True``,
-   biased by the edge weights. The predicate of every step is recovered from the edge that was
-   actually traversed. BFS walks run one cuGraph BFS per start vertex, so their cost grows with the
-   size of the graph. With ``multi_gpu=True``, the walks are generated on all GPUs of the Dask
-   cluster.
+   times and the walks are generated in bulk by cuGraph: ``uniform_random_walks``, or
+   ``biased_random_walks`` with ``walk_weighted=True``. The predicate of every step is recovered
+   from the edge that was actually traversed. On one GPU the walks are generated in chunks of
+   up to 25 M walks and kept as int32 token matrices. BFS walks run one cuGraph BFS per start
+   vertex and give one walk per root-to-leaf path, so their cost grows with the size of the graph.
+   With ``multi_gpu=True``, the walks are generated on all GPUs of the Dask cluster.
+   ``prepare_corpus`` writes the walks to Parquet instead, and ``fit_from_walks`` trains from those
+   files later, without the graph.
 
-3. **Training data** (``backend="pytorch"``): the walks are turned into (center, context) pairs with
-   cuDF and handed to PyTorch through DLPack without leaving the GPU. The data loader indexes into
-   these GPU tensors instead of copying batches.
+3. **Training data** (``backend="pytorch"``): the walks stay in GPU memory as sequences. Every step
+   takes a shuffled batch of walks, drops frequent tokens (``sample``, as in word2vec) and builds the
+   (center, context) pairs of that batch on the GPU. Steps are sized to hold about ``batch_size``
+   pairs (default 32768) after subsampling and walks that end early. With ``multi_gpu=True``, the
+   walks are written to Parquet, the Dask client is closed, and each GPU reads its own block.
 
-4. **Training**: Skip-gram with negative sampling or CBOW, trained with PyTorch Lightning (Adam,
-   16-bit mixed precision). On a single GPU, Lightning's batch-size tuner picks the batch size unless
-   ``batch_size`` is set or ``tune_batch_size=False``. With ``multi_gpu=True``, the pairs are written
-   to Parquet, the Dask cluster is released, and Lightning trains with DDP: each GPU reads its own
-   block of the pairs and gradients are averaged every step. With ``backend="gensim"``, the walks are
-   streamed from Parquet into gensim's Word2Vec on the CPU instead.
+4. **Training**: skip-gram, CBOW or order-aware skip-gram with negative sampling, trained with
+   PyTorch Lightning the way word2vec trains: summed loss, sparse SGD with a learning rate that
+   decays linearly from ``learning_rate`` to ``min_learning_rate``, and negatives drawn by token
+   frequency^0.75. With ``multi_gpu=True``, Lightning trains with DDP and averages the gradients
+   every step. With ``backend="gensim"``, the walks are streamed from Parquet into gensim's
+   Word2Vec on the CPU instead.
 
 5. **Output** (``transform``): the embedding matrix is copied into a cuDF table with one row per
    token (``token``, ``word``, ``embedding_*``), optionally written to Parquet.
@@ -80,6 +85,13 @@ This project is licensed under the MIT License.
    training
    vectorretrieval
    tracking
+
+.. toctree::
+   :maxdepth: 2
+   :hidden:
+   :caption: Benchmarks
+
+   performance
 
 .. toctree::
    :maxdepth: 2

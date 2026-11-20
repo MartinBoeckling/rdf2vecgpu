@@ -95,3 +95,68 @@ def test_bfs_roots_without_out_edges():
                                  "object": cudf.Series([7], dtype="int32")})
     with pytest.raises(ValueError, match="no walks"):
         _bfs_walk_steps(sink_edges, cudf.Series([7], dtype="int32"), walk_depth=2)
+
+
+def _rows(vertices, predicates):
+    """(vertex path, predicate path) per row of BFS walk matrices, cut at -1."""
+    out = []
+    for v, p in zip(vertices.get().tolist(), predicates.get().tolist()):
+        end = v.index(-1) if -1 in v else len(v)
+        out.append((tuple(v[:end]), tuple(p[: end - 1])))
+    return out
+
+
+def _bfs_matrices(edges, roots, depth, random_state=0, walks_per_chunk=None):
+    import cupy as cp
+
+    chunks = list(SingleGPUWalkCorpus(_graph(edges), window_size=2).bfs_chunks(
+        edges, cudf.Series(roots, dtype="int32"), walk_depth=depth, random_state=random_state,
+        walks_per_chunk=walks_per_chunk,
+    ))
+    for v, p in chunks:
+        assert v.dtype == cp.int32 and p.dtype == cp.int32
+        assert v.shape[1] == depth + 1 and p.shape[1] == depth
+    return chunks
+
+
+@pytest.mark.gpu
+def test_bfs_chunks_hold_the_root_to_leaf_paths_of_the_step_rows():
+    """The walk matrices hold the same root-to-leaf paths as `_bfs_walk_steps`,
+    padded with -1 vertices (and 0 predicates) after a path's end, in chunks
+    of whole roots of at least `walks_per_chunk` walks."""
+    import cupy as cp
+
+    edges = _edges()
+    chunks = _bfs_matrices(edges, [5, 3, 1], depth=3, walks_per_chunk=2)
+    assert [len(v) for v, _ in chunks] == [2, 3]  # root 5; roots 3 and 1
+    vertices = cp.concatenate([v for v, _ in chunks])
+    predicates = cp.concatenate([p for _, p in chunks])
+    rows = _rows(vertices, predicates)
+    reference = _walks(_bfs_walk_steps(edges, cudf.Series([5, 3, 1], dtype="int32"), walk_depth=3, random_state=0))
+    assert sorted(v for v, _ in rows) == sorted(v for v, _ in reference.values())
+    legit = {(int(s), int(o), int(p)) for s, p, o in edges.to_pandas().itertuples(index=False)}
+    for path, preds in rows:
+        assert all((path[k], path[k + 1], preds[k]) in legit for k in range(len(preds)))
+    ended = vertices[:, 1:] == -1
+    assert bool((predicates[ended] == 0).all())
+
+
+@pytest.mark.gpu
+def test_bfs_chunks_draw_parallel_edge_predicates_uniformly_and_reproducibly():
+    edges = _edges()
+    n = 400
+    first = [p[0] for v, p in _rows(*_bfs_matrices(edges, [5] * n, depth=3)[0]) if v == (5, 3, 1)]
+    assert len(first) == n and set(first) == {100, 103}
+    assert abs(np.mean(np.array(first) == 100) - 0.5) < 5 * math.sqrt(0.25 / n)
+    again = _rows(*_bfs_matrices(edges, [5] * n, depth=3)[0])
+    other = _rows(*_bfs_matrices(edges, [5] * n, depth=3, random_state=1)[0])
+    assert again == _rows(*_bfs_matrices(edges, [5] * n, depth=3)[0]) and again != other
+
+
+@pytest.mark.gpu
+def test_bfs_chunks_without_any_walk_raise():
+    sink_edges = cudf.DataFrame({"subject": cudf.Series([0], dtype="int32"),
+                                 "predicate": cudf.Series([9], dtype="int32"),
+                                 "object": cudf.Series([7], dtype="int32")})
+    with pytest.raises(ValueError, match="no walks"):
+        _bfs_matrices(sink_edges, [7], depth=2)

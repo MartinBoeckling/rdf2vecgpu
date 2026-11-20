@@ -1,0 +1,639 @@
+{
+ "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+ "title": {
+  "text": "FB15k-237: time by walk depth",
+  "subtitle": "rdf2vecgpu 0.6.0 · RTX A6000, 16 CPU threads · median of 3",
+  "anchor": "start"
+ },
+ "data": {
+  "values": [
+   {
+    "framework": "rdf2vecgpu (gensim)",
+    "x": "12",
+    "facet": "100 walks",
+    "seconds": 131.37,
+    "ok": true,
+    "time": "2.2 min",
+    "range": "2.2 min – 2.2 min, 3 runs"
+   },
+   {
+    "framework": "rdf2vecgpu (gensim)",
+    "x": "4",
+    "facet": "100 walks",
+    "seconds": 82.104,
+    "ok": true,
+    "time": "82.1 s",
+    "range": "81.7 s – 82.4 s, 3 runs"
+   },
+   {
+    "framework": "rdf2vecgpu (gensim)",
+    "x": "8",
+    "facet": "100 walks",
+    "seconds": 113.972,
+    "ok": true,
+    "time": "1.9 min",
+    "range": "1.9 min – 1.9 min, 3 runs"
+   },
+   {
+    "framework": "rdf2vecgpu (gensim)",
+    "x": "12",
+    "facet": "1000 walks",
+    "seconds": 1182.761,
+    "ok": true,
+    "time": "19.7 min",
+    "range": "19.6 min – 19.8 min, 3 runs"
+   },
+   {
+    "framework": "rdf2vecgpu (gensim)",
+    "x": "4",
+    "facet": "1000 walks",
+    "seconds": 700.2,
+    "ok": true,
+    "time": "11.7 min",
+    "range": "11.6 min – 11.7 min, 3 runs"
+   },
+   {
+    "framework": "rdf2vecgpu (gensim)",
+    "x": "8",
+    "facet": "1000 walks",
+    "seconds": 985.494,
+    "ok": true,
+    "time": "16.4 min",
+    "range": "16.2 min – 17.1 min, 3 runs"
+   },
+   {
+    "framework": "rdf2vecgpu (gensim)",
+    "x": "12",
+    "facet": "500 walks",
+    "seconds": 601.939,
+    "ok": true,
+    "time": "10.0 min",
+    "range": "9.9 min – 10.0 min, 3 runs"
+   },
+   {
+    "framework": "rdf2vecgpu (gensim)",
+    "x": "4",
+    "facet": "500 walks",
+    "seconds": 355.79,
+    "ok": true,
+    "time": "5.9 min",
+    "range": "5.9 min – 6.0 min, 3 runs"
+   },
+   {
+    "framework": "rdf2vecgpu (gensim)",
+    "x": "8",
+    "facet": "500 walks",
+    "seconds": 504.093,
+    "ok": true,
+    "time": "8.4 min",
+    "range": "8.4 min – 8.5 min, 3 runs"
+   },
+   {
+    "framework": "rdf2vecgpu (PyTorch)",
+    "x": "12",
+    "facet": "100 walks",
+    "seconds": 71.08,
+    "ok": true,
+    "time": "71.1 s",
+    "range": "70.2 s – 75.3 s, 3 runs"
+   },
+   {
+    "framework": "rdf2vecgpu (PyTorch)",
+    "x": "4",
+    "facet": "100 walks",
+    "seconds": 42.584,
+    "ok": true,
+    "time": "42.6 s",
+    "range": "42.5 s – 42.9 s, 3 runs"
+   },
+   {
+    "framework": "rdf2vecgpu (PyTorch)",
+    "x": "8",
+    "facet": "100 walks",
+    "seconds": 62.022,
+    "ok": true,
+    "time": "62.0 s",
+    "range": "61.3 s – 63.5 s, 3 runs"
+   },
+   {
+    "framework": "rdf2vecgpu (PyTorch)",
+    "x": "12",
+    "facet": "1000 walks",
+    "seconds": 587.771,
+    "ok": true,
+    "time": "9.8 min",
+    "range": "9.7 min – 10.3 min, 3 runs"
+   },
+   {
+    "framework": "rdf2vecgpu (PyTorch)",
+    "x": "4",
+    "facet": "1000 walks",
+    "seconds": 309.001,
+    "ok": true,
+    "time": "5.2 min",
+    "range": "5.1 min – 5.3 min, 3 runs"
+   },
+   {
+    "framework": "rdf2vecgpu (PyTorch)",
+    "x": "8",
+    "facet": "1000 walks",
+    "seconds": 491.622,
+    "ok": true,
+    "time": "8.2 min",
+    "range": "8.1 min – 8.3 min, 3 runs"
+   },
+   {
+    "framework": "rdf2vecgpu (PyTorch)",
+    "x": "12",
+    "facet": "500 walks",
+    "seconds": 299.862,
+    "ok": true,
+    "time": "5.0 min",
+    "range": "5.0 min – 5.2 min, 3 runs"
+   },
+   {
+    "framework": "rdf2vecgpu (PyTorch)",
+    "x": "4",
+    "facet": "500 walks",
+    "seconds": 160.06,
+    "ok": true,
+    "time": "2.7 min",
+    "range": "2.7 min – 2.7 min, 3 runs"
+   },
+   {
+    "framework": "rdf2vecgpu (PyTorch)",
+    "x": "8",
+    "facet": "500 walks",
+    "seconds": 249.41,
+    "ok": true,
+    "time": "4.2 min",
+    "range": "4.1 min – 4.2 min, 3 runs"
+   },
+   {
+    "framework": "jRDF2Vec",
+    "x": "12",
+    "facet": "100 walks",
+    "seconds": 217.051,
+    "ok": true,
+    "time": "3.6 min",
+    "range": "3.3 min – 3.7 min, 3 runs"
+   },
+   {
+    "framework": "jRDF2Vec",
+    "x": "4",
+    "facet": "100 walks",
+    "seconds": 130.155,
+    "ok": true,
+    "time": "2.2 min",
+    "range": "2.1 min – 2.2 min, 3 runs"
+   },
+   {
+    "framework": "jRDF2Vec",
+    "x": "8",
+    "facet": "100 walks",
+    "seconds": 177.82,
+    "ok": true,
+    "time": "3.0 min",
+    "range": "2.9 min – 3.0 min, 3 runs"
+   },
+   {
+    "framework": "jRDF2Vec",
+    "x": "12",
+    "facet": "1000 walks",
+    "seconds": 1907.289,
+    "ok": true,
+    "time": "31.8 min",
+    "range": "30.2 min – 31.9 min, 3 runs"
+   },
+   {
+    "framework": "jRDF2Vec",
+    "x": "4",
+    "facet": "1000 walks",
+    "seconds": 1135.539,
+    "ok": true,
+    "time": "18.9 min",
+    "range": "18.7 min – 19.1 min, 3 runs"
+   },
+   {
+    "framework": "jRDF2Vec",
+    "x": "8",
+    "facet": "1000 walks",
+    "seconds": 1624.699,
+    "ok": true,
+    "time": "27.1 min",
+    "range": "26.2 min – 27.5 min, 3 runs"
+   },
+   {
+    "framework": "jRDF2Vec",
+    "x": "12",
+    "facet": "500 walks",
+    "seconds": 968.05,
+    "ok": true,
+    "time": "16.1 min",
+    "range": "15.3 min – 16.3 min, 3 runs"
+   },
+   {
+    "framework": "jRDF2Vec",
+    "x": "4",
+    "facet": "500 walks",
+    "seconds": 574.025,
+    "ok": true,
+    "time": "9.6 min",
+    "range": "9.5 min – 9.6 min, 3 runs"
+   },
+   {
+    "framework": "jRDF2Vec",
+    "x": "8",
+    "facet": "500 walks",
+    "seconds": 818.224,
+    "ok": true,
+    "time": "13.6 min",
+    "range": "13.2 min – 13.8 min, 3 runs"
+   },
+   {
+    "framework": "pyRDF2Vec",
+    "x": "12",
+    "facet": "100 walks",
+    "seconds": 3811.3199999999997,
+    "ok": true,
+    "time": "1.1 h",
+    "range": "1.0 h – 1.1 h, 2 runs"
+   },
+   {
+    "framework": "pyRDF2Vec",
+    "x": "4",
+    "facet": "100 walks",
+    "seconds": 1728.317,
+    "ok": true,
+    "time": "28.8 min",
+    "range": "27.7 min – 33.1 min, 3 runs"
+   },
+   {
+    "framework": "pyRDF2Vec",
+    "x": "8",
+    "facet": "100 walks",
+    "seconds": 2832.284,
+    "ok": true,
+    "time": "47.2 min",
+    "range": "45.9 min – 48.5 min, 2 runs"
+   },
+   {
+    "framework": "pyRDF2Vec",
+    "x": "12",
+    "facet": "1000 walks",
+    "seconds": 43200.003,
+    "ok": false,
+    "time": "> 12.0 h (timed out)",
+    "range": ""
+   },
+   {
+    "framework": "pyRDF2Vec",
+    "x": "4",
+    "facet": "1000 walks",
+    "seconds": 26212.5305,
+    "ok": true,
+    "time": "7.3 h",
+    "range": "6.9 h – 7.6 h, 2 runs"
+   },
+   {
+    "framework": "pyRDF2Vec",
+    "x": "8",
+    "facet": "1000 walks",
+    "seconds": 35500.2285,
+    "ok": true,
+    "time": "9.9 h",
+    "range": "8.9 h – 10.8 h, 2 runs"
+   },
+   {
+    "framework": "pyRDF2Vec",
+    "x": "12",
+    "facet": "500 walks",
+    "seconds": 25950.601499999997,
+    "ok": true,
+    "time": "7.2 h",
+    "range": "7.1 h – 7.4 h, 2 runs"
+   },
+   {
+    "framework": "pyRDF2Vec",
+    "x": "4",
+    "facet": "500 walks",
+    "seconds": 12225.847,
+    "ok": true,
+    "time": "3.4 h",
+    "range": "3.2 h – 3.6 h, 3 runs"
+   },
+   {
+    "framework": "pyRDF2Vec",
+    "x": "8",
+    "facet": "500 walks",
+    "seconds": 17383.538,
+    "ok": true,
+    "time": "4.8 h",
+    "range": "4.3 h – 5.3 h, 2 runs"
+   }
+  ]
+ },
+ "facet": {
+  "column": {
+   "field": "facet",
+   "type": "ordinal",
+   "title": null,
+   "sort": [
+    "100 walks",
+    "500 walks",
+    "1000 walks"
+   ],
+   "header": {
+    "labelFontSize": 12
+   }
+  }
+ },
+ "spec": {
+  "width": 180,
+  "height": 230,
+  "layer": [
+   {
+    "transform": [
+     {
+      "filter": "datum.ok"
+     }
+    ],
+    "mark": {
+     "type": "line",
+     "strokeWidth": 2,
+     "strokeCap": "round",
+     "strokeJoin": "round"
+    },
+    "encoding": {
+     "x": {
+      "field": "x",
+      "type": "ordinal",
+      "title": "Walk depth",
+      "sort": [
+       "4",
+       "8",
+       "12"
+      ],
+      "axis": {
+       "labelAngle": 0
+      }
+     },
+     "y": {
+      "field": "seconds",
+      "type": "quantitative",
+      "title": "Wall time, end to end (s, log scale)",
+      "scale": {
+       "type": "log",
+       "domain": [
+        10.0,
+        100000.0
+       ]
+      },
+      "axis": {
+       "values": [
+        10.0,
+        100.0,
+        1000.0,
+        10000.0,
+        100000.0
+       ],
+       "format": ",.0f"
+      }
+     },
+     "color": {
+      "field": "framework",
+      "type": "nominal",
+      "title": null,
+      "scale": {
+       "domain": [
+        "rdf2vecgpu (PyTorch)",
+        "rdf2vecgpu (gensim)",
+        "jRDF2Vec",
+        "pyRDF2Vec"
+       ],
+       "range": [
+        "#2a78d6",
+        "#eb6834",
+        "#1baf7a",
+        "#eda100"
+       ]
+      },
+      "legend": {
+       "orient": "top",
+       "direction": "horizontal",
+       "symbolStrokeWidth": 2
+      }
+     },
+     "detail": {
+      "field": "framework"
+     },
+     "opacity": {
+      "condition": {
+       "param": "pick",
+       "empty": true,
+       "value": 1
+      },
+      "value": 0.15
+     }
+    }
+   },
+   {
+    "params": [
+     {
+      "name": "pick",
+      "select": {
+       "type": "point",
+       "fields": [
+        "framework"
+       ]
+      },
+      "bind": "legend"
+     }
+    ],
+    "mark": {
+     "type": "point",
+     "size": 70,
+     "strokeWidth": 2,
+     "filled": true
+    },
+    "encoding": {
+     "x": {
+      "field": "x",
+      "type": "ordinal",
+      "title": "Walk depth",
+      "sort": [
+       "4",
+       "8",
+       "12"
+      ],
+      "axis": {
+       "labelAngle": 0
+      }
+     },
+     "y": {
+      "field": "seconds",
+      "type": "quantitative",
+      "title": "Wall time, end to end (s, log scale)",
+      "scale": {
+       "type": "log",
+       "domain": [
+        10.0,
+        100000.0
+       ]
+      },
+      "axis": {
+       "values": [
+        10.0,
+        100.0,
+        1000.0,
+        10000.0,
+        100000.0
+       ],
+       "format": ",.0f"
+      }
+     },
+     "color": {
+      "field": "framework",
+      "type": "nominal",
+      "title": null,
+      "scale": {
+       "domain": [
+        "rdf2vecgpu (PyTorch)",
+        "rdf2vecgpu (gensim)",
+        "jRDF2Vec",
+        "pyRDF2Vec"
+       ],
+       "range": [
+        "#2a78d6",
+        "#eb6834",
+        "#1baf7a",
+        "#eda100"
+       ]
+      },
+      "legend": {
+       "orient": "top",
+       "direction": "horizontal",
+       "symbolStrokeWidth": 2
+      }
+     },
+     "stroke": {
+      "field": "framework",
+      "type": "nominal",
+      "title": null,
+      "scale": {
+       "domain": [
+        "rdf2vecgpu (PyTorch)",
+        "rdf2vecgpu (gensim)",
+        "jRDF2Vec",
+        "pyRDF2Vec"
+       ],
+       "range": [
+        "#2a78d6",
+        "#eb6834",
+        "#1baf7a",
+        "#eda100"
+       ]
+      },
+      "legend": {
+       "orient": "top",
+       "direction": "horizontal",
+       "symbolStrokeWidth": 2
+      }
+     },
+     "shape": {
+      "field": "framework",
+      "type": "nominal",
+      "title": null,
+      "scale": {
+       "domain": [
+        "rdf2vecgpu (PyTorch)",
+        "rdf2vecgpu (gensim)",
+        "jRDF2Vec",
+        "pyRDF2Vec"
+       ],
+       "range": [
+        "circle",
+        "square",
+        "triangle-up",
+        "diamond"
+       ]
+      }
+     },
+     "opacity": {
+      "condition": {
+       "param": "pick",
+       "empty": true,
+       "value": 1
+      },
+      "value": 0.15
+     },
+     "fillOpacity": {
+      "condition": {
+       "test": "datum.ok",
+       "value": 1
+      },
+      "value": 0
+     },
+     "tooltip": [
+      {
+       "field": "framework",
+       "title": "Framework"
+      },
+      {
+       "field": "facet",
+       "title": "Walks per vertex"
+      },
+      {
+       "field": "x",
+       "title": "Walk depth"
+      },
+      {
+       "field": "time",
+       "title": "Median"
+      },
+      {
+       "field": "range",
+       "title": "Range"
+      }
+     ]
+    }
+   }
+  ]
+ },
+ "resolve": {
+  "scale": {
+   "y": "shared"
+  }
+ },
+ "config": {
+  "background": null,
+  "font": "system-ui, -apple-system, Segoe UI, sans-serif",
+  "view": {
+   "stroke": null
+  },
+  "title": {
+   "color": "#0b0b0b",
+   "subtitleColor": "#52514e",
+   "fontSize": 14,
+   "fontWeight": 600
+  },
+  "axis": {
+   "labelColor": "#52514e",
+   "titleColor": "#52514e",
+   "gridColor": "#e4e3df",
+   "domainColor": "#e4e3df",
+   "tickColor": "#e4e3df",
+   "gridWidth": 1,
+   "titleFontWeight": 500
+  },
+  "header": {
+   "labelColor": "#0b0b0b",
+   "titleColor": "#52514e",
+   "titleFontWeight": 500
+  },
+  "legend": {
+   "labelColor": "#0b0b0b",
+   "labelFontSize": 12
+  }
+ }
+}

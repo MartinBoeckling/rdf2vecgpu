@@ -29,6 +29,7 @@ import pandas as pd
 # default pytorch backend don't need them installed; raise a friendly error
 # only when the gensim path is actually invoked.
 try:
+    import pyarrow.compute as pc
     import pyarrow.parquet as pq
     from gensim.models import Word2Vec
 
@@ -77,6 +78,28 @@ def load_id_to_word(word2idx_df) -> np.ndarray:
     return words
 
 
+def _list_matrix(column) -> np.ndarray | None:
+    """A list<number> column as an int64 ``[rows, list length]`` matrix, or
+    None when its lists differ in length or one is null. Null and NaN values
+    become -1; floats are truncated like ``int()``."""
+    n = len(column)
+    if column.null_count:
+        return None
+    if n == 0:
+        return np.empty((0, 0), dtype=np.int64)
+    bounds = pc.min_max(pc.list_value_length(column))
+    width = bounds["min"].as_py()
+    if width != bounds["max"].as_py():
+        return None
+    values = column.flatten()
+    if values.null_count:
+        values = pc.fill_null(values, -1)
+    flat = values.to_numpy(zero_copy_only=False)
+    if flat.dtype.kind == "f":
+        flat = np.where(np.isnan(flat), -1, flat)
+    return flat.astype(np.int64, copy=False).reshape(n, width)
+
+
 class WalkCorpus:
     """Stream walks-parquet → interleaved URI sequences for gensim.
 
@@ -94,6 +117,13 @@ class WalkCorpus:
     hit before max_depth). We trim each walk at the first `-1` and keep the
     matching predicate prefix; walks with fewer than 2 valid vertices are
     skipped (need at least one edge for skip-gram).
+
+    Each parquet batch of ``batch_size`` walks is converted with numpy as one
+    ``[walks, tokens]`` matrix (walk lists of one fixed length, as the GPU
+    writes them), and the token strings come from a table built once. A batch
+    that doesn't fit that shape (walk lists of different lengths, null
+    walks, negative tokens inside a walk) is read walk by walk instead, with
+    the same output.
     """
 
     def __init__(
@@ -123,38 +153,83 @@ class WalkCorpus:
                 "word2idx mapping or set int_tokens=True"
             )
 
+        self._int_strings = np.empty(0, dtype=object)
+
     def __iter__(self):
-        id_to_word = self.id_to_word
-        int_tokens = self.int_tokens
         for f in self.files:
             pf = pq.ParquetFile(f)
             for batch in pf.iter_batches(
                 columns=["vertices", "predicates"], batch_size=self.batch_size
             ):
-                # Convert list<int> columns once per batch, not per walk.
-                vs = batch.column("vertices").to_pylist()
-                ps = batch.column("predicates").to_pylist()
-                for walk_v, walk_p in zip(vs, ps):
-                    end = next(
-                        (i for i, v in enumerate(walk_v) if v < 0),
-                        len(walk_v),
-                    )
-                    if end < 2:
-                        continue
-                    walk_v = walk_v[:end]
-                    walk_p = walk_p[: end - 1]
-                    if int_tokens:
-                        v_words = [str(int(v)) for v in walk_v]
-                        p_words = [str(int(p)) for p in walk_p]
-                    else:
-                        v_words = id_to_word[walk_v].tolist()
-                        # Predicates may come back as float (cuGraph edge-weight
-                        # slot is float-typed); cast to int for fancy-indexing.
-                        p_words = id_to_word[[int(p) for p in walk_p]].tolist()
-                    out: list[Any] = [None] * (len(walk_v) + len(walk_p))
-                    out[0::2] = v_words
-                    out[1::2] = p_words
-                    yield out
+                walks = self._walks_of_batch(batch)
+                if walks is None:
+                    walks = self._walks_one_by_one(batch)
+                yield from walks
+
+    def _walks_of_batch(self, batch):
+        """The batch's walks via one token matrix, or None if the batch
+        doesn't have that shape (see the class docstring)."""
+        vertices = _list_matrix(batch.column("vertices"))
+        predicates = _list_matrix(batch.column("predicates"))
+        if vertices is None or predicates is None:
+            return None
+        n, n_vertices = vertices.shape
+        if n == 0 or n_vertices < 2 or predicates.shape[1] < n_vertices - 1:
+            return None
+        width = 2 * n_vertices - 1
+        tokens = np.empty((n, width), dtype=np.int64)
+        tokens[:, 0::2] = vertices
+        tokens[:, 1::2] = predicates[:, : n_vertices - 1]
+        negative = vertices < 0
+        ends = np.where(negative.any(axis=1), negative.argmax(axis=1), n_vertices)
+        lengths = 2 * ends - 1
+        tokens[np.arange(width) >= lengths[:, None]] = 0   # past the walk's end
+        if (tokens < 0).any():
+            return None
+        words = self._strings_for(int(tokens.max()))[tokens].tolist()
+        return (
+            row if length == width else row[:length]
+            for row, length, end in zip(words, lengths.tolist(), ends.tolist())
+            if end >= 2
+        )
+
+    def _strings_for(self, largest_token: int) -> np.ndarray:
+        """Token → word table covering ``largest_token``: `id_to_word`, or the
+        tokens as strings, built once and extended when a larger token turns up."""
+        if not self.int_tokens:
+            return self.id_to_word
+        if largest_token >= len(self._int_strings):
+            size = max(largest_token + 1, 2 * len(self._int_strings))
+            self._int_strings = np.array([str(t) for t in range(size)], dtype=object)
+        return self._int_strings
+
+    def _walks_one_by_one(self, batch):
+        id_to_word = self.id_to_word
+        int_tokens = self.int_tokens
+        # Convert list<int> columns once per batch, not per walk.
+        vs = batch.column("vertices").to_pylist()
+        ps = batch.column("predicates").to_pylist()
+        for walk_v, walk_p in zip(vs, ps):
+            end = next(
+                (i for i, v in enumerate(walk_v) if v < 0),
+                len(walk_v),
+            )
+            if end < 2:
+                continue
+            walk_v = walk_v[:end]
+            walk_p = walk_p[: end - 1]
+            if int_tokens:
+                v_words = [str(int(v)) for v in walk_v]
+                p_words = [str(int(p)) for p in walk_p]
+            else:
+                v_words = id_to_word[walk_v].tolist()
+                # Predicates may come back as float (cuGraph edge-weight
+                # slot is float-typed); cast to int for fancy-indexing.
+                p_words = id_to_word[[int(p) for p in walk_p]].tolist()
+            out: list[Any] = [None] * (len(walk_v) + len(walk_p))
+            out[0::2] = v_words
+            out[1::2] = p_words
+            yield out
 
 
 def kv_to_token_aligned_matrix(kv, word2idx_df, int_tokens: bool | None = None) -> np.ndarray:
@@ -220,6 +295,8 @@ def train_gensim_word2vec(
     epochs: int = 5,
     workers: int = 4,
     learning_rate: float = 0.025,
+    min_learning_rate: float = 0.0001,
+    sample: float = 0.001,
     random_state: int = 42,
     batch_size: int = 20_000,
     int_tokens: bool = True,
@@ -239,9 +316,10 @@ def train_gensim_word2vec(
         The word2idx mapping (`word`, `token` columns). Required even when
         `int_tokens=True` so the resulting embeddings can be joined back to
         URIs in `transform()`.
-    vector_size, window, min_count, negative, epochs, workers, learning_rate, random_state : int or float
+    vector_size, window, min_count, negative, epochs, workers, learning_rate, min_learning_rate, sample, random_state : int or float
         Forwarded to `gensim.models.Word2Vec` (``learning_rate`` as
-        ``alpha``, ``random_state`` as ``seed``).
+        ``alpha``, ``min_learning_rate`` as ``min_alpha``, ``random_state``
+        as ``seed``).
     embedding_model : {"skipgram", "cbow"}, default "skipgram"
         Mapped to gensim's `sg=1` / `sg=0`.
     int_tokens : bool, default True
@@ -269,6 +347,8 @@ def train_gensim_word2vec(
         workers=workers,
         epochs=epochs,
         alpha=learning_rate,
+        min_alpha=min_learning_rate,
+        sample=sample,
         seed=random_state,
     )
     return model

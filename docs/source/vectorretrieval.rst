@@ -25,7 +25,6 @@ The following example demonstrates how to perform this retrieval process:
        vector_size=100,
        window_size=5,
        min_count=1,
-       learning_rate=0.01,
        negative_samples=5,
        random_state=42,
        reproducible=False,

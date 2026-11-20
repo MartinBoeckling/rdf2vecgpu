@@ -59,8 +59,8 @@ pip install "rdf2vecgpu[wandb]"    # Weights & Biases experiment tracking
 pip install "rdf2vecgpu[test]"     # test suite
 ```
 
-The pinned environments used for the ISWC 2025 benchmarks (gpuRDF2Vec and the baselines) are in
-[`performance/env_files`](https://github.com/MartinBoeckling/rdf2vecgpu/blob/main/performance/env_files).
+The scripts and pinned environments used for the ISWC 2025 benchmarks (gpuRDF2Vec and the
+baselines) are in the [`v0.5.0` tag](https://github.com/MartinBoeckling/rdf2vecgpu/tree/v0.5.0/performance).
 
 ## gpuRDF2Vec overview
 
@@ -85,17 +85,19 @@ RDF2Vec is a powerful technique to generate vector embeddings of entities in RDF
 │   └── _compat.py          # cuGraph / dask compatibility patches
 ├── test/                   # unit and GPU end-to-end tests
 ├── docs/                   # Sphinx documentation (Read the Docs)
-├── performance/            # ISWC 2025 benchmark scripts and environments
+├── performance/            # end-to-end benchmark harness and chart generator
 └── data_preparation/       # dataset conversion scripts
 ```
 
 ### Capability overview
 
 - Random and BFS walk generation on the GPU with cuGraph, single- or multi-GPU, optionally weighted
-- Skip-gram and CBOW training on the GPU with PyTorch Lightning (single- or multi-GPU DDP), or on the CPU with gensim
+- Skip-gram, CBOW and order-aware skip-gram (RDF2Vec_oa) training on the GPU with PyTorch Lightning (single- or multi-GPU DDP), or skip-gram and CBOW on the CPU with gensim
+- Walks generated once and trained on later: `prepare_corpus` writes them to Parquet, `fit_from_walks` trains from the files
 - Readers for Parquet, CSV, ORC, N-Triples/N-Quads and every RDF format rdflib parses
 - Literal handling (drop or bin numeric literals) and MLflow / W&B experiment tracking
-- The benchmark scripts of the ISWC 2025 paper are in the [performance folder](https://github.com/MartinBoeckling/rdf2vecgpu/blob/main/performance)
+- Benchmarks against jRDF2Vec and pyRDF2Vec: [performance page](https://rdf2vecgpu.readthedocs.io/en/latest/performance.html)
+- The benchmark harness is in the [performance folder](https://github.com/MartinBoeckling/rdf2vecgpu/blob/main/performance); the scripts of the ISWC 2025 paper are in the [`v0.5.0` tag](https://github.com/MartinBoeckling/rdf2vecgpu/tree/v0.5.0/performance)
 
 ## Quick start
 
@@ -113,7 +115,6 @@ config = RDF2VecConfig(
     vector_size=100,
     window_size=5,
     min_count=1,
-    learning_rate=0.01,
     negative_samples=5,
     random_state=42,
     reproducible=False,
@@ -146,9 +147,9 @@ embeddings.to_parquet("data/wikidata5m/wikidata5m_embeddings.parquet", index=Fal
   - All supported [RDFlib file formats](https://rdflib.readthedocs.io/en/stable/plugin_parsers.html)
 - Core `RDF2VecConfig` parameters (see the [configuration reference](https://rdf2vecgpu.readthedocs.io/en/latest/configuration.html) for defaults and details):
   - Walks: `walk_strategy` (`"random"`, `"bfs"`), `walk_depth`, `walk_number`, `walk_weighted` (biased random walks; requires a `weights` column)
-  - Model: `embedding_model` (`"skipgram"`, `"cbow"`), `backend` (`"pytorch"`, `"gensim"`), `vector_size`, `window_size`, `min_count`, `negative_samples`, `learning_rate`
-  - Training: `epochs`, `batch_size` (if `None`, Lightning's batch-size tuner picks it on a single GPU), `tune_batch_size`, `random_state`, `reproducible`, `cpu_count` (gensim worker threads)
-  - Execution: `multi_gpu` (requires a Dask client), `num_nodes`, `generate_artifact`
+  - Model: `embedding_model` (`"skipgram"`, `"cbow"`, `"order_aware_skipgram"`), `backend` (`"pytorch"`, `"gensim"`), `vector_size`, `window_size`, `min_count`, `negative_samples`
+  - Training: `epochs`, `batch_size` (training pairs per step, default 32768), `learning_rate`, `min_learning_rate`, `sample` (frequent-token subsampling), `shrink_window`, `grad_clip_value`, `random_state`, `reproducible`, `cpu_count` (gensim worker threads)
+  - Execution: `multi_gpu` (`load_data` requires a Dask client), `num_nodes`, `generate_artifact`
   - Literals: `literal_predicates`, `literal_strategy`, `literal_n_bins`, `literal_bin_strategy`
   - Tracking: `tracker` (`"none"`, `"mlflow"`, `"wandb"`), `tracker_kwargs`, `tracker_run_name`
 
@@ -164,18 +165,23 @@ in the [ISWC 2025 paper](#citation).
 2. **Walks** (`fit`): every start vertex (by default every subject) is repeated `walk_number`
    times and the walks are generated in bulk by cuGraph: `uniform_random_walks`, or
    `biased_random_walks` with `walk_weighted=True`. The predicate of every step is recovered
-   from the edge that was actually traversed. BFS walks run one cuGraph BFS per start vertex,
-   so their cost grows with the size of the graph. With `multi_gpu=True`, the walks are
-   generated on all GPUs of the Dask cluster.
-3. **Training data** (`backend="pytorch"`): the walks are turned into (center, context) pairs
-   with cuDF and handed to PyTorch through DLPack without leaving the GPU. The data loader
-   indexes into these GPU tensors instead of copying batches.
-4. **Training**: Skip-gram with negative sampling or CBOW, trained with PyTorch Lightning
-   (Adam, 16-bit mixed precision). On a single GPU, Lightning's batch-size tuner picks the batch
-   size unless `batch_size` is set or `tune_batch_size=False`. With `multi_gpu=True`, the pairs are written to Parquet, the
-   Dask cluster is released, and Lightning trains with DDP: each GPU reads its own block of the
-   pairs and gradients are averaged every step. With `backend="gensim"`, the walks are streamed
-   from Parquet into gensim's Word2Vec on the CPU instead.
+   from the edge that was actually traversed. On one GPU the walks are generated in chunks of
+   up to 25 M walks and kept as int32 token matrices. BFS walks run one cuGraph BFS per start
+   vertex and give one walk per root-to-leaf path, so their cost grows with the size of the graph.
+   With `multi_gpu=True`, the walks are generated on all GPUs of the Dask cluster.
+   `prepare_corpus` writes the walks to Parquet instead, and `fit_from_walks` trains from those
+   files later, without the graph.
+3. **Training data** (`backend="pytorch"`): the walks stay in GPU memory as sequences. Every step
+   takes a shuffled batch of walks, drops frequent tokens (`sample`, as in word2vec) and builds the
+   (center, context) pairs of that batch on the GPU. Steps are sized to hold about `batch_size`
+   pairs (default 32768) after subsampling and walks that end early. With `multi_gpu=True`, the
+   walks are written to Parquet, the Dask client is closed, and each GPU reads its own block.
+4. **Training**: skip-gram, CBOW or order-aware skip-gram with negative sampling, trained with
+   PyTorch Lightning the way word2vec trains: summed loss, sparse SGD with a learning rate that
+   decays linearly from `learning_rate` to `min_learning_rate`, and negatives drawn by token
+   frequency^0.75. With `multi_gpu=True`, Lightning trains with DDP and averages the gradients
+   every step. With `backend="gensim"`, the walks are streamed from Parquet into gensim's
+   Word2Vec on the CPU instead.
 5. **Output** (`transform`): the embedding matrix is copied into a cuDF table with one row per
    token (`token`, `word`, `embedding_*`), optionally written to Parquet.
 

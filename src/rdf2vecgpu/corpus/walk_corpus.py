@@ -69,10 +69,15 @@ def _decode_predicates(edge_attrs, code_to_token):
     codes = cp.asarray(edge_attrs)
     if code_to_token is None:
         return codes
-    ci = cp.rint(codes).astype(cp.int64)
-    if ci.size and (not bool((ci == codes).all()) or int(ci.min()) < 0 or int(ci.max()) >= len(code_to_token)):
+    # int32 throughout: codes stay below 2^24 and vocabulary tokens below
+    # 2^31 (cuDF's row limit caps the vocabulary), and an int64 copy of every
+    # step of a large walk corpus is what ran out of GPU memory first
+    ci = codes.astype(cp.int32)
+    if ci.size and (
+        not bool((ci.astype(codes.dtype) == codes).all()) or int(ci.min()) < 0 or int(ci.max()) >= len(code_to_token)
+    ):
         raise ValueError("predicate codes returned by cuGraph are not valid code indices")
-    return cp.asarray(code_to_token)[ci]
+    return cp.asarray(code_to_token, dtype=cp.int32)[ci]
 
 
 # ── Weighted walks: predicate recovery ──────────────────────────────────────
@@ -133,11 +138,12 @@ def _pick_parallel_edges(steps, index, keys, random_state, what):
     groups = index[index["rank"] == 0][keys + ["n"]]
     is_dask = isinstance(steps, dcudf.DataFrame)
     if not is_dask:
-        # merge output order is arbitrary; the draws follow the input order
-        steps = steps.assign(_row=cp.arange(len(steps)))
+        # Row i takes the i-th draw of the seeded stream: drawn in input order
+        # and carried through the merge (whose output order is arbitrary), so
+        # the result needs no sort back into input order (on BFS corpora that
+        # sort was the largest allocation)
+        steps = steps.assign(_u=cp.random.RandomState(random_state).random_sample(len(steps)))
     out = steps.merge(groups, on=keys, how="left")
-    if not is_dask:
-        out = out.sort_values("_row").drop(columns="_row").reset_index(drop=True)
     if is_dask:
         from dask.distributed import wait as dask_wait
 
@@ -153,7 +159,8 @@ def _pick_parallel_edges(steps, index, keys, random_state, what):
     if is_dask:
         out = out.map_partitions(_draw_ranks, random_state)
     else:
-        out = _draw_ranks(out, random_state)
+        n = out["n"].values
+        out = out.assign(rank=cp.minimum((out["_u"].values * n).astype(cp.int32), n - 1)).drop(columns="_u")
     out = out.merge(index[keys + ["rank", "predicate"]], on=keys + ["rank"])
     out = out.drop(columns=["rank", "n"])
     return out.assign(predicate=out["predicate"].astype("int64"))
@@ -632,6 +639,217 @@ class SingleGPUWalkCorpus:
                                code_to_token=self.code_to_token,
                                edge_index=self.edge_index if self.walk_weighted else None,
                                random_state=random_state)
+
+    def walk_chunks(self, walk_vertices, walk_number: int, walk_depth: int, random_state,
+                    walks_per_chunk: int | None = None):
+        """Random walks in chunks: ``walk_number`` walks from each start vertex
+        in `walk_vertices`, at most ``walks_per_chunk`` walks (whole start
+        vertices) per cuGraph call (default `SINGLE_GPU_WALKS_PER_CHUNK`).
+
+        Yields ``(vertices, predicates)`` cupy int32 matrices per chunk,
+        ``(m, walk_depth + 1)`` and ``(m, walk_depth)``, in cuGraph's layout:
+        ``-1`` vertices after a walk's end. A walk corpus of one call grows
+        with the walks, and so do cuGraph's intermediates: chunking bounds
+        the GPU memory a walk call needs. Chunk ``i`` is walked with seed
+        ``random_state + i`` (None lets cuGraph seed each call), so a corpus
+        of one chunk is the walks of a single call with `random_state`.
+        """
+        per_chunk = SINGLE_GPU_WALKS_PER_CHUNK if walks_per_chunk is None else int(walks_per_chunk)
+        if hasattr(walk_vertices, "compute"):
+            walk_vertices = walk_vertices.compute()
+        starts = walk_vertices.reset_index(drop=True)
+        vertices_per_chunk = max(1, per_chunk // max(1, walk_number))
+        for i, lo in enumerate(range(0, len(starts), vertices_per_chunk)):
+            chunk = starts.iloc[lo:lo + vertices_per_chunk]
+            if walk_number > 1:
+                chunk = chunk.repeat(walk_number)
+            chunk = chunk.reset_index(drop=True)
+            seed = None if random_state is None else random_state + i
+            paths, attrs, max_length = self._walks(chunk, walk_depth, seed)
+            max_length = int(max_length)
+            n = len(paths) // (max_length + 1)
+            vs = cp.asarray(paths.values).reshape(n, max_length + 1)
+            ws = cp.asarray(attrs.values).reshape(n, max_length)
+            del paths, attrs
+            if self.walk_weighted:
+                ps = _weighted_predicate_matrix(vs, ws, self.edge_index, seed)
+            else:
+                ps = _decode_predicates(ws, self.code_to_token)
+            del ws
+            vs, ps = vs.astype(cp.int32, copy=False), ps.astype(cp.int32, copy=False)
+            if max_length < walk_depth:  # every walk of the call ended early
+                vs = cp.pad(vs, ((0, 0), (0, walk_depth - max_length)), constant_values=-1)
+                ps = cp.pad(ps, ((0, 0), (0, walk_depth - max_length)), constant_values=0)
+            yield vs, ps
+
+    def walk_matrices(self, walk_vertices, walk_number: int, walk_depth: int, random_state,
+                      walks_per_chunk: int | None = None):
+        """All walks of `walk_chunks` as two GPU int32 torch matrices (see
+        `walk_chunk_matrices`)."""
+        chunks = self.walk_chunks(walk_vertices, walk_number, walk_depth, random_state, walks_per_chunk)
+        return walk_chunk_matrices(chunks, walk_depth, n_walks=len(walk_vertices) * walk_number)
+
+    def write_walk_sequences(self, walk_vertices, walk_number: int, walk_depth: int, random_state,
+                             out_dir: str, walks_per_chunk: int | None = None, file_mb: float = 300) -> int:
+        """Walks of `walk_chunks` written chunk by chunk to a parquet directory
+        (see `write_walk_chunks`). Returns the number of walks."""
+        chunks = self.walk_chunks(walk_vertices, walk_number, walk_depth, random_state, walks_per_chunk)
+        return write_walk_chunks(chunks, out_dir, walk_depth, file_mb)
+
+    def bfs_chunks(self, edge_df, walk_vertices, walk_depth: int, random_state,
+                   walks_per_chunk: int | None = None):
+        """BFS walks as walk sequences: for each root in `walk_vertices`, one
+        walk per leaf of its BFS tree (at most `walk_depth` edges deep), the
+        root-to-leaf path. Yields ``(vertices, predicates)`` cupy int32
+        matrices, ``(m, walk_depth + 1)`` and ``(m, walk_depth)``, -1 vertices
+        (and 0 predicates) after a path's end, like `walk_chunks`; one chunk
+        per run of whole roots holding at least ``walks_per_chunk`` walks
+        (default `SINGLE_GPU_WALKS_PER_CHUNK`).
+
+        As in `_bfs_walk_steps`, the trees are built on the distinct (subject,
+        object) pairs of `edge_df` (cuGraph's `bfs` takes a `cugraph.Graph`)
+        and over parallel edges each step's predicate is drawn uniformly, with
+        seed ``random_state + i`` for chunk ``i``. Raises if no root has a walk.
+        """
+        from cugraph import Graph
+
+        per_chunk = SINGLE_GPU_WALKS_PER_CHUNK if walks_per_chunk is None else int(walks_per_chunk)
+        keys = ["subject", "object"]
+        pairs = edge_df[keys].drop_duplicates()
+        graph = Graph(directed=True)
+        graph.from_cudf_edgelist(pairs, source="subject", destination="object", renumber=False)
+        index = None  # the parallel-edge index, built once the first chunk has walks
+        key_dtype = edge_df["subject"].dtype
+        n_ids = int(max(pairs["subject"].max(), pairs["object"].max())) + 1
+        # vertex-indexed scratch arrays, filled for one tree and reset after it
+        predecessor = cp.full(n_ids, -1, dtype=cp.int32)
+        is_parent = cp.zeros(n_ids, dtype=cp.bool_)
+        if hasattr(walk_vertices, "compute"):
+            walk_vertices = walk_vertices.compute()
+        roots = walk_vertices.values_host if hasattr(walk_vertices, "values_host") else walk_vertices
+        pending, rows, chunk, total = [], 0, 0, 0
+        for root in np.asarray(roots).tolist():
+            paths = _bfs_root_paths(graph, int(root), walk_depth, predecessor, is_parent)
+            if paths is None:
+                continue
+            pending.append(paths)
+            rows += len(paths)
+            if rows >= per_chunk:
+                seed = None if random_state is None else random_state + chunk
+                if index is None:
+                    index = _parallel_edge_index(edge_df[keys + ["predicate"]], keys)
+                yield _bfs_chunk(pending, index, keys, key_dtype, walk_depth, seed)
+                total, rows, chunk, pending = total + rows, 0, chunk + 1, []
+        if pending:
+            seed = None if random_state is None else random_state + chunk
+            if index is None:
+                index = _parallel_edge_index(edge_df[keys + ["predicate"]], keys)
+            yield _bfs_chunk(pending, index, keys, key_dtype, walk_depth, seed)
+            total += rows
+        if not total:
+            raise ValueError("BFS produced no walks from the given start vertices.")
+
+
+def _bfs_root_paths(graph, root, walk_depth, predecessor, is_parent):
+    """Root-to-leaf paths of `root`'s BFS tree as a cupy int32 ``(leaves,
+    walk_depth + 1)`` matrix (-1 after a path's end), or None for a root
+    without out-edges. Each path is filled backwards from its leaf through
+    the tree's predecessors, using the vertex-indexed scratch arrays
+    `predecessor` (-1) and `is_parent` (False), which are reset afterwards."""
+    tree = filter_unreachable(bfs(graph, start=root, depth_limit=walk_depth))
+    tree = tree[tree["predecessor"] != -1]
+    if not len(tree):
+        return None
+    vertex = tree["vertex"].values.astype(cp.int32)
+    parent = tree["predecessor"].values.astype(cp.int32)
+    distance = tree["distance"].values.astype(cp.int64)
+    predecessor[vertex] = parent
+    is_parent[parent] = True
+    leaf = ~is_parent[vertex]
+    paths = cp.full((int(leaf.sum()), walk_depth + 1), -1, dtype=cp.int32)
+    paths[cp.arange(len(paths)), distance[leaf]] = vertex[leaf]
+    for k in range(walk_depth, 0, -1):
+        on = cp.flatnonzero(paths[:, k] >= 0)
+        paths[on, k - 1] = predecessor[paths[on, k]]
+    predecessor[vertex] = -1
+    is_parent[parent] = False
+    return paths
+
+
+def _bfs_chunk(pending, index, keys, key_dtype, walk_depth, random_state):
+    """Stack the root-to-leaf paths of several roots and draw each step's
+    predicate among its parallel edges (`_pick_parallel_edges`)."""
+    vertices = cp.concatenate(pending)
+    pending.clear()
+    dst = vertices[:, 1:].ravel()
+    step = cp.flatnonzero(dst >= 0)
+    steps = cudf.DataFrame({
+        "subject": cudf.Series(vertices[:, :-1].ravel()[step]).astype(key_dtype),
+        "object": cudf.Series(dst[step]).astype(key_dtype),
+        "_i": step,
+    })
+    picked = _pick_parallel_edges(steps, index, keys, random_state, "BFS walk")
+    predicates = cp.zeros(len(vertices) * walk_depth, dtype=cp.int32)
+    predicates[picked["_i"].values] = picked["predicate"].values.astype(cp.int32)
+    return vertices, predicates.reshape(len(vertices), walk_depth)
+
+
+def walk_chunk_matrices(chunks, walk_depth, n_walks=None):
+    """The ``(vertices, predicates)`` cupy int32 chunks of a walk corpus as two
+    GPU int32 torch matrices, ``(n, walk_depth + 1)`` and ``(n, walk_depth)``:
+    the corpus as the PyTorch trainer holds it in GPU memory, half the size
+    of int64 list columns and not bound by cuDF's 2^31-element limit. With
+    `n_walks` (an upper bound) the chunks are copied into matrices allocated
+    once, otherwise stacked at the end."""
+    device = torch.device("cuda", cp.cuda.Device().id)
+    if n_walks is None:
+        parts = [(torch.as_tensor(vs, device=device), torch.as_tensor(ps, device=device)) for vs, ps in chunks]
+        if not parts:
+            return (torch.empty((0, walk_depth + 1), dtype=torch.int32, device=device),
+                    torch.empty((0, walk_depth), dtype=torch.int32, device=device))
+        vertices = torch.cat([v for v, _ in parts])
+        predicates = torch.cat([p for _, p in parts])
+        del parts
+    else:
+        vertices = torch.empty((n_walks, walk_depth + 1), dtype=torch.int32, device=device)
+        predicates = torch.empty((n_walks, walk_depth), dtype=torch.int32, device=device)
+        row = 0
+        for vs, ps in chunks:
+            vertices[row:row + len(vs)] = torch.as_tensor(vs, device=device)
+            predicates[row:row + len(ps)] = torch.as_tensor(ps, device=device)
+            row += len(vs)
+        vertices, predicates = vertices[:row], predicates[:row]
+    # hand the walk intermediates cupy keeps cached back to the device, for training
+    cp.get_default_memory_pool().free_all_blocks()
+    return vertices, predicates
+
+
+def write_walk_chunks(chunks, out_dir: str, walk_depth: int, file_mb: float = 300) -> int:
+    """The ``(vertices, predicates)`` chunks of a walk corpus written one by one
+    to a parquet directory, in the schema of
+    `MultiGPUWalkCorpus.write_walk_sequences` (one row per walk, ``vertices``
+    / ``predicates`` lists, ``part.<n>.parquet``), so the corpus never has to
+    fit on the GPU at once. Returns the number of walks."""
+    import os
+
+    if os.path.isdir(out_dir) and any(f.endswith(".parquet") for f in os.listdir(out_dir)):
+        raise ValueError(f"{out_dir} already holds parquet files, which readers would mix with these walks")
+    os.makedirs(out_dir, exist_ok=True)
+    rows_per_file = max(1, int(file_mb * 10**6) // (8 * (2 * walk_depth + 1) + 8))
+    total = files = 0
+    for vs, ps in chunks:
+        walks = cudf.DataFrame({"vertices": _fixed_width_lists(vs), "predicates": _fixed_width_lists(ps)})
+        del vs, ps
+        _write_parts(walks, out_dir, files, rows_per_file)
+        files += -(-len(walks) // rows_per_file)
+        total += len(walks)
+    return total
+
+
+# Walks per cuGraph call on one GPU (`SingleGPUWalkCorpus.walk_chunks`, and
+# the BFS paths per chunk of `bfs_chunks`); the same bound as the multi-GPU
+# writer's per-GPU chunks.
+SINGLE_GPU_WALKS_PER_CHUNK = 25_000_000
 
 
 # ── Multi-GPU Walk Corpus ───────────────────────────────────────────────────
