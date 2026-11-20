@@ -35,18 +35,27 @@ When several files hold the same run, the later file wins, so the reference fram
 from an earlier measurement on the same machine. It refuses to combine runs from different
 machines, as wall times are not comparable.
 
+## Data
+
+- Synthetic graphs: download them from [Zenodo](https://doi.org/10.5281/zenodo.15368485)
+  (`<model>_graph_<size>.parquet` for Barabási–Albert, Erdős–Rényi and growing random graphs of
+  100, 1,000 and 10,000 vertices).
+- FB15k-237: the train, validation and test splits merged into one graph, `fb15k_kg.parquet`.
+
+Each graph also needs an N-Triples copy (`.nt`) next to its parquet file, which jRDF2Vec and
+pyRDF2Vec read.
+
+## Environments
+
+Each framework runs in its own Python environment, passed to `benchmark.py`:
+
+- rdf2vecgpu: the release wheel with the `gensim` extra (`pip install "rdf2vecgpu[gensim]"`) in a
+  RAPIDS environment (see the main README).
+- jRDF2Vec: the `jrdf2vec-1.3-SNAPSHOT.jar` and a Java runtime; `--jrdf2vec-python` is the Python
+  that jRDF2Vec starts its gensim server with (Python 3.12, gensim 4.3.3, Flask 2.2).
+- pyRDF2Vec: `pip install pyrdf2vec==0.2.3` (Python 3.10).
+
 ## ISWC 2025 setup
 
-This folder contains everything you need to build and run the performance benchmarks for the GPU-accelerated RDF2Vec implementation. Use these benchmarks to measure throughput, memory usage, and speedup over the CPU baseline.
-
-## Dataset creation
-Please download the set of synthetic datasets from the following [Zenodo repository](https://doi.org/10.5281/zenodo.15368485) and place them under `data/generated_graphs`. Please use the FB15k-237 repository as well as the wikidata-5m repository in order to download the data assets. For both the FB15k-237 dataset as well as the [merge_text_file script](data_preparation/merge_text_file.py) to merge all the different splits together. 
-
-For both the jrdf2vec library as well as the sparkkgml library please convert the parquet files into a ttl file.
-
-Scripts:
-- To calculate the graph statistics please run the following [script](graph_statistics.py)
-- To run the jrdf2vec performance comparison, please use the following [script](jrdf2vec_based_performance.py)
-- To run the pyrdf2vec performance comparison, please use the following [script](pyrdf2vec_based_performance.py)
-- To run the sparkrdf2vec performance comparison, please use the following [script](spark_rdf2vec_performance.py)
-- To run the gpu_rdf2vec performance comparison, please use the following [script](gpu_rdf2vec_performance.py)
+The scripts and pinned environments used for the ISWC 2025 paper are no longer maintained here.
+They are in the [`v0.5.0` tag](https://github.com/MartinBoeckling/rdf2vecgpu/tree/v0.5.0/performance).

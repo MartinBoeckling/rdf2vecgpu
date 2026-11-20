@@ -59,8 +59,8 @@ pip install "rdf2vecgpu[wandb]"    # Weights & Biases experiment tracking
 pip install "rdf2vecgpu[test]"     # test suite
 ```
 
-The pinned environments used for the ISWC 2025 benchmarks (gpuRDF2Vec and the baselines) are in
-[`performance/env_files`](https://github.com/MartinBoeckling/rdf2vecgpu/blob/main/performance/env_files).
+The scripts and pinned environments used for the ISWC 2025 benchmarks (gpuRDF2Vec and the
+baselines) are in the [`v0.5.0` tag](https://github.com/MartinBoeckling/rdf2vecgpu/tree/v0.5.0/performance).
 
 ## gpuRDF2Vec overview
 
@@ -85,7 +85,7 @@ RDF2Vec is a powerful technique to generate vector embeddings of entities in RDF
 │   └── _compat.py          # cuGraph / dask compatibility patches
 ├── test/                   # unit and GPU end-to-end tests
 ├── docs/                   # Sphinx documentation (Read the Docs)
-├── performance/            # ISWC 2025 benchmark scripts and environments
+├── performance/            # end-to-end benchmark harness and chart generator
 └── data_preparation/       # dataset conversion scripts
 ```
 
@@ -97,7 +97,7 @@ RDF2Vec is a powerful technique to generate vector embeddings of entities in RDF
 - Readers for Parquet, CSV, ORC, N-Triples/N-Quads and every RDF format rdflib parses
 - Literal handling (drop or bin numeric literals) and MLflow / W&B experiment tracking
 - Benchmarks against jRDF2Vec and pyRDF2Vec: [performance page](https://rdf2vecgpu.readthedocs.io/en/latest/performance.html)
-- The benchmark scripts of the ISWC 2025 paper are in the [performance folder](https://github.com/MartinBoeckling/rdf2vecgpu/blob/main/performance)
+- The benchmark harness is in the [performance folder](https://github.com/MartinBoeckling/rdf2vecgpu/blob/main/performance); the scripts of the ISWC 2025 paper are in the [`v0.5.0` tag](https://github.com/MartinBoeckling/rdf2vecgpu/tree/v0.5.0/performance)
 
 ## Quick start
 

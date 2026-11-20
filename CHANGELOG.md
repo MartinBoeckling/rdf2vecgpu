@@ -90,6 +90,9 @@ now train on one GPU.
 
 - The looped `OrderAwareSkipgram` / `OrderAwareCBOW` models and their
   DataModules, which the config could not reach.
+- The ISWC 2025 benchmark scripts and their pinned environment files from
+  `performance/`, replaced by the end-to-end harness (`benchmark.py`,
+  `benchmark_charts.py`). They remain in the `v0.5.0` tag.
 
 ### Fixed
 
